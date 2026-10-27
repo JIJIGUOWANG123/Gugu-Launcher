@@ -1,0 +1,6 @@
+# pnpm 11 的工程级设置（原 package.json 的 pnpm 字段已不再被读取）。
+# esbuild 需要允许它的 postinstall 才能拿到平台二进制（vite 依赖）。
+onlyBuiltDependencies:
+  - esbuild
+# 不希望在 "pnpm run <script>" 前自动跑一次依赖校验安装（本机它会因为构建脚本白名单报错）。
+verifyDepsBeforeRun: false

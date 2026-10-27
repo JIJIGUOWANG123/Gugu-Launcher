@@ -1,0 +1,39 @@
+{
+  "name": "gugu-launcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "咕咕启动器 · Gugu Launcher — Minecraft 开源无广告启动器",
+  "author": "JIJIGUOWANG123",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JIJIGUOWANG123/Gugu-Launcher.git"
+  },
+  "homepage": "https://github.com/JIJIGUOWANG123/Gugu-Launcher",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "skinview-utils": "0.7.1",
+    "three": "0.156.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/node": "^26.6.5",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "0.156.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11"
+  }
+}

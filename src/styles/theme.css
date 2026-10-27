@@ -1,0 +1,67 @@
+/**
+ * 主题变量：浅色/深色两套。`--accent` 由 JS（lib/theme.ts）在 :root 上覆盖，
+ * 所有按钮/信息图标/高亮一律引用变量，不写死颜色。
+ */
+:root,
+:root[data-theme="light"] {
+  --accent: #f5c845;
+  --accent-strong: color-mix(in srgb, var(--accent) 68%, #4a3600);
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-contrast: #2a2000;
+
+  --bg: #eef1f6;
+  --bg-content: #f4f6fa;
+  --surface: #ffffff;
+  --surface-muted: #f7f9fc;
+  --surface-hover: #f0f3f9;
+
+  --text: #171b24;
+  --text-muted: #6b7280;
+  --text-faint: #9aa2b1;
+
+  --border: rgba(23, 27, 36, 0.08);
+  --border-strong: rgba(23, 27, 36, 0.16);
+  --shadow-sm: 0 2px 6px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.08);
+  --shadow-lg: 0 18px 48px rgba(15, 23, 42, 0.18);
+
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --accent: #f5c845;
+  --accent-strong: color-mix(in srgb, var(--accent) 82%, #ffffff 18%);
+  --accent-soft: color-mix(in srgb, var(--accent) 22%, transparent);
+  --accent-contrast: #241c00;
+
+  --bg: #14161c;
+  --bg-content: #181b22;
+  --surface: #1f232c;
+  --surface-muted: #23272f;
+  --surface-hover: #262b35;
+
+  --text: #e8ebf2;
+  --text-muted: #9aa3b2;
+  --text-faint: #6f7787;
+
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 18px 48px rgba(0, 0, 0, 0.6);
+
+  color-scheme: dark;
+}
+
+/* 圆角与尺寸统一走变量，方便后面整体收紧 */
+:root {
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
+  --radius-pill: 999px;
+  /* 界面字体：默认微软雅黑，设置里选择后由 JS 覆盖 --font-ui */
+  --font-ui: "Microsoft YaHei", "Microsoft YaHei UI", system-ui, sans-serif;
+  --titlebar-h: 54px;
+  --sidebar-w: 208px;
+  --transition: 140ms ease;
+}

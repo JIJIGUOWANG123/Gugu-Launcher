@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.tsbuildinfo
+
+# 本机打包用的 NSIS 工具链（不进仓库；tauri 会从本地缓存目录复用）
+nsis-3.13/
+
+# 内置凭据（微软登录 client id）：只在打包机上存在，绝不入库
+# build.rs 会读它并注入 GUGU_MS_CLIENT_ID；源码/源码快照都不得包含
+.ms-client-id
+.ms-client-id.*
+
+# 运行期数据（本机 .mc 数据根，绝不入库）
+.mc/
+*.db
+*.db-wal
+*.db-shm
+
+# 日志与测试产物
+*.log
+logs/
+测试代码/out/
+测试代码/*.log
+coverage/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
