@@ -177,6 +177,50 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $dialog.
     }
 }
 
+
+/// 把文本写进 Windows 剪贴板（前端 navigator.clipboard 失败时的兜底）。
+pub fn clipboard_write(text: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        // 走 PowerShell 的 Set-Clipboard：中文与换行都能原样进去，也不用额外 crate
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$input | Set-Clipboard -Value $input",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+        crate::util::hidden(&mut cmd);
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| AppError::Other(format!("打开剪贴板失败：{err}")))?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|err| AppError::Other(format!("写入剪贴板失败：{err}")))?;
+        }
+        drop(child.stdin.take());
+        let output = child
+            .wait_with_output()
+            .map_err(|err| AppError::Other(format!("等待剪贴板写入失败：{err}")))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(AppError::Other(format!("写入剪贴板失败：{detail}")));
+        }
+        tracing::info!(chars = text.chars().count(), "已写入剪贴板");
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        Err(AppError::Other("当前系统不支持写入剪贴板".to_string()))
+    }
+}
+
 /// 弹出系统目录选择框，返回用户选中的目录；取消返回空字符串。
 pub fn pick_directory() -> Result<String> {
     #[cfg(windows)]

@@ -6,6 +6,7 @@
 
 pub mod accounts;
 pub mod appearance;
+pub mod capes;
 pub mod commands;
 pub mod content;
 pub mod datadir;
@@ -21,14 +22,18 @@ pub mod instance;
 pub mod java;
 pub mod launch;
 pub mod meta;
+pub mod modpack;
 pub mod mods;
 pub mod ms_auth;
 pub mod ms_login;
 pub mod net;
 pub mod news;
 pub mod paths;
+pub mod png;
 pub mod saying;
+pub mod seedmap;
 pub mod server;
+pub mod server_content;
 pub mod settings;
 pub mod shell;
 pub mod single_instance;
@@ -41,6 +46,7 @@ pub mod terracotta;
 pub mod translate;
 pub mod tracing_file;
 pub mod update;
+pub mod updates;
 pub mod util;
 pub mod version;
 
@@ -322,6 +328,7 @@ pub fn run() {
             commands::instance_pick_icon,
             commands::version_install,
             commands::instance_launch,
+            commands::instance_launch_with_save,
             commands::downloads_list,
             commands::download_cancel,
             commands::download_open_folder,
@@ -350,10 +357,23 @@ pub fn run() {
             commands::server_open_folder,
             commands::server_read_properties,
             commands::server_write_properties,
+            commands::server_content_list,
+            commands::server_content_install,
+            commands::server_content_toggle,
+            commands::server_content_check,
+            commands::server_content_apply_updates,
+            commands::server_saves_list,
+            commands::server_saves_backup,
+            commands::server_config_read,
+            commands::server_config_write,
+            commands::server_logs_tail,
+            commands::server_send_command,
+            commands::server_console_state,
             commands::logs_list,
             commands::log_read,
             commands::log_open_folder,
             commands::open_path,
+            commands::clipboard_write,
             commands::fonts_list,
             commands::fun_saying,
             commands::translation_test,
@@ -366,25 +386,30 @@ pub fn run() {
             commands::mods_delete,
             commands::mods_import,
             commands::mods_open_folder,
+            commands::mods_check_updates,
+            commands::mods_apply_updates,
             commands::saves_open_folder,
             commands::skin_current,
-            commands::cape_current,
             commands::saves_list,
             commands::saves_delete,
             commands::saves_export,
             commands::instance_export,
             commands::skins_list,
+            commands::skins_delete,
             commands::skin_apply,
             commands::skin_upload,
             commands::skin_lookup_thirdparty,
             commands::skin_import_from_url,
             commands::capes_list,
-            commands::cape_apply,
+            commands::cape_set_active,
+            commands::ms_skin_upload,
+            commands::ms_profile,
             commands::cape_clear,
             commands::skin_fetch_mojang,
             commands::skin_profile_mojang,
             commands::skin_default,
             commands::news_list,
+            commands::news_refresh,
             commands::accounts_list,
             commands::account_add_offline,
             commands::account_apply,
@@ -395,6 +420,7 @@ pub fn run() {
             commands::content_detail,
             commands::content_versions,
             commands::mod_install,
+            commands::modpack_install,
             commands::translate_texts,
             commands::background_list,
             commands::background_apply,
@@ -409,6 +435,11 @@ pub fn run() {
             commands::update_status,
             commands::update_check,
             commands::update_install,
+            commands::seedmap_versions,
+            commands::seedmap_biomes,
+            commands::seedmap_biome_at,
+            commands::seedmap_spawn,
+            commands::seedmap_structures,
         ]);
 
     if let Err(err) = builder.run(tauri::generate_context!()) {

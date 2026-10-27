@@ -25,6 +25,8 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 种子地图：把 third_party/cubiomes 的 C 源码编进 exe（仅构建期依赖）
+cc = "1"
 
 [dependencies]
 # tray-icon：系统托盘小图标（关闭到托盘的入口）

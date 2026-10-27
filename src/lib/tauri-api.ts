@@ -10,8 +10,12 @@ import type {
   AppInfo,
   BackgroundItem,
   BackgroundPage,
-  CapeItem,
+  CapesListResult,
+  CapeState,
   ContentFileKind,
+  ContentDependency,
+  ExternalImportResult,
+  ExternalScanResult,
   ContentItem,
   ContentKindTab,
   ContentProvider,
@@ -33,9 +37,14 @@ import type {
   DataDirInfo,
   LauncherEvent,
   LogFile,
+  ModApplyResult,
+  ModCheckResult,
   ModFileItem,
+  ModUpdateItem,
+  ModpackInstallRequest,
   MsAuthStatus,
   MsLoginPoll,
+  MsProfile,
   NewsItem,
   MsLoginStart,
   PathsLayout,
@@ -43,9 +52,13 @@ import type {
   SaveItem,
   Settings,
   SayingResult,
+  ServerConfigResult,
+  ServerContentItem,
   ServerCore,
   ServerCreateRequest,
+  ServerConsoleState,
   ServerInstance,
+  ServerSaveItem,
   ServerState,
   ServerVersion,
   StorageKey,
@@ -61,6 +74,7 @@ import type {
   TranslateResult,
   UpdateCheckResult,
   UpdateStatus,
+  VersionChannel,
   VersionItem,
   VersionManifest,
 } from "./types";
@@ -143,6 +157,7 @@ const MOCK_SETTINGS: Settings = {
   perFileConnections: 4,
   customMirror: "",
   resourceSource: "modrinth",
+  translateEnabled: true,
   translationSource: "builtin",
   translationBaseUrl: "",
   translationApiKey: "",
@@ -215,6 +230,8 @@ const MOCK_VERSIONS: VersionManifest = {
     { id: "1.21.4", versionType: "release", url: "", releaseTime: "2025-01-08T10:00:00+00:00" },
     { id: "1.21.3", versionType: "release", url: "", releaseTime: "2024-11-20T10:00:00+00:00" },
     { id: "1.20.6", versionType: "release", url: "", releaseTime: "2024-06-13T10:00:00+00:00" },
+    { id: "1.19.4", versionType: "release", url: "", releaseTime: "2023-03-14T10:00:00+00:00" },
+    { id: "1.19.2", versionType: "release", url: "", releaseTime: "2022-08-05T10:00:00+00:00" },
     { id: "1.20.1", versionType: "release", url: "", releaseTime: "2023-06-12T10:00:00+00:00" },
     { id: "25w02a", versionType: "snapshot", url: "", releaseTime: "2025-01-15T10:00:00+00:00" },
     { id: "24w14potato", versionType: "snapshot", url: "", releaseTime: "2024-04-01T10:00:00+00:00" },
@@ -241,6 +258,31 @@ let mockInstances: Instance[] = [
     playTimeSecs: 500,
     createdAt: "2025-01-01T00:00:00Z",
     lastPlayedAt: "2025-02-01T00:00:00Z",
+  },
+  // 1.20 及以上才支持「进入该存档」，这两个实例就是新旧版本两侧的对照
+  {
+    id: 2,
+    name: "1.19.4 原版",
+    mcVersion: "1.19.4",
+    loader: "Vanilla",
+    loaderVersion: "",
+    icon: "",
+    pinnedHome: false,
+    playTimeSecs: 0,
+    createdAt: "2025-01-12T00:00:00Z",
+    lastPlayedAt: null,
+  },
+  {
+    id: 3,
+    name: "1.20.1 生存",
+    mcVersion: "1.20.1",
+    loader: "Fabric",
+    loaderVersion: "0.15.11",
+    icon: "",
+    pinnedHome: false,
+    playTimeSecs: 1200,
+    createdAt: "2025-02-03T00:00:00Z",
+    lastPlayedAt: "2025-02-10T00:00:00Z",
   },
 ];
 
@@ -708,7 +750,7 @@ function mockSkinDataUrl(variant: number): string {
   return canvas.toDataURL("image/png");
 }
 
-/** 画一张 64×32 的假披风。 */
+/** 画一张 64×32 的假披风（正面在 1,1 起 10×16，和真实贴图布局一致）。 */
 function mockCapeDataUrl(variant: number): string {
   const canvas = document.createElement("canvas");
   canvas.width = 64;
@@ -720,6 +762,21 @@ function mockCapeDataUrl(variant: number): string {
   ctx.fillStyle = "#f5c845";
   ctx.fillRect(3, 4, 6, 3);
   ctx.fillRect(5, 9, 2, 6);
+  return canvas.toDataURL("image/png");
+}
+
+/** 后端会额外给一张正面裁切图（previewDataUrl），mock 这里模拟一张 40×64 的。 */
+function mockCapePreviewDataUrl(variant: number): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = 40;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  ctx.fillStyle = ["#c0392b", "#1f6f54", "#3d4d8f", "#7a4bb5"][variant % 4];
+  ctx.fillRect(0, 0, 40, 64);
+  ctx.fillStyle = "#f5c845";
+  ctx.fillRect(8, 14, 24, 12);
+  ctx.fillRect(16, 34, 8, 24);
   return canvas.toDataURL("image/png");
 }
 
@@ -786,10 +843,24 @@ function mockFetchMojang(username: string): SkinItem {
   return { ...item };
 }
 
-const mockCapes: CapeItem[] = [
-  { name: "Migrator", path: mockRoot + "\\capes\\Migrator.png", size: 1280, dataUrl: mockCapeDataUrl(0) },
-  { name: "Mojang", path: mockRoot + "\\capes\\Mojang.png", size: 1156, dataUrl: mockCapeDataUrl(2) },
+interface MockCape {
+  id: string;
+  name: string;
+  alias: string;
+  url: string;
+  /** 只有第一张带后端预生成的正面裁切图，其余走前端裁切分支 */
+  previewDataUrl?: string;
+}
+
+const MOCK_CAPES: MockCape[] = [
+  { id: "migrator", name: "Migrator", alias: "迁移者", url: mockCapeDataUrl(0), previewDataUrl: mockCapePreviewDataUrl(0) },
+  { id: "mojang", name: "Mojang", alias: "官方员工", url: mockCapeDataUrl(2) },
+  { id: "founders", name: "Founder's Cape", alias: "创始人", url: mockCapeDataUrl(1) },
+  { id: "translator", name: "Translator Cape", alias: "译者", url: mockCapeDataUrl(3) },
 ];
+
+/** 浏览器预览里用 localStorage 的 gugu.mock.cape 模拟四种账号形态。 */
+const MOCK_CAPE_MODE_KEY = "gugu.mock.cape";
 
 /**
  * 皮肤站（Yggdrasil）查皮肤的假实现：
@@ -821,7 +892,42 @@ function mockSkinLookup(server: string, name: string): SkinLookupResult {
 
 /** 当前应用的皮肤 / 披风（mock 只存在内存里，刷新页面回到默认）。 */
 let mockCurrentSkin = mockSkins[0].path;
-let mockCurrentCape = mockCapes[0].name;
+let mockActiveCapeId: string | null = "migrator";
+
+/**
+ * capes_list 的假实现：披风只属于「微软账号」。
+ * 离线账号 / 未登录 / 皮肤站账号都返回 supported=false，reason 直接给界面显示。
+ */
+function mockCapesList(): CapesListResult {
+  const forced = window.localStorage.getItem(MOCK_CAPE_MODE_KEY);
+  if (forced === "thirdparty") {
+    return { supported: false, reason: "第三方（皮肤站）账号不支持披风", active: null, items: [] };
+  }
+  if (forced === "expired") {
+    return { supported: false, reason: "登录已过期，请重新登录", active: null, items: [] };
+  }
+  const current = mockAccounts.find((account) => account.current) ?? null;
+  if (forced === "offline" || !current || current.type !== "microsoft") {
+    return {
+      supported: false,
+      reason: current ? "离线账号不支持披风，登录微软账号后可用" : "请先登录微软账号",
+      active: null,
+      items: [],
+    };
+  }
+  return {
+    supported: true,
+    active: mockActiveCapeId,
+    items: MOCK_CAPES.map((cape) => ({
+      id: cape.id,
+      name: cape.name,
+      alias: cape.alias,
+      url: cape.url,
+      state: cape.id === mockActiveCapeId ? ("ACTIVE" as const) : ("INACTIVE" as const),
+      previewDataUrl: cape.previewDataUrl ?? null,
+    })),
+  };
+}
 
 // ---- 账号 ----
 
@@ -869,6 +975,13 @@ function mockApplyAccount(id: string): void {
   mockAccounts = mockAccounts.map((account) => ({ ...account, current: account.id === id }));
 }
 
+/** 后端可能用 kind（"ms" / "microsoft" / "offline"）描述账号类型，前端统一折成 type。 */
+function normalizeAccount(raw: Account): Account {
+  const kind = String(raw.type ?? raw.kind ?? "").toLowerCase();
+  const type: Account["type"] = kind === "microsoft" || kind === "ms" ? "microsoft" : "offline";
+  return { ...raw, type };
+}
+
 // ---- 微软登录（设备码流程的假状态）----
 
 const MOCK_MS_STATE = { deviceCode: "", userCode: "", polls: 0 };
@@ -899,6 +1012,7 @@ function mockMsStart(): MsLoginStart {
     configured: true,
     userCode: MOCK_MS_STATE.userCode,
     verifyUrl: "https://www.microsoft.com/link",
+    verificationUri: "https://www.microsoft.com/link",
     deviceCode: MOCK_MS_STATE.deviceCode,
     expiresIn: 900,
   };
@@ -1135,7 +1249,9 @@ const MOCK_PROVIDER_LABEL: Record<ContentProvider, string> = {
 };
 
 function mockProjectFromId(provider: ContentProvider, projectId: string): MockProject | null {
-  const slug = projectId.includes(":") ? projectId.split(":").pop() ?? "" : projectId;
+  // 合成目录的 id 形如 provider:slug:index，取第二段才是 slug
+  const parts = projectId.split(":");
+  const slug = parts.length >= 2 ? parts[1] : projectId;
   const found = MOCK_PROJECTS.find((project) => project.slug === slug) ?? null;
   if (found) return found;
   return provider === "modrinth" ? null : null;
@@ -1149,6 +1265,7 @@ const MOCK_CATEGORY_POOL: Record<string, string[]> = {
   shader: ["光影", "写实", "卡通"],
   resourcepack: ["材质", "写实", "16x"],
   datapack: ["数据包", "实用", "小游戏"],
+  plugin: ["插件", "经济", "优化"],
 };
 
 function mockContentCatalog(provider: ContentProvider, kind: ContentKindTab): ContentItem[] {
@@ -1163,7 +1280,24 @@ function mockContentCatalog(provider: ContentProvider, kind: ContentKindTab): Co
       id: provider + ":" + base.slug + ":" + i,
       provider,
       kind,
-      title: base.title + suffix + "（" + (kind === "mod" ? "模组" : kind === "modpack" ? "整合包" : kind === "shader" ? "光影" : kind === "resourcepack" ? "资源包" : "数据包") + "）",
+      title:
+        // 译文版标题故意和 titleOriginal 明显不同，方便验证「关掉翻译显示原文」
+        "译文·" +
+        base.title +
+        suffix +
+        "（" +
+        (kind === "mod"
+          ? "模组"
+          : kind === "modpack"
+            ? "整合包"
+            : kind === "shader"
+              ? "光影"
+              : kind === "resourcepack"
+                ? "资源包"
+                : kind === "plugin"
+                  ? "插件"
+                  : "数据包") +
+        "）",
       titleOriginal: base.title + suffix,
       author: base.author,
       downloads: base.downloads - i * 137,
@@ -1430,9 +1564,48 @@ const MOCK_SERVER_VERSIONS: Record<string, ServerVersion[]> = {
   ],
 };
 
-let mockServers: ServerInstance[] = [];
+// 种子数据：多人 → 服务器里一进来就有两台，插件安装、服务端详情、截图都靠它们
+let mockServers: ServerInstance[] = [
+  {
+    id: "srv-paper-1",
+    name: "Paper 生存服",
+    core: "paper",
+    mcVersion: "1.21.4",
+    port: 25565,
+    memoryMb: 4096,
+    state: "stopped",
+    players: 0,
+    dir: mockRoot + "\\servers\\srv-paper-1",
+  },
+  {
+    id: "srv-fabric-1",
+    name: "Fabric 模组服",
+    core: "fabric",
+    mcVersion: "1.20.1",
+    port: 25566,
+    memoryMb: 6144,
+    state: "running",
+    players: 2,
+    dir: mockRoot + "\\servers\\srv-fabric-1",
+  },
+];
 const mockServerLogs = new Map<string, string[]>();
 const mockServerTickers = new Map<string, number>();
+
+mockServerLogs.set("srv-paper-1", [
+  "[00:00:01] [Server thread/INFO]: Starting minecraft server version 1.21.4",
+  "[00:00:02] [Server thread/INFO]: Loading properties",
+  "[00:00:03] [Server thread/INFO]: Preparing level \"world\"",
+  "[00:00:05] [Server thread/INFO]: Done (3.412s)! For help, type \"help\"",
+  "[00:00:06] [Server thread/INFO]: 服务器已就绪，等待玩家加入",
+]);
+mockServerLogs.set("srv-fabric-1", [
+  "[00:00:01] [Server thread/INFO]: Starting minecraft server version 1.20.1",
+  "[00:00:01] [Server thread/INFO]: Loading 3 mods: fabric-api, sodium, lithium",
+  "[00:00:04] [Server thread/INFO]: Done (2.842s)! For help, type \"help\"",
+  "[00:00:09] [Server thread/INFO]: Steve joined the game",
+  "[00:00:12] [Server thread/INFO]: Alex joined the game",
+]);
 
 function mockServerLog(id: string, line: string): void {
   const lines = [...(mockServerLogs.get(id) ?? []), line].slice(-500);
@@ -1443,6 +1616,76 @@ function mockServerLog(id: string, line: string): void {
 function mockServerState(id: string, state: ServerState, players?: number): void {
   mockServers = mockServers.map((server) => (server.id === id ? { ...server, state, players: players ?? server.players ?? 0 } : server));
   emitMock({ kind: "server-state", payload: { id, state, players } });
+}
+
+// ---- 服务端详情：内容 / 存档 / 配置 ----
+
+const mockServerContent = new Map<string, ServerContentItem[]>();
+const mockServerSaves = new Map<string, ServerSaveItem[]>();
+const mockServerConfig = new Map<string, ServerConfigResult>();
+
+const SERVER_CONTENT_SEED: Record<"mod" | "plugin", ServerContentItem[]> = {
+  mod: [
+    { fileName: "fabric-api-0.92.2.jar", sizeBytes: 2_100_400, enabled: true, provider: "modrinth", projectId: "fabric-api" },
+    { fileName: "sodium-0.5.8.jar", sizeBytes: 1_240_900, enabled: true, provider: "modrinth", projectId: "sodium" },
+    { fileName: "lithium-0.12.1.jar", sizeBytes: 780_300, enabled: false, provider: "modrinth", projectId: "lithium" },
+  ],
+  plugin: [
+    { fileName: "EssentialsX-2.20.1.jar", sizeBytes: 3_402_100, enabled: true, provider: "modrinth", projectId: "essentialsx" },
+    { fileName: "Vault-1.7.3.jar", sizeBytes: 168_400, enabled: true, provider: "modrinth", projectId: "vault" },
+    { fileName: "ProtocolLib-5.1.0.jar", sizeBytes: 1_502_600, enabled: false, provider: "modrinth", projectId: "protocollib" },
+  ],
+};
+
+function mockServerContentList(serverId: string, kind: "mod" | "plugin"): ServerContentItem[] {
+  const key = serverId + ":" + kind;
+  const cached = mockServerContent.get(key);
+  if (cached) return cached;
+  const seed = SERVER_CONTENT_SEED[kind].map((item) => ({ ...item }));
+  mockServerContent.set(key, seed);
+  return seed;
+}
+
+function mockServerSavesOf(serverId: string): ServerSaveItem[] {
+  const cached = mockServerSaves.get(serverId);
+  if (cached) return cached;
+  const seed: ServerSaveItem[] = [
+    { name: "world", sizeBytes: 512_344_064, updatedAt: secondsAgo(2_400) },
+    { name: "world_nether", sizeBytes: 84_221_952, updatedAt: secondsAgo(2_400) },
+    { name: "world_the_end", sizeBytes: 41_893_888, updatedAt: secondsAgo(86_400) },
+  ];
+  mockServerSaves.set(serverId, seed);
+  return seed;
+}
+
+function mockServerConfigOf(serverId: string): ServerConfigResult {
+  const cached = mockServerConfig.get(serverId);
+  if (cached) return cached;
+  const server = mockServers.find((item) => item.id === serverId);
+  const fields: Record<string, string> = {
+    "server-port": String(server?.port ?? 25565),
+    motd: "咕咕启动器开的世界",
+    "max-players": "20",
+    "online-mode": "true",
+    difficulty: "normal",
+    gamemode: "survival",
+    "level-name": "world",
+    "view-distance": "10",
+    "simulation-distance": "10",
+    pvp: "true",
+    "allow-flight": "false",
+    "white-list": "false",
+  };
+  const text = [
+    "#Minecraft server properties",
+    "#" + new Date().toISOString(),
+    ...Object.entries(fields).map(([key, value]) => key + "=" + value),
+    "# 下面这行是启动器不认识的，写回时必须原样保留",
+    "custom-unrecognised-key=keep-me",
+  ].join("\n");
+  const value: ServerConfigResult = { text, fields };
+  mockServerConfig.set(serverId, value);
+  return value;
 }
 
 /** 运行中的服务器每 3 秒来一行日志，偶尔有人进来。 */
@@ -1788,6 +2031,141 @@ export const api = {
     });
   },
 
+  /** 整合包安装：直接创建一个新实例，返回 taskId + instanceId。TODO(M9): 后端 modpack_install。 */
+  modpackInstall(request: ModpackInstallRequest): Promise<{ taskId: string; instanceId: number }> {
+    return call("modpack_install", { ...request }, () => {
+      const project = mockProjectFromId(request.provider, request.projectId);
+      const name = request.instanceName?.trim() || project?.title || "整合包实例";
+      const created: Instance = {
+        id: (mockInstances.reduce((max, item) => Math.max(max, item.id), 0) || 0) + 1,
+        name: name,
+        mcVersion: project?.gameVersions[0] ?? "1.21.4",
+        loader: project?.loaders[0] ?? "Fabric",
+        loaderVersion: "",
+        icon: "",
+        pinnedHome: false,
+        playTimeSecs: 0,
+        createdAt: new Date().toISOString(),
+        lastPlayedAt: null,
+        packName: project?.title ?? name,
+        packState: "installed",
+      };
+      mockInstances = [...mockInstances, created];
+      startMockInstall("安装整合包：" + name, mockRoot + "\\instances\\" + created.id, "install");
+      if (typeof window !== "undefined" && window.localStorage.getItem("gugu.mock.modpack") === "fail") {
+        mockInstances = mockInstances.map((item) => (item.id === created.id ? { ...item, packState: "incomplete" } : item));
+        throw new Error("整合包文件校验失败（mock）：已创建实例，可稍后重试安装");
+      }
+      return { taskId: mockTasks[0].id, instanceId: created.id };
+    });
+  },
+
+  // ------------------------------------ 检查更新 / 进入存档（M10）
+
+  /** 检查某类文件的更新。TODO(M10): 后端 mods_check_updates。 */
+  modsCheckUpdates(request: { instanceId: number; kind: string }): Promise<ModCheckResult> {
+    return call("mods_check_updates", { ...request }, () => {
+      const updatable = request.kind === "mod" ? 3 : request.kind === "resourcepack" ? 2 : 0;
+      const updates: ModUpdateItem[] = Array.from({ length: updatable }, (_, index) => ({
+        fileName: request.kind + "-sample-" + (index + 1) + ".jar",
+        path: mockRoot + "\\instances\\" + request.instanceId + "\\" + request.kind + "s",
+        kind: request.kind,
+        currentVersion: "1." + (index + 2) + ".0",
+        latestVersion: "1." + (index + 3) + ".0",
+        downloadUrl: "https://example.invalid/" + request.kind + "-" + (index + 1),
+        sha1: null,
+      }));
+      return {
+        checked: 12,
+        updates: updates,
+        failed: updatable > 0 ? [{ fileName: "unknown-" + request.kind + ".jar", reason: "未记录安装信息且指纹未命中" }] : [],
+      };
+    });
+  },
+
+  /** 应用更新。TODO(M10): 后端 mods_apply_updates。 */
+  modsApplyUpdates(request: { instanceId: number; kind: string; items: ModUpdateItem[] }): Promise<ModApplyResult> {
+    return call("mods_apply_updates", { ...request }, () => ({ updated: request.items.length, failed: [] }));
+  },
+
+  /** 启动并直接进入存档。TODO(M10): 后端 instance_launch_with_save。 */
+  instanceLaunchWithSave(request: { instanceId: number; levelName: string }): Promise<{ pid: number }> {
+    return call("instance_launch_with_save", { ...request }, () => {
+      const target = mockInstances.find((item) => item.id === request.instanceId);
+      const major = Number((target?.mcVersion ?? "1.21").split(".")[1] ?? 21);
+      if (major < 12) throw new Error("该版本不支持直接进入存档，请手动在游戏内选择");
+      return { pid: 4242 + request.instanceId };
+    });
+  },
+
+  // -------------------------------------- 外部启动器导入（M9 HMCL / PCL2）
+
+  /** 扫描 HMCL / PCL2 根目录。TODO(M9): 后端 external_scan。 */
+  externalScan(request: { root: string }): Promise<ExternalScanResult> {
+    return call("external_scan", { ...request }, () => {
+      const root = request.root.trim();
+      if (!root) throw new Error("请先选择一个目录");
+      if (/notfound|invalid/i.test(root)) throw new Error("这不是 HMCL / PCL2 的目录（没找到 versions 子目录）");
+      const launcher: ExternalScanResult["launcher"] = /pcl/i.test(root) ? "pcl2" : /hmcl/i.test(root) ? "hmcl" : "hmcl";
+      const base = [
+        { id: "ext-1", name: "HMCL 1.20.1 Fabric", mcVersion: "1.20.1", loader: "Fabric", isolated: true, modCount: 12, broken: null },
+        { id: "ext-2", name: "PCL2 1.19.4 原版", mcVersion: "1.19.4", loader: "Vanilla", isolated: false, modCount: 0, broken: null },
+        { id: "ext-3", name: "1.16.5 Forge 整合", mcVersion: "1.16.5", loader: "Forge", isolated: false, modCount: 43, broken: null },
+        { id: "ext-4", name: "损坏的版本", mcVersion: "1.18.2", loader: "Forge", isolated: false, modCount: 3, broken: "缺少 version.json（可能被手动删过）" },
+        { id: "ext-5", name: "1.21.1 NeoForge", mcVersion: "1.21.1", loader: "NeoForge", isolated: true, modCount: 5, broken: null },
+      ];
+      return {
+        launcher: launcher,
+        minecraftDir: root,
+        candidates: base.map((item) => ({
+          id: item.id,
+          name: item.name,
+          mcVersion: item.mcVersion,
+          loader: item.loader,
+          loaderVersion: item.loader === "Vanilla" ? null : "0.16.9",
+          path: root + "\\versions\\" + item.name,
+          isolated: item.isolated,
+          hasMods: item.modCount > 0,
+          modCount: item.modCount,
+          sizeBytes: 380_000_000 + item.modCount * 12_000_000,
+          javaMajor: Number(item.mcVersion.split(".")[1]) >= 20 ? 17 : 8,
+          broken: item.broken,
+        })),
+      };
+    });
+  },
+
+  /** 导入选中的版本：link=引用原目录，copy=复制到咕咕目录。TODO(M9): 后端 external_import。 */
+  externalImport(request: { root: string; ids: string[]; mode: "link" | "copy" }): Promise<ExternalImportResult> {
+    return call("external_import", { ...request }, () => {
+      const imported: Instance[] = [];
+      const failed: Array<{ id: string; reason: string }> = [];
+      let nextId = (mockInstances.reduce((max, item) => Math.max(max, item.id), 0) || 0) + 1;
+      for (const id of request.ids) {
+        if (id === "ext-broken" || id === "ext-4") {
+          failed.push({ id, reason: "缺少 version.json" });
+          continue;
+        }
+        const created: Instance = {
+          id: nextId,
+          name: (request.mode === "copy" ? "[复制] " : "") + "导入实例 " + id.replace("ext-", ""),
+          mcVersion: "1.20.1",
+          loader: "Fabric",
+          loaderVersion: "",
+          icon: "",
+          pinnedHome: false,
+          playTimeSecs: 0,
+          createdAt: new Date().toISOString(),
+          lastPlayedAt: null,
+        };
+        nextId += 1;
+        imported.push(created);
+      }
+      mockInstances = [...mockInstances, ...imported];
+      return { instances: imported, failed };
+    });
+  },
+
   // ------------------------------------------------ 存储统计 / 清理（M7）
 
   /** 数据目录各分项体积。TODO(M7): 后端 storage_stats。 */
@@ -1993,6 +2371,16 @@ export const api = {
     return call("skins_list", undefined, () => mockSkins.map((skin) => ({ ...skin })));
   },
 
+  /** 删除本地皮肤（只删 .mc\\skins 里的文件，不动账号外观）。TODO(M14): 后端 skins_delete。 */
+  skinsDelete(request: { name: string }): Promise<void> {
+    return call("skins_delete", { ...request }, () => {
+      const target = mockSkins.find((skin) => skin.name === request.name);
+      if (!target) throw new Error("皮肤不存在：" + request.name);
+      mockSkins = mockSkins.filter((skin) => skin.name !== request.name);
+      if (mockCurrentSkin === target.path) mockCurrentSkin = "";
+    });
+  },
+
   /** 把某个皮肤设为当前皮肤。TODO(M3-2): 后端 skin_apply。 */
   skinApply(path: string): Promise<void> {
     return call("skin_apply", { path }, () => {
@@ -2001,6 +2389,47 @@ export const api = {
   },
 
   /** 上传一张 PNG（base64），落到 .mc\\skins\\ 并返回新条目。TODO(M3-2): 后端 skin_upload。 */
+  /**
+   * 正版账号上传皮肤（离线/第三方账号没有这个能力，调用方需自行判断）。
+   * 磁盘上有文件的皮肤传 pngPath；内置 / 打包资源的皮肤没有路径，改传 pngBase64。
+   * TODO(M11): 后端 ms_skin_upload 已加 pngBase64 参数，两者都传时以 base64 为准。
+   */
+  msSkinUpload(request: {
+    pngPath?: string;
+    pngBase64?: string;
+    variant: "classic" | "slim";
+  }): Promise<{ ok: boolean; variant: string; uploadedAt: string; capeSynced: boolean }> {
+    // 自检用：记下这次上传到底带了路径还是 base64（界面不显示）
+    if (typeof window !== "undefined") {
+      const host = window as unknown as Record<string, unknown>;
+      const seen = Array.isArray(host.__guguSkinUpload) ? (host.__guguSkinUpload as unknown[]) : [];
+      host.__guguSkinUpload = [
+        ...seen,
+        {
+          hasPath: typeof request.pngPath === "string" && request.pngPath.length > 0,
+          hasBase64: typeof request.pngBase64 === "string" && request.pngBase64.length > 0,
+          base64Length: typeof request.pngBase64 === "string" ? request.pngBase64.length : 0,
+          variant: request.variant,
+        },
+      ].slice(-20);
+    }
+    return call("ms_skin_upload", { ...request }, () => {
+      const account = mockAccounts.find((item) => item.current);
+      if (!account || account.type !== "microsoft") throw new Error("只有正版账号才能上传皮肤");
+      // 自检用：gugu.mock.skinUpload = badSize 模拟后端报「皮肤尺寸不对」
+      if (window.localStorage.getItem("gugu.mock.skinUpload") === "badSize") {
+        throw new Error("皮肤尺寸不对：需要 64×32 或 64×64 的 PNG");
+      }
+      const base64 = (request.pngBase64 ?? "").trim();
+      const path = (request.pngPath ?? "").trim();
+      if (!base64 && !path) throw new Error("没有可上传的皮肤图片");
+      // 两者都传时以 base64 为准（和后端一致）
+      if (base64 && !base64.startsWith("iVBOR")) throw new Error("皮肤尺寸不对：需要 64×32 或 64×64 的 PNG");
+      if (!base64 && !/\.png$/i.test(path)) throw new Error("皮肤尺寸不对：需要 64×32 或 64×64 的 PNG");
+      return { ok: true, variant: request.variant, uploadedAt: new Date().toISOString(), capeSynced: true };
+    });
+  },
+
   skinUpload(pngBase64: string): Promise<SkinItem> {
     return call("skin_upload", { pngBase64 }, () => {
       const name = "skin-" + (mockSkins.length + 1) + "-" + Date.now().toString(36).slice(-4);
@@ -2020,28 +2449,26 @@ export const api = {
     return call("skin_current", undefined, () => mockCurrentSkin);
   },
 
-  /** 本地披风列表。TODO(M3-2): 后端 capes_list。 */
-  capesList(): Promise<CapeItem[]> {
-    return call("capes_list", undefined, () => mockCapes.map((cape) => ({ ...cape })));
+  /** 账号上的披风列表；supported=false 时 reason 说明为什么不支持，items 恒为空。 */
+  capesList(): Promise<CapesListResult> {
+    return call("capes_list", undefined, () => mockCapesList());
   },
 
-  /** 应用/取消披风（传空字符串＝取消）。TODO(M3-2): 后端 cape_apply。 */
-  capeApply(name: string): Promise<void> {
-    return call("cape_apply", { name }, () => {
-      mockCurrentCape = name;
+  /** 装备披风；capeId=null 表示不使用披风。 */
+  capeSetActive(request: { capeId: string | null }): Promise<CapeState> {
+    return call("cape_set_active", request, () => {
+      mockActiveCapeId = request.capeId;
+      return { active: mockActiveCapeId };
     });
-  },
-
-  /** 当前披风名，空字符串＝没有。TODO(M3-2): 后端 cape_current。 */
-  capeCurrent(): Promise<string> {
-    return call("cape_current", undefined, () => mockCurrentCape);
   },
 
   // ---------------------------------------------------------- 账号（M3-2）
 
   /** 全部账号（含 current 标记）。TODO(M3-2): 后端 accounts_list。 */
   accountsList(): Promise<Account[]> {
-    return call("accounts_list", undefined, () => mockAccounts.map((account) => ({ ...account })));
+    return call("accounts_list", undefined, () => mockAccounts.map((account) => ({ ...account }))).then((list) =>
+      list.map(normalizeAccount),
+    );
   },
 
   /** 添加离线账号：名称 3–16 位，重名/重复由后端再校验一次。TODO(M3-2): 后端 account_add_offline。 */
@@ -2092,6 +2519,31 @@ export const api = {
     return call("ms_login_start", undefined, () => mockMsStart());
   },
 
+  /**
+   * 微软账号当前正在使用的外观（皮肤 / 披风 / 模型）。
+   * 「恢复正版皮肤」用它把账号上的皮肤取回本地。TODO(M14): 后端 ms_profile。
+   */
+  msProfile(): Promise<MsProfile> {
+    // 自检用：记下调用次数（界面不显示）
+    if (typeof window !== "undefined") {
+      const host = window as unknown as Record<string, unknown>;
+      host.__guguMsProfile = (typeof host.__guguMsProfile === "number" ? host.__guguMsProfile : 0) + 1;
+    }
+    return call("ms_profile", undefined, () => {
+      const account = mockAccounts.find((item) => item.current);
+      if (!account || account.type !== "microsoft") throw new Error("请先登录微软账号");
+      if (window.localStorage.getItem("gugu.mock.msToken") === "expired") throw new Error("登录已过期，请重新登录");
+      const useDefault = window.localStorage.getItem("gugu.mock.msSkin") === "default";
+      return {
+        name: account.name,
+        uuid: account.uuid,
+        skinUrl: useDefault ? "" : mockSkinDataUrl(1),
+        capeUrl: null,
+        variant: "classic" as const,
+      };
+    });
+  },
+
   /** 轮询微软登录结果。TODO(M3-2): 后端 ms_login_poll。 */
   msLoginPoll(deviceCode: string): Promise<MsLoginPoll> {
     return call("ms_login_poll", { deviceCode }, () => mockMsPoll(deviceCode));
@@ -2114,12 +2566,17 @@ export const api = {
           sort: query.sort,
           loader: query.loader ?? "",
           categories: query.categories ?? [],
+          mcVersion: query.mcVersion ?? "",
         },
       ].slice(-60);
     }
     return call("content_search", { ...query }, () => {
       if (window.localStorage.getItem("gugu.mock.content") === "error") {
         throw new Error("内容服务暂时不可用（mock）");
+      }
+      // 自检用：gugu.mock.content = 403 模拟「CurseForge 没填 Key / 镜像不可用」
+      if (window.localStorage.getItem("gugu.mock.content") === "403") {
+        throw new Error("下载失败：内容接口返回 HTTP 403（Forbidden）");
       }
       // 模拟后端 kind_mapping 缺分支：MCIM 不认整合包
       if (query.provider === "mcim" && query.kind === "modpack") {
@@ -2179,30 +2636,50 @@ export const api = {
   },
 
   /** 项目的版本列表（按 MC 版本 / 加载器过滤）。TODO(M3-2): 后端 content_versions。 */
+  /** 前置依赖；后端未实现时返回空数组。TODO(M9): 后端 content_dependencies。 */
+  contentDependencies(provider: ContentProvider, projectId: string): Promise<ContentDependency[]> {
+    return call("content_dependencies", { provider, projectId }, () => {
+      const slug = projectId.split(":").pop() ?? "";
+      if (slug.indexOf("fabric-api") >= 0) return [];
+      return [
+        { projectId: provider + ":fabric-api", name: "Fabric API", kind: "required", provider },
+        { projectId: provider + ":cloth-config", name: "Cloth Config", kind: "required", provider },
+        { projectId: provider + ":modmenu", name: "Mod Menu", kind: "optional", provider },
+      ];
+    });
+  },
+
   contentVersions(
     provider: ContentProvider,
     projectId: string,
     mcVersion?: string,
     loader?: string,
+    channel?: VersionChannel,
   ): Promise<VersionItem[]> {
-    return call("content_versions", { provider, projectId, mcVersion, loader }, () => {
+    return call("content_versions", { provider, projectId, mcVersion, loader, channel }, () => {
       const project = mockProjectFromId(provider, projectId);
       if (!project) return [];
       const base = project.gameVersions.filter((version) => !mcVersion || version === mcVersion);
       const games = base.length > 0 ? base : project.gameVersions;
-      return games.slice(0, 3).map((game, index) => ({
-        versionId: project.slug + "-" + game + "-" + (index + 1),
-        name: project.title + " " + game + (index === 0 ? " (最新)" : ""),
-        gameVersions: [game],
-        loaders: project.loaders.filter((item) => !loader || item === loader || item === "Minecraft"),
-        downloads: Math.floor(project.downloads / (index + 2)),
-        fileSize: 1_048_576 * (index + 1),
-        publishedAt: secondsAgo(86_400 * (index + 1) * 7),
-        dependencies:
-          index === 0 && project.slug !== "fabric-api"
-            ? [{ projectId: provider + ":fabric-api", name: "Fabric API", kind: "required" }]
-            : [],
-      }));
+      const rows: VersionItem[] = [];
+      const channels: VersionChannel[] = ["release", "beta", "alpha"];
+      for (let index = 0; index < 6; index += 1) {
+        const game = games[index % games.length];
+        const kind = channels[index % 3];
+        rows.push({
+          versionId: project.slug + "-" + game + "-" + channel + "-" + (index + 1),
+          name: project.title + " " + (index + 1),
+          gameVersions: [game],
+          loaders: project.loaders.filter((item) => !loader || item === loader || item === "Minecraft"),
+          downloads: Math.floor(project.downloads / (index + 2)),
+          fileSize: 1_048_576 * (index + 1),
+          publishedAt: secondsAgo(86_400 * (index + 1) * 7),
+          dependencies: [],
+          channel: kind,
+          serverLabel: "Server, " + game,
+        });
+      }
+      return channel ? rows.filter((row) => (row.channel ?? "release") === channel) : rows;
     });
   },
 
@@ -2212,6 +2689,7 @@ export const api = {
     projectId: string;
     versionId?: string;
     instanceId: number;
+    withDependencies?: boolean;
   }): Promise<{ taskId: string }> {
     return call("mod_install", { ...request }, () => {
       const project = mockProjectFromId(request.provider, request.projectId);
@@ -2270,7 +2748,10 @@ export const api = {
   teraStatus(): Promise<TeraStatus> {
     return call("tera_status", undefined, () => ({
       installed: MOCK_TERA.installed,
-      version: MOCK_TERA.installed ? MOCK_TERA.version : null,
+      version: MOCK_TERA.version,
+      source: "bundled",
+      license: "AGPL-3.0",
+      homepage: "https://github.com/burningtnt/Terracotta",
     }));
   },
 
@@ -2493,11 +2974,139 @@ export const api = {
     });
   },
 
+  // -------------------------------- 服务端详情：内容 / 存档 / 配置 / 日志（M10）
+
+  /** 服务端里的模组或插件。TODO(M10): 后端 server_content_list。 */
+  serverContentList(request: { serverId: string; kind: "mod" | "plugin" }): Promise<ServerContentItem[]> {
+    return call("server_content_list", { ...request }, () =>
+      mockServerContentList(request.serverId, request.kind).map((item) => ({ ...item })),
+    );
+  },
+
+  /** 把一个资源装进服务端（插件走这里）。TODO(M10): 后端 server_content_install。 */
+  serverContentInstall(request: {
+    serverId: string;
+    provider: ContentProvider;
+    projectId: string;
+    versionId?: string;
+  }): Promise<{ taskId: string }> {
+    return call("server_content_install", { ...request }, () => {
+      const list = mockServerContentList(request.serverId, "plugin");
+      const fileName = request.projectId + "-latest.jar";
+      if (!list.some((item) => item.fileName === fileName)) {
+        mockServerContent.set(request.serverId + ":plugin", [
+          { fileName, sizeBytes: 1_048_576, enabled: true, provider: request.provider, projectId: request.projectId },
+          ...list,
+        ]);
+      }
+      startMockInstall(request.projectId + " 插件", "servers\\" + request.serverId + "\\plugins", "install");
+      return { taskId: mockTasks[0]?.id ?? "mock-task" };
+    });
+  },
+
+  /** 启用 / 禁用服务端里的一个 jar。TODO(M10): 后端 server_content_toggle。 */
+  serverContentToggle(request: { serverId: string; kind: "mod" | "plugin"; fileName: string; enabled: boolean }): Promise<void> {
+    return call("server_content_toggle", { ...request }, () => {
+      const list = mockServerContentList(request.serverId, request.kind).map((item) =>
+        item.fileName === request.fileName ? { ...item, enabled: request.enabled } : item,
+      );
+      mockServerContent.set(request.serverId + ":" + request.kind, list);
+    });
+  },
+
+  /** 服务端世界列表。TODO(M10): 后端 server_saves_list。 */
+  serverSavesList(request: { serverId: string }): Promise<ServerSaveItem[]> {
+    return call("server_saves_list", { ...request }, () => mockServerSavesOf(request.serverId).map((item) => ({ ...item })));
+  },
+
+  /** 把世界目录备份成 zip。TODO(M10): 后端 server_saves_backup（契约外，缺这条后端会回错误）。 */
+  serverSavesBackup(request: { serverId: string; name: string }): Promise<{ path: string }> {
+    return call("server_saves_backup", { ...request }, () => ({
+      path: mockRoot + "\\servers\\" + request.serverId + "\\backups\\" + request.name + "-" + Date.now().toString(36) + ".zip",
+    }));
+  },
+
+  /** 读 server.properties：原文 + 常用项。TODO(M10): 后端 server_config_read。 */
+  serverConfigRead(request: { serverId: string }): Promise<ServerConfigResult> {
+    return call("server_config_read", { ...request }, () => {
+      const value = mockServerConfigOf(request.serverId);
+      return { text: value.text, fields: { ...value.fields } };
+    });
+  },
+
+  /** 写回 server.properties：只改 patch 里给的键，未识别的行与注释原样保留。TODO(M10): 后端 server_config_write。 */
+  serverConfigWrite(request: { serverId: string; patch: Record<string, string> }): Promise<void> {
+    return call("server_config_write", { ...request }, () => {
+      const current = mockServerConfigOf(request.serverId);
+      const fields = { ...current.fields, ...request.patch };
+      const text = current.text
+        .split("\n")
+        .map((line) => {
+          const eq = line.indexOf("=");
+          if (eq <= 0) return line;
+          const key = line.slice(0, eq).trim();
+          return Object.prototype.hasOwnProperty.call(request.patch, key) ? key + "=" + request.patch[key] : line;
+        })
+        .join("\n");
+      mockServerConfig.set(request.serverId, { text, fields });
+      if (request.patch["server-port"]) {
+        const port = Number(request.patch["server-port"]);
+        if (Number.isFinite(port)) {
+          mockServers = mockServers.map((server) => (server.id === request.serverId ? { ...server, port } : server));
+        }
+      }
+    });
+  },
+
+  /** 向服务端控制台发一条指令（服务端没运行时后端会拒）。TODO(M12): 后端 server_send_command。 */
+  serverSendCommand(request: { serverId: string; command: string }): Promise<void> {
+    return call("server_send_command", { ...request }, () => {
+      const server = mockServers.find((item) => item.id === request.serverId);
+      if (!server || server.state !== "running") throw new Error("服务端未运行，先点启动");
+      const command = request.command.trim().replace(/^\//, "");
+      if (!command) throw new Error("指令不能为空");
+      // 回显行由界面自己补（带高亮），这里只模拟后端执行结果
+      if (/^list\b/.test(command)) {
+        mockServerLog(request.serverId, "[Server thread/INFO]: There are " + (server.players ?? 0) + " of a max of 20 players online");
+      } else if (/^tps\b/.test(command)) {
+        mockServerLog(request.serverId, "[Server thread/INFO]: TPS from last 1m, 5m, 15m: 20.0, 20.0, 20.0");
+      } else if (/^save-all\b/.test(command)) {
+        mockServerLog(request.serverId, "[Server thread/INFO]: Saved the game");
+      } else if (/^stop\b/.test(command)) {
+        mockServerLog(request.serverId, "[Server thread/INFO]: Stopping the server");
+      } else {
+        mockServerLog(request.serverId, "[Server thread/INFO]: " + command + " 已执行");
+      }
+    });
+  },
+
+  /** 控制台状态：running / stdinOpen。TODO(M12): 后端 server_console_state。 */
+  serverConsoleState(request: { serverId: string }): Promise<ServerConsoleState> {
+    return call("server_console_state", { ...request }, () => {
+      const server = mockServers.find((item) => item.id === request.serverId);
+      const running = server?.state === "running";
+      return { running, stdinOpen: running };
+    });
+  },
+
+  /** 服务端日志尾部。TODO(M10): 后端 server_logs_tail。 */
+  serverLogsTail(request: { serverId: string; lines: number }): Promise<string[]> {
+    return call("server_logs_tail", { ...request }, () =>
+      (mockServerLogs.get(request.serverId) ?? []).slice(-Math.max(1, request.lines)),
+    );
+  },
+
   // ------------------------------------------------------ 外部链接（M4）
 
   /** 用系统浏览器打开外链。TODO(M4): 后端 open_external（或换成 tauri-opener 插件）。 */
   openExternal(url: string): Promise<void> {
     return call("open_external", { url }, () => {
+      // 自检用：浏览器预览里 window.open 可能被拦，这里记下真实调用（window.__guguOpened）
+      if (typeof window !== "undefined") {
+        const host = window as unknown as Record<string, unknown>;
+        const seen = Array.isArray(host.__guguOpened) ? (host.__guguOpened as string[]) : [];
+        host.__guguOpened = [...seen, url].slice(-40);
+      }
       window.open(url, "_blank", "noopener,noreferrer");
     });
   },

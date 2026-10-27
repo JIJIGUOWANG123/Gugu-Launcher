@@ -43,6 +43,8 @@ pub struct LaunchOptions {
     pub uuid: String,
     /// 微软账号的访问令牌；离线账号留空（启动参数里写 0）
     pub access_token: String,
+    /// 直接进存档的存档名（1.20+ 才支持），None 表示正常启动到标题界面
+    pub quick_play: Option<String>,
 }
 
 impl LaunchOptions {
@@ -244,6 +246,18 @@ pub fn build_command(
     } else if let Some(template) = &merged.minecraft_arguments {
         for arg in template.split_whitespace() {
             game_args.push(substitute(arg, &vars));
+        }
+    }
+
+    // 直接进存档：1.20+ 的 --quickPlaySingleplayer（存档名带空格也只占一个参数）
+    if let Some(level) = options
+        .quick_play
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !game_args.iter().any(|arg| arg == "--quickPlaySingleplayer") {
+            game_args.extend(crate::updates::quick_play_args(level));
         }
     }
 
@@ -499,6 +513,7 @@ mod tests {
             username: "Steve".to_string(),
             uuid: String::new(),
             access_token: String::new(),
+            quick_play: None,
         }
     }
 

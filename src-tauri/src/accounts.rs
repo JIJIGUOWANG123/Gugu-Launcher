@@ -42,10 +42,31 @@ pub fn dashed_uuid(uuid: &str) -> String {
 pub struct AccountItem {
     pub id: i64,
     pub name: String,
+    /// 前端契约字段：microsoft / offline
+    #[serde(rename = "type")]
+    pub account_type: String,
+    /// 内部 kind：ms / offline（前端也认这个字段）
     pub kind: String,
     pub uuid: String,
+    /// 是否当前账号（前端字段名是 current）
+    #[serde(rename = "current")]
     pub is_current: bool,
+    /// 账号皮肤：优先本地已下载的皮肤（data URL），其次正版贴图地址
+    pub skin_data_url: Option<String>,
+    /// 正版贴图地址（只给后端用，不进 JSON）
+    #[serde(skip)]
     pub skin_url: Option<String>,
+}
+
+impl AccountItem {
+    /// kind → 前端 type：只有 ms 算微软账号，其余都是离线。
+    pub fn type_of(kind: &str) -> &'static str {
+        if kind == "ms" {
+            "microsoft"
+        } else {
+            "offline"
+        }
+    }
 }
 
 /// 落盘的账号（含令牌，绝不直接序列化给前端）。
@@ -63,17 +84,34 @@ pub struct StoredAccount {
     pub refresh_token: String,
     #[serde(default)]
     pub skin_url: String,
+    /// 登录后下载到 .mc/skins 的皮肤文件绝对路径（空串表示没有）
+    #[serde(default)]
+    pub local_skin: String,
     pub created_at: String,
 }
 
 impl StoredAccount {
     pub fn to_item(&self, current: Option<i64>) -> AccountItem {
+        let local = std::path::Path::new(self.local_skin.trim());
+        let skin_data_url = local
+            .is_file()
+            .then(|| crate::skins::png_data_url(local, crate::skins::MAX_DATA_URL_BYTES))
+            .flatten()
+            .or_else(|| {
+                if self.skin_url.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.skin_url.clone())
+                }
+            });
         AccountItem {
             id: self.id,
             name: self.name.clone(),
+            account_type: AccountItem::type_of(&self.kind).to_string(),
             kind: self.kind.clone(),
             uuid: self.uuid.clone(),
             is_current: current == Some(self.id),
+            skin_data_url,
             skin_url: if self.skin_url.trim().is_empty() {
                 None
             } else {
@@ -164,6 +202,29 @@ pub fn list(paths: &Paths) -> Vec<AccountItem> {
         .collect()
 }
 
+/// 登录后把这条账号的外观信息写回（皮肤地址 / 本地皮肤文件）。
+pub fn set_appearance(
+    paths: &Paths,
+    id: i64,
+    skin_url: Option<&str>,
+    local_skin: Option<&str>,
+) -> Result<()> {
+    let mut file = load(paths);
+    let account = file
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == id)
+        .ok_or_else(|| AppError::Invalid(format!("账号不存在：{id}")))?;
+    if let Some(url) = skin_url {
+        account.skin_url = url.to_string();
+    }
+    if let Some(local) = local_skin {
+        account.local_skin = local.to_string();
+    }
+    account.kind = "ms".to_string();
+    save(paths, &file)
+}
+
 /// 当前账号（启动时用）：返回 (用户名, uuid, access_token)。
 pub fn current_credentials(paths: &Paths) -> Option<(String, String, String)> {
     let file = load(paths);
@@ -172,11 +233,13 @@ pub fn current_credentials(paths: &Paths) -> Option<(String, String, String)> {
         .accounts
         .iter()
         .find(|account| account.id == current)?;
-    Some((
-        account.name.clone(),
-        account.uuid.clone(),
-        account.access_token.clone(),
-    ))
+    // uuid 缺失（档案没读到）时按离线 uuid 兜底，启动参数里不会出现空 uuid
+    let uuid = if account.uuid.trim().is_empty() {
+        offline_uuid(&account.name)
+    } else {
+        account.uuid.clone()
+    };
+    Some((account.name.clone(), uuid, account.access_token.clone()))
 }
 
 pub fn add_offline(paths: &Paths, name: &str) -> Result<AccountItem> {
@@ -199,6 +262,7 @@ pub fn add_offline(paths: &Paths, name: &str) -> Result<AccountItem> {
         access_token: "0".to_string(),
         refresh_token: String::new(),
         skin_url: String::new(),
+        local_skin: String::new(),
         created_at: util::iso8601(util::now_unix()),
     };
     file.accounts.push(account);
@@ -211,12 +275,14 @@ pub fn add_offline(paths: &Paths, name: &str) -> Result<AccountItem> {
         .iter()
         .find(|item| item.id == id)
         .map(|item| item.to_item(file.current))
-        .unwrap_or(AccountItem {
+        .unwrap_or_else(|| AccountItem {
             id,
             name,
+            account_type: AccountItem::type_of("offline").to_string(),
             kind: "offline".to_string(),
             uuid: String::new(),
             is_current: true,
+            skin_data_url: None,
             skin_url: None,
         }))
 }
@@ -230,7 +296,18 @@ pub fn upsert_ms(
     refresh_token: &str,
 ) -> Result<AccountItem> {
     let mut file = load(paths);
-    let id = match file.accounts.iter().position(|account| account.uuid == uuid) {
+    let uuid_known = !uuid.trim().is_empty();
+    // 先按 uuid 认账号；uuid 缺失（档案读不出来）时退化成按名字找同名微软账号
+    let id = match file
+        .accounts
+        .iter()
+        .position(|account| uuid_known && account.uuid == uuid)
+        .or_else(|| {
+            file.accounts.iter().position(|account| {
+                account.kind == "ms" && account.name.eq_ignore_ascii_case(name)
+            })
+        })
+    {
         Some(index) => file.accounts[index].id,
         None => {
             let id = file.next_id.max(1);
@@ -243,6 +320,7 @@ pub fn upsert_ms(
                 access_token: String::new(),
                 refresh_token: String::new(),
                 skin_url: String::new(),
+                local_skin: String::new(),
                 created_at: util::iso8601(util::now_unix()),
             });
             id
@@ -253,7 +331,9 @@ pub fn upsert_ms(
         account.access_token = access_token.to_string();
         account.refresh_token = refresh_token.to_string();
         account.kind = "ms".to_string();
-        account.uuid = uuid.to_string();
+        if uuid_known {
+            account.uuid = uuid.to_string();
+        }
     }
     file.current = Some(id);
     save(paths, &file)?;
@@ -261,14 +341,38 @@ pub fn upsert_ms(
     Ok(list(paths)
         .into_iter()
         .find(|item| item.id == id)
-        .unwrap_or(AccountItem {
+        .unwrap_or_else(|| AccountItem {
             id,
             name: name.to_string(),
+            account_type: AccountItem::type_of("ms").to_string(),
             kind: "ms".to_string(),
             uuid: uuid.to_string(),
             is_current: true,
+            skin_data_url: None,
             skin_url: None,
         }))
+}
+
+/// 刷新后回写令牌：只动令牌字段，不动当前账号。
+pub fn update_tokens(
+    paths: &Paths,
+    id: i64,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    let mut file = load(paths);
+    let account = file
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == id)
+        .ok_or_else(|| AppError::Invalid(format!("账号不存在：{id}")))?;
+    account.access_token = access_token.to_string();
+    if !refresh_token.trim().is_empty() {
+        account.refresh_token = refresh_token.to_string();
+    }
+    save(paths, &file)?;
+    tracing::info!(id, token = %util::mask_secret(access_token), "微软令牌已更新");
+    Ok(())
 }
 
 pub fn apply(paths: &Paths, id: i64) -> Result<()> {
@@ -283,6 +387,17 @@ pub fn apply(paths: &Paths, id: i64) -> Result<()> {
 pub fn delete(paths: &Paths, id: i64) -> Result<()> {
     let mut file = load(paths);
     let before = file.accounts.len();
+    // 登出要干净：连同登录时下载的皮肤文件一起删掉
+    if let Some(account) = file.accounts.iter().find(|account| account.id == id) {
+        let local = account.local_skin.trim().to_string();
+        if !local.is_empty() {
+            if let Err(err) = std::fs::remove_file(&local) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(%err, path = %local, "删除账号皮肤文件失败");
+                }
+            }
+        }
+    }
     file.accounts.retain(|account| account.id != id);
     if file.accounts.len() == before {
         return Err(AppError::Invalid(format!("账号不存在：{id}")));
@@ -315,6 +430,75 @@ mod tests {
         let paths = Paths::from_root(&root);
         paths.ensure().unwrap();
         paths
+    }
+
+#[test]
+    fn ms_account_serializes_as_microsoft_even_without_uuid() {
+        let paths = temp_paths("ms-kind");
+        // 档案读不出来时 uuid 为空：仍然必须是微软账号
+        let item = upsert_ms(&paths, "微软账号", "", "token-1", "refresh-1").unwrap();
+        assert_eq!(item.kind, "ms");
+        assert_eq!(item.account_type, "microsoft");
+        assert_eq!(item.uuid, "");
+        // 再登录一次（这次有 uuid）：按名字复用同一条，不新增
+        let same = upsert_ms(
+            &paths,
+            "微软账号",
+            "0123456789abcdef0123456789abcdef",
+            "token-2",
+            "refresh-2",
+        )
+        .unwrap();
+        assert_eq!(same.id, item.id);
+        assert_eq!(same.uuid, "0123456789abcdef0123456789abcdef");
+        assert_eq!(list(&paths).len(), 1);
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn account_item_json_follows_the_frontend_contract() {
+        let paths = temp_paths("account-json");
+        let offline = add_offline(&paths, "Steve").unwrap();
+        let value = serde_json::to_value(&offline).unwrap();
+        assert_eq!(value["type"], "offline");
+        assert_eq!(value["kind"], "offline");
+        assert_eq!(value["current"], true);
+        assert!(value.get("skinDataUrl").is_some());
+        assert!(value.get("isCurrent").is_none(), "前端只认 current");
+        assert!(value.get("accessToken").is_none(), "令牌不能出后端");
+        let ms = upsert_ms(&paths, "Notch", "069a79f444e94726a5befca90e38aaf5", "t", "r").unwrap();
+        let value = serde_json::to_value(&ms).unwrap();
+        assert_eq!(value["type"], "microsoft");
+        assert_eq!(value["kind"], "ms");
+        assert_eq!(value["current"], true);
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn deleting_account_removes_downloaded_skin_file() {
+        let paths = temp_paths("account-skin-clean");
+        let item = upsert_ms(&paths, "Notch", "069a79f444e94726a5befca90e38aaf5", "t", "r").unwrap();
+        std::fs::create_dir_all(&paths.skins).unwrap();
+        let skin = paths.skins.join("Notch.png");
+        std::fs::write(
+            &skin,
+            crate::png::encode_png(64, 64, &vec![0u8; 64 * 64 * 4]).unwrap(),
+        )
+        .unwrap();
+        set_appearance(&paths, item.id, Some("https://t/skin.png"), skin.to_str()).unwrap();
+        let stored = list(&paths)
+            .into_iter()
+            .find(|entry| entry.id == item.id)
+            .unwrap();
+        assert!(stored
+            .skin_data_url
+            .as_deref()
+            .map(|url| url.starts_with("data:image/png;base64,"))
+            .unwrap_or(false));
+        delete(&paths, item.id).unwrap();
+        assert!(!skin.exists(), "登出后皮肤文件要一起删掉");
+        assert!(list(&paths).is_empty());
+        let _ = std::fs::remove_dir_all(&paths.root);
     }
 
     #[test]

@@ -8,7 +8,7 @@ import { useT } from "../lib/i18n";
 import { isTauri } from "../lib/tauri-api";
 import type { ThemeMode } from "../lib/types";
 
-export type PageKey = "home" | "instances" | "net" | "content" | "accounts" | "skins" | "about" | "settings";
+export type PageKey = "home" | "instances" | "net" | "content" | "accounts" | "skins" | "about" | "fun" | "seedmap" | "settings";
 
 interface NavItem {
   key: PageKey;
@@ -99,6 +99,39 @@ export function TopBar({ active, onSelect, theme, onToggleTheme }: Props) {
             <circle cx="12" cy="7.6" r="0.9" fill="currentColor" stroke="none" />
           </svg>
           <span className="topnav-item__label">{t("nav.about")}</span>
+        </button>
+        {/* 娱乐：也没有彩色素材，同样用内联 SVG（星星 + 笑脸弧线） */}
+        <button
+          type="button"
+          className={"topnav-item" + (active === "fun" ? " is-active" : "")}
+          data-page="fun"
+          aria-current={active === "fun" ? "page" : undefined}
+          title={t("nav.fun")}
+          onClick={() => onSelect("fun")}
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M8.5 14.2c.9 1.3 2.1 2 3.5 2s2.6-.7 3.5-2" />
+            <circle cx="9.2" cy="9.6" r="0.9" fill="currentColor" stroke="none" />
+            <circle cx="14.8" cy="9.6" r="0.9" fill="currentColor" stroke="none" />
+          </svg>
+          <span className="topnav-item__label">{t("nav.fun")}</span>
+        </button>
+        {/* 种子地图：同样没有彩色素材，用内联 SVG（地球 + 经纬线） */}
+        <button
+          type="button"
+          className={"topnav-item" + (active === "seedmap" ? " is-active" : "")}
+          data-page="seedmap"
+          aria-current={active === "seedmap" ? "page" : undefined}
+          title={t("nav.seedmap")}
+          onClick={() => onSelect("seedmap")}
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M3 12h18" />
+            <path d="M12 3c2.6 2.5 4 5.6 4 9s-1.4 6.5-4 9c-2.6-2.5-4-5.6-4-9s1.4-6.5 4-9z" />
+          </svg>
+          <span className="topnav-item__label">{t("nav.seedmap")}</span>
         </button>
       </nav>
 

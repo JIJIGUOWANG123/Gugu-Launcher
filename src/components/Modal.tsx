@@ -8,6 +8,8 @@ interface Props {
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
+  /** 需要更多横向空间的弹窗（例如披风网格）加个修饰类 */
+  className?: string;
 }
 
 /**
@@ -20,7 +22,7 @@ interface Props {
  *
  * 同时给 body 加 modal-open，由 CSS 负责模糊底层内容。
  */
-export function Modal({ title, onClose, children, footer }: Props) {
+export function Modal({ title, onClose, children, footer, className }: Props) {
   const t = useT();
 
   useEffect(() => {
@@ -37,7 +39,7 @@ export function Modal({ title, onClose, children, footer }: Props) {
 
   return createPortal(
     <div className="modal-overlay" role="dialog" aria-modal="true" aria-label={title} onClick={onClose}>
-      <div className="modal" onClick={(event) => event.stopPropagation()}>
+      <div className={"modal" + (className ? " " + className : "")} onClick={(event) => event.stopPropagation()}>
         <div className="modal__head">
           <h3 className="modal__title">{title}</h3>
           <button className="icon-button" title={t("common.cancel")} onClick={onClose}>

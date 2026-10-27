@@ -29,6 +29,8 @@ pub struct DeviceCodeStart {
     pub configured: bool,
     pub user_code: Option<String>,
     pub verify_url: Option<String>,
+    /// 前端优先用这个字段打开浏览器（与 verify_url 同值，两个都给）
+    pub verification_uri: Option<String>,
     pub device_code: Option<String>,
     pub expires_in: Option<u64>,
     pub message: String,
@@ -219,6 +221,7 @@ pub async fn start_device_code(
             configured: false,
             user_code: None,
             verify_url: None,
+            verification_uri: None,
             device_code: None,
             expires_in: None,
             message: "请先在「设置 → 内容服务」里填写微软登录 Client ID".to_string(),
@@ -243,6 +246,7 @@ pub async fn start_device_code(
     Ok(DeviceCodeStart {
         configured: true,
         user_code: Some(parsed.user_code),
+        verification_uri: Some(parsed.verify_url.clone()),
         verify_url: Some(parsed.verify_url),
         device_code: Some(parsed.device_code),
         expires_in: Some(parsed.expires_in),
@@ -306,18 +310,110 @@ pub async fn poll_once(
     let (xbl_token, uhs) = xbox_authenticate(client, &ms_token).await?;
     let (xsts_token, xsts_uhs) = xsts_authorize(client, &xbl_token, &uhs).await?;
     let mc_token = minecraft_login(client, &xsts_uhs, &xsts_token).await?;
-    let (name, uuid, skin) = minecraft_profile(client, &mc_token).await?;
+    // 档案读不出来也要落成微软账号（kind 永远是 ms，绝不回落到 offline）
+    let (name, uuid) = match minecraft_profile(client, &mc_token).await {
+        Ok((name, uuid, _skin)) => (name, uuid),
+        Err(err) => {
+            tracing::warn!(%err, "登录后读取档案失败，账号仍按微软账号保存");
+            (fallback_ms_name(paths, &refresh_token), String::new())
+        }
+    };
     let account = accounts::upsert_ms(paths, &name, &uuid, &mc_token, &refresh_token)?;
-    tracing::info!(player = %name, "微软账号登录成功");
-    let mut account = account;
-    if let Some(skin) = skin {
-        account.skin_url = Some(skin);
-    }
+    let account_id = account.id;
+
+    // 登录成功后同步外观（皮肤落盘 + 清披风缓存）；失败只 warn，不影响登录
+    let (skin, cape) = match crate::capes::refresh_appearance(client, paths, &mc_token, account_id).await
+    {
+        Ok(profile) => (
+            !profile.skin_url.is_empty(),
+            !profile.cape_url.is_empty(),
+        ),
+        Err(err) => {
+            tracing::warn!(%err, "登录后同步外观失败（不影响登录）");
+            (false, false)
+        }
+    };
+    tracing::info!(
+        name = %account.name,
+        uuid = %account.uuid,
+        skin = if skin { "有" } else { "无" },
+        cape = if cape { "有" } else { "无" },
+        token = %util::mask_secret(&mc_token),
+        "微软登录成功"
+    );
+    let refreshed = accounts::list(paths)
+        .into_iter()
+        .find(|item| item.id == account_id)
+        .or(Some(account));
     Ok(LoginPoll {
         state: "done".to_string(),
-        account: Some(account),
+        account: refreshed,
         message: Some("登录成功".to_string()),
     })
+}
+
+/// 档案读取失败时的账号名回落：同 refresh_token 的旧账号 → 占位名。
+fn fallback_ms_name(paths: &Paths, refresh_token: &str) -> String {
+    let file = accounts::load(paths);
+    file.accounts
+        .iter()
+        .find(|account| {
+            account.kind == "ms"
+                && !refresh_token.trim().is_empty()
+                && account.refresh_token == refresh_token
+        })
+        .map(|account| account.name.clone())
+        .unwrap_or_else(|| "微软账号".to_string())
+}
+
+/// 用 refresh_token 换一份新的 Minecraft 令牌（capes / 皮肤上传前发现 401 时调）。
+///
+/// 成功时把新令牌写回 accounts.json 并返回；refresh_token 失效返回 Ok(None)。
+pub async fn refresh_access_token(
+    client: &reqwest::Client,
+    paths: &Paths,
+    settings: &crate::settings::Settings,
+    account: &accounts::StoredAccount,
+) -> Result<Option<String>> {
+    if account.refresh_token.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(client_id) = ms_auth::client_id(settings) else {
+        tracing::warn!("没有配置微软 Client ID，无法刷新令牌");
+        return Ok(None);
+    };
+    let response = client
+        .post(TOKEN_URL)
+        .form(&[
+            ("client_id", client_id),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", account.refresh_token.trim()),
+            ("scope", SCOPE),
+        ])
+        .send()
+        .await
+        .map_err(|err| AppError::Net(format!("刷新令牌失败：{err}")))?;
+    let text = response
+        .text()
+        .await
+        .map_err(|err| AppError::Net(format!("读取刷新响应失败：{err}")))?;
+    let (ms_token, refresh_token) = match parse_token_response(&text) {
+        TokenOutcome::Ready {
+            access_token,
+            refresh_token,
+        } => (access_token, refresh_token),
+        TokenOutcome::Pending(reason) => {
+            tracing::warn!(%reason, "刷新令牌被拒绝");
+            return Ok(None);
+        }
+    };
+
+    let (xbl_token, uhs) = xbox_authenticate(client, &ms_token).await?;
+    let (xsts_token, xsts_uhs) = xsts_authorize(client, &xbl_token, &uhs).await?;
+    let mc_token = minecraft_login(client, &xsts_uhs, &xsts_token).await?;
+    accounts::update_tokens(paths, account.id, &mc_token, &refresh_token)?;
+    tracing::info!(token = %util::mask_secret(&mc_token), "已刷新微软访问令牌");
+    Ok(Some(mc_token))
 }
 
 async fn xbox_authenticate(client: &reqwest::Client, ms_token: &str) -> Result<(String, String)> {

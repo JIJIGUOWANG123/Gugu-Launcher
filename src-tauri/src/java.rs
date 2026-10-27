@@ -29,12 +29,62 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const PROBE_SAMPLES: usize = 3;
 /// 探测缓存有效期。
 pub const PROBE_CACHE_TTL: Duration = Duration::from_secs(600);
-/// Oracle 只能手动下载。
-pub const ORACLE_PAGE: &str = "https://www.oracle.com/java/technologies/downloads/";
 /// 可自动下载的源（顺序＝UI 顺序）。
-pub const INSTALLABLE_SOURCES: [&str; 4] = ["bellsoft", "adoptium", "tuna", "azul"];
+///
+/// bellsoft 与 adoptium 官方（下载都走 github.com）国内太慢，已从可下载清单里删掉；
+/// oracle 官方只给下载页（403 + OTN 许可），这里只保留能直接下 zip 的 6 家。
+pub const INSTALLABLE_SOURCES: [&str; 6] = [
+    "tuna",
+    "lzu",
+    "zulu-injdk",
+    "oracle-injdk",
+    "microsoft",
+    "azul",
+];
+/// 只能手动安装的源（只给「前往下载页」）。
+pub const MANUAL_SOURCES: [&str; 1] = ["oracle"];
+/// Oracle 官方下载页（人工安装）。
+pub const ORACLE_PAGE: &str = "https://www.oracle.com/java/technologies/downloads/";
+/// Oracle JDK 的许可提示（写进来源描述与错误文案）。
+pub const ORACLE_LICENSE_NOTE: &str = "Oracle JDK 受 OTN 许可约束，商用请自行确认";
+/// Microsoft Build of OpenJDK 支持的 LTS 主版本（aka.ms 直链按主版本给）。
+pub const MICROSOFT_MAJORS: [u32; 4] = [11, 17, 21, 25];
+/// Microsoft 的下载页（版本说明写在 UI 里）。
+pub const MICROSOFT_PAGE: &str = "https://learn.microsoft.com/zh-cn/java/openjdk/download";
+/// injdk.cn 的 Zulu 镜像根（Caddy 目录列表，<major>/ 下按平台分文件）。
+pub const INJDK_ZULU_ROOT: &str = "https://d10.injdk.cn/openjdk/zulu";
+/// injdk.cn 的 Oracle JDK 镜像根（同上，文件名 *_windows-x64_bin.zip）。
+pub const INJDK_ORACLE_ROOT: &str = "https://d10.injdk.cn/openjdk/oraclejdk";
+/// 清华 TUNA 的 Adoptium 目录根（大写 Adoptium）。
+pub const TUNA_ROOT: &str = "https://mirrors.tuna.tsinghua.edu.cn/Adoptium";
+/// 兰州大学的 Adoptium 目录根（小写 adoptium）。
+pub const LZU_ROOT: &str = "https://mirrors.lzu.edu.cn/adoptium";
+/// 兰大的备用端口（实测 200，与 LZU_ROOT 同一份内容）。
+pub const LZU_SPARE_ROOT: &str = "https://mirror.lzu.edu.cn:8080/adoptium";
+/// Adoptium 目录镜像（文件名完全一致，只换根路径即可互备）。
+pub const ADOPTIUM_MIRRORS: [&str; 3] = [TUNA_ROOT, LZU_ROOT, LZU_SPARE_ROOT];
+
+/// 镜像的目录根（实测：TUNA 是 /Adoptium/，兰大是小写 /adoptium/）。
+pub fn mirror_root(source: &str) -> Option<&'static str> {
+    match source {
+        "tuna" => Some(TUNA_ROOT),
+        "lzu" => Some(LZU_ROOT),
+        _ => None,
+    }
+}
+
+/// 同文件名可互备的镜像根，按尝试顺序（含兰大 :8080 备用端口）。
+pub fn mirror_roots(source: &str) -> Vec<&'static str> {
+    match source {
+        "tuna" => vec![TUNA_ROOT, LZU_ROOT, LZU_SPARE_ROOT],
+        "lzu" => vec![LZU_ROOT, LZU_SPARE_ROOT, TUNA_ROOT],
+        _ => Vec::new(),
+    }
+}
 /// 常见 LTS 主版本。
 pub const LTS_MAJORS: [u32; 5] = [8, 11, 17, 21, 25];
+/// 下载 JDK 包时的分片连接数（单个 200MB 包单流很容易中途失败）。
+pub const INSTALL_CONNECTIONS: usize = 4;
 
 // ------------------------------------------------------------------ 数据结构
 
@@ -655,24 +705,42 @@ pub fn source_display_name(id: &str) -> String {
 
 // ------------------------------------------------------------------ 元数据端点
 
-/// BellSoft Liberica 元数据（实测 200；注意 arch=x86 就是 amd64，
-/// 传 x64 会被拒 400；os/bundle-type/package-type 用短横线参数名）。
-pub fn bellsoft_api_url(major: u32) -> String {
-    format!(
-        "https://api.bell-sw.com/v1/liberica/releases?version-feature={major}&os=windows&arch=x86&bundle-type=jdk&package-type=zip"
-    )
+/// injdk.cn 的 Zulu 目录（Caddy 列表；文件名形如 zulu21.50.19-ca-jdk21.0.11-win_x64.zip）。
+pub fn injdk_zulu_dir_url(major: u32) -> String {
+    format!("{INJDK_ZULU_ROOT}/{major}/")
 }
 
-/// Eclipse Adoptium 最新资产（实测 200）。
-pub fn adoptium_api_url(major: u32) -> String {
-    format!(
-        "https://api.adoptium.net/v3/assets/latest/{major}/hotspot?os=windows&architecture=x64&image_type=jdk&vendor=eclipse"
-    )
+/// injdk.cn 的 Oracle JDK 目录（文件名形如 jdk-21_windows-x64_bin.zip）。
+pub fn injdk_oracle_dir_url(major: u32) -> String {
+    format!("{INJDK_ORACLE_ROOT}/{major}/")
+}
+
+/// Microsoft 的 aka.ms 直链（只覆盖 11/17/21/25，其余主版本返回 None）。
+pub fn microsoft_zip_url(major: u32) -> Option<String> {
+    if !MICROSOFT_MAJORS.contains(&major) {
+        return None;
+    }
+    Some(format!(
+        "https://aka.ms/download-jdk/microsoft-jdk-{major}-windows-x64.zip"
+    ))
 }
 
 /// 清华 TUNA 的 Adoptium 目录列表（实测 200，Apache 风格 HTML）。
 pub fn tuna_list_url(major: u32) -> String {
     format!("https://mirrors.tuna.tsinghua.edu.cn/Adoptium/{major}/jdk/x64/windows/")
+}
+
+/// 兰州大学镜像的 Adoptium 目录（实测 200，路径是小写 adoptium）。
+pub fn lzu_list_url(major: u32) -> String {
+    format!("https://mirrors.lzu.edu.cn/adoptium/{major}/jdk/x64/windows/")
+}
+
+/// 镜像目录地址（tuna / lzu 结构一致，只差根路径的字母大小写）。
+pub fn mirror_list_url(source: &str, major: u32) -> String {
+    match mirror_root(source) {
+        Some(root) => format!("{root}/{major}/jdk/x64/windows/"),
+        None => tuna_list_url(major),
+    }
 }
 
 /// Azul Zulu 元数据（实测 200；返回 {value:[...],Count:n}）。
@@ -682,37 +750,53 @@ pub fn azul_api_url(major: u32) -> String {
     )
 }
 
-/// 下载源表（java_sources）。
+/// 下载源表（java_sources）：6 家可下载 + oracle 仅跳转。
 pub fn sources_table() -> Vec<JavaSourceInfo> {
     vec![
         JavaSourceInfo {
-            id: "bellsoft".to_string(),
-            name: "BellSoft Liberica".to_string(),
-            description: "Liberica 官方元数据（api.bell-sw.com），GitHub Releases 直链，LTS 版本齐全".to_string(),
-            requires_license: false,
-        },
-        JavaSourceInfo {
-            id: "adoptium".to_string(),
-            name: "Eclipse Temurin".to_string(),
-            description: "Adoptium 官方元数据（api.adoptium.net），GitHub Releases 直链".to_string(),
-            requires_license: false,
-        },
-        JavaSourceInfo {
             id: "tuna".to_string(),
             name: "清华 TUNA 镜像 · Temurin".to_string(),
-            description: "mirrors.tuna.tsinghua.edu.cn 目录镜像，国内速度最快".to_string(),
+            description: "mirrors.tuna.tsinghua.edu.cn/Adoptium，国内最快，可自动下载".to_string(),
+            requires_license: false,
+        },
+        JavaSourceInfo {
+            id: "lzu".to_string(),
+            name: "兰州大学镜像 · Temurin".to_string(),
+            description:
+                "mirrors.lzu.edu.cn/adoptium（备用 mirror.lzu.edu.cn:8080），与清华同结构可互备"
+                    .to_string(),
+            requires_license: false,
+        },
+        JavaSourceInfo {
+            id: "zulu-injdk".to_string(),
+            name: "injdk.cn 镜像 · Zulu".to_string(),
+            description: "d10.injdk.cn/openjdk/zulu，Caddy 目录列表，取 *-win_x64.zip".to_string(),
+            requires_license: false,
+        },
+        JavaSourceInfo {
+            id: "oracle-injdk".to_string(),
+            name: "injdk.cn 镜像 · Oracle JDK".to_string(),
+            description: format!(
+                "d10.injdk.cn/openjdk/oraclejdk，可直链下载；{ORACLE_LICENSE_NOTE}"
+            ),
+            requires_license: false,
+        },
+        JavaSourceInfo {
+            id: "microsoft".to_string(),
+            name: "Microsoft Build of OpenJDK".to_string(),
+            description: format!("aka.ms/download-jdk 直链，下载页 {MICROSOFT_PAGE}"),
             requires_license: false,
         },
         JavaSourceInfo {
             id: "azul".to_string(),
             name: "Azul Zulu".to_string(),
-            description: "Zulu 官方元数据（api.azul.com）+ cdn.azul.com 直链".to_string(),
+            description: "api.azul.com 元数据 + cdn.azul.com 直链".to_string(),
             requires_license: false,
         },
         JavaSourceInfo {
             id: "oracle".to_string(),
-            name: "Oracle JDK".to_string(),
-            description: format!("需要接受 Oracle 许可，只能手动下载：{ORACLE_PAGE}"),
+            name: "Oracle 官方（需登录）".to_string(),
+            description: format!("只能到 {ORACLE_PAGE} 手动下载；{ORACLE_LICENSE_NOTE}"),
             requires_license: true,
         },
     ]
@@ -721,51 +805,109 @@ pub fn sources_table() -> Vec<JavaSourceInfo> {
 /// 该源用来测速的地址。
 pub fn source_probe_url(source: &str, major: u32) -> String {
     match source {
-        "bellsoft" => bellsoft_api_url(major),
-        "adoptium" => adoptium_api_url(major),
-        "tuna" => tuna_list_url(major),
+        "tuna" | "lzu" => mirror_list_url(source, major),
+        "zulu-injdk" => injdk_zulu_dir_url(major),
+        "oracle-injdk" => injdk_oracle_dir_url(major),
+        // aka.ms 会 302 到带版本号的文件名，HEAD 跟着走就能测
+        "microsoft" => microsoft_zip_url(major).unwrap_or_else(|| MICROSOFT_PAGE.to_string()),
         "azul" => azul_api_url(major),
-        _ => ORACLE_PAGE.to_string(),
+        "oracle" => ORACLE_PAGE.to_string(),
+        _ => tuna_list_url(major),
     }
 }
 
-fn value_as_u64(value: &serde_json::Value, key: &str) -> u64 {
-    value.get(key).and_then(|item| item.as_u64()).unwrap_or(0)
+/// Caddy 目录列表里要挑哪种 zip。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaddyKind {
+    /// injdk 的 Zulu：只认 *-win_x64.zip
+    Zulu,
+    /// injdk 的 Oracle JDK：只认 *_windows-x64_bin.zip（老包是 -windows-x64.zip）
+    Oracle,
 }
 
-/// BellSoft JSON → 版本列表。
-pub fn parse_bellsoft(json: &str, major: u32) -> Vec<JavaVersionInfo> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(items) = value.as_array() else {
-        return Vec::new();
+impl CaddyKind {
+    fn accepts(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        match self {
+            CaddyKind::Zulu => lower.ends_with("-win_x64.zip"),
+            CaddyKind::Oracle => {
+                lower.ends_with("_windows-x64_bin.zip") || lower.ends_with("-windows-x64.zip")
+            }
+        }
+    }
+
+    /// zulu21.50.19-ca-jdk21.0.11-win_x64.zip → 21.0.11
+    /// jdk-21_windows-x64_bin.zip → 21（老包 jdk-8u491-windows-x64.zip → 8u491）
+    fn version_of(&self, name: &str) -> Option<String> {
+        let lower = name.to_ascii_lowercase();
+        let (marker, take_dot) = match self {
+            CaddyKind::Zulu => ("jdk", true),
+            CaddyKind::Oracle => ("jdk-", false),
+        };
+        let start = lower.find(marker)? + marker.len();
+        let version: String = name[start..]
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_digit() || (take_dot && *character == '.') || (!take_dot && character.is_ascii_alphabetic())
+            })
+            .collect();
+        if version.is_empty() {
+            None
+        } else {
+            Some(version)
+        }
+    }
+}
+
+/// Caddy 目录列表 → 版本列表。
+///
+/// 实测结构（d10.injdk.cn）：
+/// `<a href="./xxx-win_x64.zip">…</a>` 后面紧跟 `<td class="size" data-size="188640192">`。
+pub fn parse_caddy_listing(
+    html: &str,
+    base: &str,
+    major: u32,
+    source: &str,
+    kind: CaddyKind,
+) -> Vec<JavaVersionInfo> {
+    let base = if base.ends_with('/') {
+        base.to_string()
+    } else {
+        format!("{base}/")
     };
     let mut out: Vec<JavaVersionInfo> = Vec::new();
-    for item in items {
-        let arch = item.get("architecture").and_then(|v| v.as_str()).unwrap_or("");
-        let bundle = item.get("bundleType").and_then(|v| v.as_str()).unwrap_or("");
-        let package = item.get("packageType").and_then(|v| v.as_str()).unwrap_or("");
-        let os = item.get("os").and_then(|v| v.as_str()).unwrap_or("");
-        // BellSoft 的 arch=x86 同时包含 amd64 与 i586，靠 bitness 只留 64 位
-        let bitness = item.get("bitness").and_then(|v| v.as_u64()).unwrap_or(64);
-        if arch != "x86" || bitness != 64 || bundle != "jdk" || package != "zip" || os != "windows" {
+    let mut rest = html;
+    while let Some(position) = rest.find("href=\"") {
+        let after = &rest[position + "href=\"".len()..];
+        let Some(end) = after.find('"') else { break };
+        let href = &after[..end];
+        // 从 href 之后继续扫，size 列在同一个 <tr> 里、href 后面
+        rest = &after[end..];
+        if href.starts_with("..") || !href.to_ascii_lowercase().ends_with(".zip") {
             continue;
         }
-        let Some(version) = item.get("version").and_then(|v| v.as_str()) else {
+        let name = href.trim_start_matches("./");
+        if !kind.accepts(name) {
+            continue;
+        }
+        let Some(version) = kind.version_of(name) else {
             continue;
         };
-        let Some(url) = item.get("downloadUrl").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let lts = item.get("LTS").and_then(|v| v.as_bool()).unwrap_or(false);
+        let size = rest
+            .find("data-size=\"")
+            .and_then(|index| {
+                let tail = &rest[index + "data-size=\"".len()..];
+                tail.find('"')
+                    .and_then(|end| tail[..end].trim().parse::<u64>().ok())
+            })
+            .unwrap_or(0);
         out.push(JavaVersionInfo {
-            source: "bellsoft".to_string(),
-            version: version.to_string(),
+            source: source.to_string(),
+            version,
             major,
-            lts,
-            size_bytes: value_as_u64(item, "size"),
-            url: url.to_string(),
+            lts: LTS_MAJORS.contains(&major),
+            size_bytes: size,
+            url: format!("{base}{name}"),
         });
     }
     out.sort_by(|left, right| right.version.cmp(&left.version));
@@ -773,51 +915,70 @@ pub fn parse_bellsoft(json: &str, major: u32) -> Vec<JavaVersionInfo> {
     out
 }
 
-/// Adoptium JSON → 版本列表（binary.package 里是 zip 直链）。
-pub fn parse_adoptium(json: &str, major: u32) -> Vec<JavaVersionInfo> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(items) = value.as_array() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for item in items {
-        let package = item.pointer("/binary/package");
-        let Some(url) = package.and_then(|p| p.get("link")).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let name = package
-            .and_then(|p| p.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let version = item
-            .get("release_name")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string)
-            .or_else(|| {
-                item.pointer("/version/semver")
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            })
-            .unwrap_or_else(|| name.to_string());
-        let lts = item
-            .pointer("/version/semver")
-            .and_then(|v| v.as_str())
-            .map(|semver| semver.to_ascii_uppercase().contains("LTS"))
-            .unwrap_or(false)
-            || LTS_MAJORS.contains(&major);
-        out.push(JavaVersionInfo {
-            source: "adoptium".to_string(),
-            version: version.trim_start_matches("jdk-").to_string(),
-            major,
-            lts,
-            size_bytes: package.and_then(|p| p.get("size")).and_then(|v| v.as_u64()).unwrap_or(0),
-            url: url.to_string(),
-        });
+/// microsoft-jdk-21.0.13.0.2-windows-x64.zip → 21.0.13.0.2
+pub fn microsoft_version_from_name(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let marker = "microsoft-jdk-";
+    let start = lower.find(marker)? + marker.len();
+    let version: String = name[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect();
+    let version = version.trim_end_matches('.').to_string();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
     }
-    out.sort_by(|left, right| right.version.cmp(&left.version));
-    out
+}
+
+/// Microsoft 只有一个 aka.ms 直链：HEAD 跟着 302 走到带版本号的文件名，取长度与版本。
+pub async fn fetch_microsoft_version(
+    client: &reqwest::Client,
+    major: u32,
+) -> Vec<JavaVersionInfo> {
+    let Some(url) = microsoft_zip_url(major) else {
+        return Vec::new();
+    };
+    let response = match tokio::time::timeout(Duration::from_secs(20), client.head(&url).send())
+        .await
+    {
+        Ok(Ok(response)) if response.status().is_success() => response,
+        Ok(Ok(response)) => {
+            tracing::warn!(major, status = response.status().as_u16(), "Microsoft JDK 探测失败");
+            return Vec::new();
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(major, %err, "Microsoft JDK 探测失败");
+            return Vec::new();
+        }
+        Err(_) => {
+            tracing::warn!(major, "Microsoft JDK 探测超时");
+            return Vec::new();
+        }
+    };
+    // HEAD 的 body 是空的，reqwest 的 content_length() 会给出 0，直接读头更可靠
+    let size = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let final_name = response
+        .url()
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    let version = microsoft_version_from_name(&final_name).unwrap_or_else(|| major.to_string());
+    vec![JavaVersionInfo {
+        source: "microsoft".to_string(),
+        version,
+        major,
+        lts: LTS_MAJORS.contains(&major),
+        size_bytes: size,
+        url,
+    }]
 }
 
 /// Azul 元数据 → 版本列表（只要普通 jdk，排除 crac/fx 变体）。
@@ -887,8 +1048,13 @@ pub fn parse_size_text(text: &str) -> u64 {
     (value * factor) as u64
 }
 
-/// 从 TUNA 目录列表 HTML 里解析 zip（文件名带版本号，旁边有 size 列）。
-pub fn parse_tuna_listing(html: &str, base: &str, major: u32) -> Vec<JavaVersionInfo> {
+/// 从 Adoptium 目录镜像（TUNA / 兰大，结构一致）的 HTML 里解析 zip。
+pub fn parse_mirror_listing(
+    html: &str,
+    base: &str,
+    major: u32,
+    source: &str,
+) -> Vec<JavaVersionInfo> {
     let base = if base.ends_with('/') { base.to_string() } else { format!("{base}/") };
     let mut out = Vec::new();
     let mut rest = html;
@@ -919,7 +1085,7 @@ pub fn parse_tuna_listing(html: &str, base: &str, major: u32) -> Vec<JavaVersion
             })
             .unwrap_or_else(|| stem.to_string());
         out.push(JavaVersionInfo {
-            source: "tuna".to_string(),
+            source: source.to_string(),
             version,
             major,
             lts: LTS_MAJORS.contains(&major),
@@ -934,10 +1100,25 @@ pub fn parse_tuna_listing(html: &str, base: &str, major: u32) -> Vec<JavaVersion
 
 fn parse_versions(source: &str, body: &str, major: u32) -> Vec<JavaVersionInfo> {
     match source {
-        "bellsoft" => parse_bellsoft(body, major),
-        "adoptium" => parse_adoptium(body, major),
-        "tuna" => parse_tuna_listing(body, &tuna_list_url(major), major),
+        "tuna" | "lzu" => {
+            parse_mirror_listing(body, &mirror_list_url(source, major), major, source)
+        }
+        "zulu-injdk" => parse_caddy_listing(
+            body,
+            &injdk_zulu_dir_url(major),
+            major,
+            source,
+            CaddyKind::Zulu,
+        ),
+        "oracle-injdk" => parse_caddy_listing(
+            body,
+            &injdk_oracle_dir_url(major),
+            major,
+            source,
+            CaddyKind::Oracle,
+        ),
         "azul" => parse_azul(body, major),
+        // microsoft 没有目录列表，走 HEAD（在 fetch_versions 里特判）
         _ => Vec::new(),
     }
 }
@@ -977,7 +1158,8 @@ pub async fn probe_source(client: &reqwest::Client, source: &str) -> JavaSourceP
 /// 全部源并发测速（结果顺序固定为 sources_table 的顺序）。
 pub async fn probe_sources(client: &reqwest::Client) -> Vec<JavaSourceProbe> {
     let mut handles = Vec::new();
-    for source in ["bellsoft", "adoptium", "tuna", "azul", "oracle"] {
+    // 只测可下载的 6 家：oracle 官方只有下载页（403/需登录），没有测速意义
+    for source in INSTALLABLE_SOURCES {
         let client = client.clone();
         handles.push(tokio::spawn(async move { probe_source(&client, source).await }));
     }
@@ -1008,6 +1190,9 @@ async fn fetch_versions(
     if !INSTALLABLE_SOURCES.contains(&source) {
         // Oracle 之类：只给下载页，不给直链
         return Ok(Vec::new());
+    }
+    if source == "microsoft" {
+        return Ok(fetch_microsoft_version(client, major).await);
     }
     let url = source_probe_url(source, major);
     let response = tokio::time::timeout(Duration::from_secs(20), client.get(&url).send())
@@ -1059,9 +1244,10 @@ pub async fn versions(
 /// 源 → 运行时目录里的 vendor 段。
 pub fn vendor_dir_name(source: &str) -> &'static str {
     match source {
-        "bellsoft" => "liberica",
-        "adoptium" | "tuna" => "temurin",
-        "azul" => "zulu",
+        "tuna" | "lzu" => "temurin",
+        "zulu-injdk" | "azul" => "zulu",
+        "oracle-injdk" => "oracle",
+        "microsoft" => "microsoft",
         _ => VENDOR,
     }
 }
@@ -1098,6 +1284,30 @@ fn write_stamp(dir: &Path, stamp: &JavaStamp) -> Result<()> {
 pub fn read_stamp(dir: &Path) -> Option<JavaStamp> {
     let text = std::fs::read_to_string(dir.join(STAMP_FILE)).ok()?;
     serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+}
+
+
+/// 下载候选：首选 → 同族镜像（同名文件，只换根路径）→ 兰大 :8080 备用端口。
+///
+/// 只有 Adoptium 目录镜像之间文件名完全一致，才谈得上"换镜像"；
+/// zulu-injdk / oracle-injdk / microsoft / azul 各自只有一个直链，交给 auto_install 换源。
+pub fn download_candidates(source: &str, url: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vec![(source.to_string(), url.to_string())];
+    let roots = mirror_roots(source);
+    if roots.is_empty() {
+        return out;
+    }
+    let Some(current) = roots.iter().find(|root| url.starts_with(**root)).copied() else {
+        return out;
+    };
+    let suffix = &url[current.len()..];
+    for root in roots {
+        if root == current {
+            continue;
+        }
+        out.push((source.to_string(), format!("{root}{suffix}")));
+    }
+    out
 }
 
 /// java_install()：下载 → 解压 → 写 .gugu-java.json → 探测。
@@ -1137,17 +1347,55 @@ pub async fn install(
         major,
         sanitize_version_part(&picked_version)
     ));
-    let fetcher = Fetcher::new(client, origins, task.cancel_flag(), 1);
+    // JDK 包动辄 200MB：用 4 连接分片，比单流快得多，也不容易半路被掐断
+    let fetcher = Fetcher::new(client, origins, task.cancel_flag(), INSTALL_CONNECTIONS);
     task.progress_forced(
         Phase::Downloading,
         &format!("正在下载 Java {major}（{source}）"),
         0,
         0,
     );
-    match fetcher.fetch(&url, &zip_path, None, None).await {
-        Ok(outcome) => tracing::info!(source, url = %url, bytes = outcome.bytes, "Java 安装包已下载"),
-        Err(AppError::Cancelled) => return Err(AppError::Cancelled),
-        Err(err) => return Err(err),
+    // 首选源失败就自动换下一家（Adoptium 两家镜像之间文件名一致，换根即可），日志写清切换
+    let candidates = download_candidates(source, &url);
+    let mut downloaded_url = url.clone();
+    let mut failures: Vec<String> = Vec::new();
+    let mut done = false;
+    for (index, (attempt_source, attempt_url)) in candidates.iter().enumerate() {
+        if index > 0 {
+            tracing::warn!(
+                from = source,
+                to = attempt_source.as_str(),
+                url = %attempt_url,
+                "Java {major} 下载失败，切换到 {attempt_source} 镜像"
+            );
+            task.progress_forced(
+                Phase::Downloading,
+                &format!("正在下载 Java {major}（{attempt_source}）"),
+                0,
+                0,
+            );
+        }
+        match fetcher.fetch(attempt_url, &zip_path, None, None).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    source = attempt_source.as_str(),
+                    url = %attempt_url,
+                    bytes = outcome.bytes,
+                    "Java 安装包已下载"
+                );
+                downloaded_url = attempt_url.clone();
+                done = true;
+                break;
+            }
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(err) => failures.push(format!("{attempt_source}: {err}")),
+        }
+    }
+    if !done {
+        return Err(AppError::Net(format!(
+            "Java {major} 全部镜像都下载失败：{}",
+            failures.join("；")
+        )));
     }
 
     task.progress_forced(Phase::Extracting, "正在解压 Java 运行时", 0, 0);
@@ -1177,7 +1425,7 @@ pub async fn install(
             vendor: probe.vendor.clone(),
             version: probe.version.clone(),
             major: probe.major,
-            url,
+            url: downloaded_url,
             installed_at: crate::util::now_unix(),
         },
     )?;
@@ -1381,26 +1629,77 @@ mod tests {
     }
 
     #[test]
-    fn bellsoft_json_is_filtered_to_windows_amd64_jdk_zip() {
-        let json = r#"[{"version":"21.0.12","downloadUrl":"https://x/a.zip","size":195000000,"LTS":true,"architecture":"x86","bundleType":"jdk","packageType":"zip","os":"windows"},{"version":"21.0.11","downloadUrl":"https://x/b.zip","size":1,"LTS":true,"architecture":"x86","bundleType":"jdk","packageType":"zip","os":"windows"},{"version":"21.0.10","downloadUrl":"https://x/c.zip","size":1,"LTS":true,"architecture":"arm","bundleType":"jdk","packageType":"zip","os":"windows"},{"version":"21.0.9","downloadUrl":"https://x/d.deb","size":1,"LTS":true,"architecture":"x86","bundleType":"jdk","packageType":"deb","os":"windows"},{"version":"21.0.8","downloadUrl":"https://x/e.zip","size":1,"LTS":true,"architecture":"x86","bitness":32,"bundleType":"jdk","packageType":"zip","os":"windows"}]"#;
-        let items = parse_bellsoft(json, 21);
-        assert_eq!(items.len(), 2, "只要 windows/amd64/jdk/zip：{:?}", items);
-        assert_eq!(items[0].version, "21.0.12");
-        assert_eq!(items[0].size_bytes, 195_000_000);
-        assert!(items[0].lts);
-        assert_eq!(items[0].major, 21);
-        assert!(parse_bellsoft("not json", 21).is_empty());
+    fn caddy_listing_parses_zulu_win_x64_zip() {
+        let html = r#"<tr class="file">
+            <td></td>
+            <td><a href="./zulu21.50.19-ca-jdk21.0.11-linux.x86_64.rpm"><span class="name">zulu21.50.19-ca-jdk21.0.11-linux.x86_64.rpm</span></a></td>
+            <td class="size" data-size="188640192"><div class="sizebar-text">180 MiB</div></td></tr>
+        <tr class="file">
+            <td></td>
+            <td><a href="./zulu21.50.19-ca-jdk21.0.11-win_x64.zip"><span class="name">zulu21.50.19-ca-jdk21.0.11-win_x64.zip</span></a></td>
+            <td class="size" data-size="201450315"><div class="sizebar-text">192 MiB</div></td></tr>
+        <tr class="file">
+            <td></td>
+            <td><a href="./zulu21.48.15-ca-jdk21.0.10-win_x64.zip"><span class="name">zulu21.48.15-ca-jdk21.0.10-win_x64.zip</span></a></td>
+            <td class="size" data-size="201000000"><div class="sizebar-text">191 MiB</div></td></tr>"#;
+        let items = parse_caddy_listing(
+            html,
+            "https://d10.injdk.cn/openjdk/zulu/21/",
+            21,
+            "zulu-injdk",
+            CaddyKind::Zulu,
+        );
+        assert_eq!(items.len(), 2, "linux rpm 要排除：{:?}", items);
+        assert_eq!(items[0].version, "21.0.11", "取 jdk 后面的 21.0.11");
+        assert_eq!(items[0].size_bytes, 201_450_315);
+        assert_eq!(items[0].source, "zulu-injdk");
+        assert_eq!(items[1].version, "21.0.10");
+        assert_eq!(
+            items[0].url,
+            "https://d10.injdk.cn/openjdk/zulu/21/zulu21.50.19-ca-jdk21.0.11-win_x64.zip"
+        );
+        assert!(parse_caddy_listing("", "https://x/", 21, "zulu-injdk", CaddyKind::Zulu).is_empty());
     }
 
     #[test]
-    fn adoptium_json_maps_package_link_and_size() {
-        let json = r#"[{"release_name":"jdk-21.0.12.1+1","version":{"semver":"21.0.12+101.0.LTS"},"binary":{"package":{"name":"OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip","link":"https://github.com/x.zip","size":205073461}}}]"#;
-        let items = parse_adoptium(json, 21);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].version, "21.0.12.1+1");
-        assert_eq!(items[0].size_bytes, 205_073_461);
-        assert!(items[0].lts);
-        assert_eq!(items[0].url, "https://github.com/x.zip");
+    fn caddy_listing_parses_oracle_windows_zip() {
+        let html = r#"<tr class="file"><td><a href="./jdk-21_linux-aarch64_bin.rpm">x</a></td>
+            <td class="size" data-size="195331559">186 MiB</td></tr>
+        <tr class="file"><td><a href="./jdk-21_windows-x64_bin.zip">x</a></td>
+            <td class="size" data-size="185000000">176 MiB</td></tr>"#;
+        let items = parse_caddy_listing(
+            html,
+            "https://d10.injdk.cn/openjdk/oraclejdk/21/",
+            21,
+            "oracle-injdk",
+            CaddyKind::Oracle,
+        );
+        assert_eq!(items.len(), 1, "只要 *_windows-x64_bin.zip：{:?}", items);
+        assert_eq!(items[0].version, "21");
+        assert_eq!(items[0].size_bytes, 185_000_000);
+        assert!(items[0].url.ends_with("/21/jdk-21_windows-x64_bin.zip"));
+        assert!(!CaddyKind::Oracle.accepts("jdk-21_linux-aarch64_bin.rpm"));
+        assert_eq!(
+            CaddyKind::Oracle.version_of("jdk-8u491-windows-x64.zip").as_deref(),
+            Some("8u491")
+        );
+    }
+
+    #[test]
+    fn microsoft_urls_cover_supported_majors_only() {
+        assert_eq!(
+            microsoft_zip_url(21).as_deref(),
+            Some("https://aka.ms/download-jdk/microsoft-jdk-21-windows-x64.zip")
+        );
+        assert!(microsoft_zip_url(17).is_some());
+        assert!(microsoft_zip_url(8).is_none(), "Microsoft 不提供 8");
+        assert!(microsoft_zip_url(26).is_none());
+        assert_eq!(microsoft_zip_url(21).unwrap(), source_probe_url("microsoft", 21));
+        assert_eq!(
+            microsoft_version_from_name("microsoft-jdk-21.0.13.0.2-windows-x64.zip").as_deref(),
+            Some("21.0.13.0.2")
+        );
+        assert!(microsoft_version_from_name("something-else.zip").is_none());
     }
 
     #[test]
@@ -1419,7 +1718,12 @@ mod tests {
     fn tuna_listing_reads_version_and_size() {
         let html = r#"<tr><td class="link"><a href="OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip" title="x">OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip</a></td><td class="size">195.6 MiB</td><td class="date">21 Aug 2026</td></tr>
 <tr><td class="link"><a href="OpenJDK21U-jdk_x64_windows_hotspot_21.0.11_10.zip" title="y">y</a></td><td class="size">195.1 MiB</td></tr>"#;
-        let items = parse_tuna_listing(html, "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/windows/", 21);
+        let items = parse_mirror_listing(
+            html,
+            "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/windows/",
+            21,
+            "tuna",
+        );
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].version, "21.0.12.1+1");
         assert_eq!(items[0].size_bytes, parse_size_text("195.6 MiB"));
@@ -1436,34 +1740,157 @@ mod tests {
     }
 
     #[test]
-    fn sources_table_lists_five_with_oracle_licensed() {
+    fn both_mirrors_parse_the_same_listing() {
+        // 两家镜像的目录 HTML 结构完全一致（只有 <a href> 与 size 列）
+        let html = r#"<tr><td class="link"><a href="OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip" title="x">x</a></td><td class="size">195.6 MiB</td></tr>"#;
+        let tuna = parse_mirror_listing(
+            html,
+            "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/windows/",
+            21,
+            "tuna",
+        );
+        let lzu = parse_mirror_listing(
+            html,
+            "https://mirrors.lzu.edu.cn/adoptium/21/jdk/x64/windows/",
+            21,
+            "lzu",
+        );
+        assert_eq!(tuna.len(), 1);
+        assert_eq!(lzu.len(), 1);
+        assert_eq!(tuna[0].version, "21.0.12.1+1");
+        assert_eq!(lzu[0].version, tuna[0].version, "两家文件名一致，版本号必须一致");
+        assert_eq!(lzu[0].size_bytes, tuna[0].size_bytes);
+        assert_eq!(lzu[0].source, "lzu");
+        assert_eq!(tuna[0].source, "tuna");
+        assert!(lzu[0].url.starts_with("https://mirrors.lzu.edu.cn/adoptium/"));
+        assert!(tuna[0].url.starts_with("https://mirrors.tuna.tsinghua.edu.cn/Adoptium/"));
+    }
+
+    #[test]
+    fn lzu_urls_use_the_lowercase_path() {
+        assert_eq!(
+            lzu_list_url(21),
+            "https://mirrors.lzu.edu.cn/adoptium/21/jdk/x64/windows/"
+        );
+        assert!(lzu_list_url(17).contains("/adoptium/17/"));
+        assert!(!lzu_list_url(17).contains("/Adoptium/"), "兰大是小写 adoptium");
+        assert_eq!(mirror_list_url("tuna", 21), tuna_list_url(21));
+        assert_eq!(mirror_list_url("lzu", 21), lzu_list_url(21));
+        assert_eq!(source_probe_url("lzu", 21), lzu_list_url(21));
+        assert_eq!(mirror_root("lzu"), Some(LZU_ROOT));
+        assert_eq!(mirror_root("zulu-injdk"), None);
+    }
+
+    #[test]
+    fn download_candidates_switch_between_mirrors() {
+        let tuna_url = "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/21/jdk/x64/windows/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip";
+        let candidates = download_candidates("tuna", tuna_url);
+        assert_eq!(candidates.len(), 3, "首选 → 兰大 → 兰大 :8080：{:?}", candidates);
+        assert_eq!(candidates[0], ("tuna".to_string(), tuna_url.to_string()));
+        assert_eq!(
+            candidates[1].1,
+            "https://mirrors.lzu.edu.cn/adoptium/21/jdk/x64/windows/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip",
+            "换镜像只替换根路径，文件名不变"
+        );
+        assert_eq!(
+            candidates[2].1,
+            "https://mirror.lzu.edu.cn:8080/adoptium/21/jdk/x64/windows/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip"
+        );
+
+        // 从兰大出发：先 :8080 备用端口，再清华
+        let lzu_url = "https://mirrors.lzu.edu.cn/adoptium/21/jdk/x64/windows/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip";
+        let candidates = download_candidates("lzu", lzu_url);
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates[1].1.starts_with("https://mirror.lzu.edu.cn:8080/adoptium/"));
+        assert!(candidates[2].1.starts_with("https://mirrors.tuna.tsinghua.edu.cn/Adoptium/"));
+
+        // 单一来源的源：只有它自己（换源交给 auto_install）
+        for source in ["zulu-injdk", "oracle-injdk", "microsoft", "azul"] {
+            let candidates = download_candidates(source, "https://x/a.zip");
+            assert_eq!(candidates.len(), 1, "{source} 只有一条直链");
+            assert_eq!(candidates[0].0, source);
+        }
+    }
+
+    #[test]
+    fn adoptium_mirror_pool_covers_both_hosts_and_spare_port() {
+        assert_eq!(
+            mirror_roots("tuna"),
+            vec![TUNA_ROOT, LZU_ROOT, LZU_SPARE_ROOT],
+            "清华首选，兰大与兰大 :8080 依次兜底"
+        );
+        assert_eq!(mirror_roots("lzu")[0], LZU_ROOT);
+        assert!(mirror_roots("azul").is_empty(), "非 Adoptium 镜像没有同族镜像");
+        assert_eq!(ADOPTIUM_MIRRORS, [TUNA_ROOT, LZU_ROOT, LZU_SPARE_ROOT]);
+        assert!(INSTALLABLE_SOURCES.contains(&"lzu"));
+    }
+
+    #[test]
+    fn sources_table_lists_six_installable_plus_oracle() {
         let table = sources_table();
         let ids: Vec<&str> = table.iter().map(|item| item.id.as_str()).collect();
-        assert_eq!(ids, vec!["bellsoft", "adoptium", "tuna", "azul", "oracle"]);
+        assert_eq!(
+            ids,
+            vec!["tuna", "lzu", "zulu-injdk", "oracle-injdk", "microsoft", "azul", "oracle"]
+        );
+        // 6 家可自动下载 + oracle 仅跳转
+        assert_eq!(INSTALLABLE_SOURCES.len(), 6);
+        for source in INSTALLABLE_SOURCES {
+            assert!(ids.contains(&source), "{source} 必须出现在 java_sources 里");
+        }
+        assert!(!INSTALLABLE_SOURCES.contains(&"oracle"));
+        assert_eq!(table.iter().filter(|item| !item.requires_license).count(), 6);
         let oracle = table.iter().find(|item| item.id == "oracle").unwrap();
         assert!(oracle.requires_license);
         assert!(oracle.description.contains("oracle.com"));
-        assert!(table.iter().filter(|item| !item.requires_license).count() == 4);
+        // injdk 的 Oracle 是直链，允许下载，但描述里要点明 OTN 许可
+        let injdk = table.iter().find(|item| item.id == "oracle-injdk").unwrap();
+        assert!(!injdk.requires_license);
+        assert!(injdk.description.contains("OTN"));
+        // 每家都要有名字/描述/下载页说明
+        for item in &table {
+            assert!(!item.name.is_empty());
+            assert!(!item.description.is_empty());
+        }
+        assert!(table
+            .iter()
+            .any(|item| item.id == "microsoft" && item.description.contains("learn.microsoft.com")));
+        // bellsoft / adoptium 官方已下线
+        assert!(!ids.contains(&"bellsoft"));
+        assert!(!ids.contains(&"adoptium"));
     }
 
     #[test]
     fn probe_urls_point_at_measured_endpoints() {
-        assert!(bellsoft_api_url(21).starts_with("https://api.bell-sw.com/v1/liberica/releases?"));
-        assert!(bellsoft_api_url(21).contains("arch=x86"), "BellSoft 的 amd64 是 arch=x86");
-        assert!(adoptium_api_url(21).starts_with("https://api.adoptium.net/v3/assets/latest/21/"));
         assert_eq!(
             tuna_list_url(17),
             "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/17/jdk/x64/windows/"
         );
+        assert_eq!(
+            source_probe_url("zulu-injdk", 21),
+            "https://d10.injdk.cn/openjdk/zulu/21/"
+        );
+        assert_eq!(
+            source_probe_url("oracle-injdk", 21),
+            "https://d10.injdk.cn/openjdk/oraclejdk/21/"
+        );
+        assert_eq!(
+            source_probe_url("microsoft", 21),
+            "https://aka.ms/download-jdk/microsoft-jdk-21-windows-x64.zip"
+        );
         assert!(azul_api_url(21).starts_with("https://api.azul.com/metadata/v1/zulu/packages/"));
         assert_eq!(source_probe_url("oracle", 21), ORACLE_PAGE);
         assert!(source_probe_url("tuna", 11).contains("Adoptium/11/"));
+        assert_eq!(
+            source_probe_url("lzu", 21),
+            "https://mirrors.lzu.edu.cn/adoptium/21/jdk/x64/windows/"
+        );
     }
 
     #[test]
     fn fastest_source_ignores_failures_and_oracle() {
         let probes = vec![
-            JavaSourceProbe { source_id: "bellsoft".into(), ok: true, latency_ms: 900, error: None },
+            JavaSourceProbe { source_id: "zulu-injdk".into(), ok: true, latency_ms: 900, error: None },
             JavaSourceProbe { source_id: "tuna".into(), ok: true, latency_ms: 120, error: None },
             JavaSourceProbe { source_id: "oracle".into(), ok: true, latency_ms: 5, error: None },
             JavaSourceProbe { source_id: "azul".into(), ok: false, latency_ms: 0, error: Some("超时".into()) },
@@ -1475,8 +1902,12 @@ mod tests {
     #[test]
     fn runtime_dir_and_version_part_are_filesystem_safe() {
         let paths = Paths::from_root("C:\\tmp\\.mc");
-        let dir = runtime_dir(&paths, "bellsoft", 21, "21.0.12.1+1");
-        assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "liberica-21-21.0.12.1_1");
+        let dir = runtime_dir(&paths, "zulu-injdk", 21, "21.0.12+1");
+        assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "zulu-21-21.0.12_1");
+        let dir = runtime_dir(&paths, "oracle-injdk", 21, "21");
+        assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "oracle-21-21");
+        let dir = runtime_dir(&paths, "microsoft", 21, "21.0.13.0.2");
+        assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "microsoft-21-21.0.13.0.2");
         let dir = runtime_dir(&paths, "tuna", 17, "17.0.9+9");
         assert_eq!(dir.file_name().unwrap().to_str().unwrap(), "temurin-17-17.0.9_9");
         assert_eq!(sanitize_version_part("a/b:c"), "a_b_c");
@@ -1488,8 +1919,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let stamp = JavaStamp {
-            source: "bellsoft".into(),
-            vendor: "Liberica".into(),
+            source: "zulu-injdk".into(),
+            vendor: "Zulu".into(),
             version: "21.0.12".into(),
             major: 21,
             url: "https://x/a.zip".into(),
@@ -1633,10 +2064,11 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("手动安装"));
+        assert!(err.to_string().contains(ORACLE_PAGE), "错误文案要给出下载页");
         let err = install(
             reqwest::Client::new(),
             &paths,
-            "bellsoft",
+            "tuna",
             "",
             3,
             Vec::new(),

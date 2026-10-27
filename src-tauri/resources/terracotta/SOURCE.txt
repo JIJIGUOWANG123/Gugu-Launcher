@@ -1,0 +1,39 @@
+Terracotta（陶瓦联机）
+=======================
+
+项目名   ：Terracotta（陶瓦联机）
+版本     ：v0.4.2（Windows x86_64）
+上游地址 ：https://github.com/burningtnt/Terracotta
+许可证   ：AGPL-3.0（全文见同目录 LICENSE-AGPL-3.0.txt）
+作者     ：burningtnt 及 Terracotta 贡献者
+
+获取源码
+--------
+https://github.com/burningtnt/Terracotta
+（对应 v0.4.2 的源码可用 git clone 后 checkout 到 v0.4.2 标签，
+ 本地参考副本：D:\minecraft\Terracotta-master）
+
+在本启动器中的使用方式
+----------------------
+咕咕启动器 **不链接、不修改** Terracotta 的二进制，只把它当作独立进程启动
+（`terracotta.exe --hmcl <port 文件>`），通过它的本地 HTTP 接口（/state、/meta）
+读取联机状态。二进制原样内嵌在本安装包的 resources/terracotta/ 下，
+首次运行时复制到 <数据根>/terracotta/ 再启动。
+
+按 AGPL-3.0 的要求，本安装包同时分发：
+  · resources/terracotta/terracotta.exe     —— 上游发布的原始可执行文件
+  · resources/terracotta/LICENSE-AGPL-3.0.txt —— AGPL-3.0 许可证全文
+  · resources/terracotta/SOURCE.txt          —— 本文件（来源与源码获取方式）
+
+内嵌文件的完整性（可用于核对是否与上游一致）：
+  terracotta.exe  size = 9402880
+  terracotta.exe  sha256 = 74c10568a7fea9c1d38cf8d2d4ca90baf1517f8e5a26c63d3349db70bc449796
+
+VC 运行库（随上游发布包一起提供）
+--------------------------------
+  VCRUNTIME140.DLL  size   = 97656
+  VCRUNTIME140.DLL  sha256 = 475ab98b7722e965bd38c8fa6ed23502309582ccf294ff1061cb290c7988f0d1
+  说明：Microsoft Visual C++ 可再发行组件，原样分发未做修改。
+        缺少它在没有装 VC++ 运行库的机器上 terracotta.exe 无法启动，
+        所以本启动器把它一起内嵌，首次运行时与 terracotta.exe 一起复制到
+        <数据根>/terracotta/ 并按上面的 sha256 校验。

@@ -22,6 +22,9 @@ pub const BACKOFF_MS: u64 = 800;
 pub const CHUNK_THRESHOLD: u64 = 8 * 1024 * 1024;
 /// 单个分片至少这么大，避免把一个 8MB 文件切成一堆小请求。
 pub const MIN_CHUNK_BYTES: u64 = 1024 * 1024;
+/// 单个文件的请求超时：reqwest 的 Client::timeout 是"整条响应读完"的总时长，
+/// 200MB 的 JDK 包在慢链路上会被 30 秒的全局超时打断，所以下载请求单独放宽到 15 分钟。
+pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// 一次下载结果。
 #[derive(Debug, Clone)]
@@ -242,6 +245,7 @@ impl Fetcher {
         let response = self
             .client
             .get(url)
+            .timeout(DOWNLOAD_TIMEOUT)
             .send()
             .await
             .map_err(|err| FetchError::Other(short(&err.to_string())))?;
@@ -322,6 +326,7 @@ impl Fetcher {
                         reqwest::header::RANGE,
                         format!("bytes={}-{}", range.start, range.end),
                     )
+                    .timeout(DOWNLOAD_TIMEOUT)
                     .send()
                     .await
                     .map_err(|err| FetchError::Other(short(&err.to_string())))?;

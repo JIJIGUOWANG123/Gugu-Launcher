@@ -187,6 +187,20 @@ function RoomsTab({ notify }: Props) {
       </section>
 
       <section className="card multi-status">
+        <div className="multi-source" data-tera-source>
+          <span>
+            {t("multi.sourceLine", { version: status?.version ?? "—", license: status?.license ?? "AGPL-3.0" })}
+            {status?.source === "bundled" ? " · " + t("multi.sourceBundled") : ""}
+          </span>
+          <span className="multi-source__links">
+            <button type="button" className="link-button" data-action="tera-open-github" onClick={() => void api.openExternal("https://github.com/burningtnt/Terracotta").catch((error) => notify(String(error)))}>
+              {t("multi.sourceGithub")}
+            </button>
+            <button type="button" className="link-button" data-action="tera-open-license" onClick={() => void api.openExternal(status?.homepage ?? "https://github.com/burningtnt/Terracotta/blob/master/LICENSE").catch((error) => notify(String(error)))}>
+              {t("multi.sourceLicense")}
+            </button>
+          </span>
+        </div>
         <div className="multi-status__row">
           <div>
             <div className="detail-card__title">{t("multi.status")}</div>
@@ -196,15 +210,21 @@ function RoomsTab({ notify }: Props) {
           </div>
           <div className="multi-status__actions">
             {!installed ? (
-              <button
-                type="button"
-                className="pill-button"
-                data-action="tera-install"
-                disabled={busy || installing}
-                onClick={() => void install()}
-              >
-                {installing ? t("multi.installing") : t("multi.install")}
-              </button>
+              status?.source === "bundled" ? (
+                <span className="row__hint" data-tera-bundled-hint>
+                  {t("multi.sourceBundledHint")}
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  className="pill-button"
+                  data-action="tera-install"
+                  disabled={busy || installing}
+                  onClick={() => void install()}
+                >
+                  {installing ? t("multi.installing") : t("multi.reinstall")}
+                </button>
+              )
             ) : (
               <>
                 <button
@@ -374,7 +394,7 @@ function RoomsTab({ notify }: Props) {
  * 多人页：上面两个 tab（服务器 / 联机房间），默认停在「服务器」。
  * 「+ 创建服务器」在服务器 tab 的右上角（ServersPanel 里）。
  */
-export function MultiplayerPage({ notify }: Props) {
+export function MultiplayerPage({ notify, onOpenContent }: Props & { onOpenContent: () => void }) {
   const t = useT();
   const [tab, setTab] = useState<"servers" | "rooms">("servers");
 
@@ -403,7 +423,7 @@ export function MultiplayerPage({ notify }: Props) {
         </button>
       </nav>
 
-      {tab === "servers" ? <ServersPanel notify={notify} /> : <RoomsTab notify={notify} />}
+      {tab === "servers" ? <ServersPanel notify={notify} onOpenContent={onOpenContent} /> : <RoomsTab notify={notify} />}
     </div>
   );
 }

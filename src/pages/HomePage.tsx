@@ -13,11 +13,12 @@ interface Props {
   notify: (message: string) => void;
 }
 
-const NEWS_LIMIT = 5;
+// 只显示最新一条：请求也只取一条，省掉无谓的翻译与流量
+const NEWS_LIMIT = 1;
 const MINECRAFT_SITE = "https://www.minecraft.net/";
 
 /**
- * 主页：官网新闻卡（首条展示 + 左右翻页 + 原文切换）+ 版本信息 + 一键启动。
+ * 主页：官网新闻卡（只显示最新一条 + 原文切换）+ 版本信息 + 一键启动。
  * 新闻取不到时只显示「暂时取不到新闻」和一个打开官网的按钮，不阻塞其它卡片。
  */
 export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify }: Props) {
@@ -25,15 +26,20 @@ export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify
   const [news, setNews] = useState<NewsItem[] | null>(null);
   const [recent, setRecent] = useState<Instance[]>([]);
   const [failed, setFailed] = useState(false);
-  const [index, setIndex] = useState(0);
   const [showOriginal, setShowOriginal] = useState(false);
 
   const load = useCallback(async () => {
     setFailed(false);
     try {
       const list = await api.newsList({ limit: NEWS_LIMIT });
+      // 自检用：记下这次新闻请求的参数（界面不显示）
+      if (typeof window !== "undefined") {
+        const host = window as unknown as Record<string, unknown>;
+        const seen = Array.isArray(host.__guguNewsReq) ? (host.__guguNewsReq as unknown[]) : [];
+        host.__guguNewsReq = [...seen, { limit: NEWS_LIMIT }].slice(-20);
+      }
       setNews(list);
-      setIndex(0);
+      setShowOriginal(false);
     } catch {
       setNews(null);
       setFailed(true);
@@ -65,13 +71,11 @@ export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify
     }
   };
 
-  const current = news && news.length > 0 ? news[Math.min(index, news.length - 1)] : null;
-
-  const step = (delta: number) => {
-    if (!news || news.length === 0) return;
-    setIndex((prev) => (prev + delta + news.length) % news.length);
-    setShowOriginal(false);
-  };
+  // 只显示最新一条，不再翻页
+  const current = news && news.length > 0 ? news[0] : null;
+  // 自检用：gugu.mock.newsCover = off 时把封面当成没有，方便截「NEWS COVER 占位」那张图
+  const hideCover =
+    typeof window !== "undefined" && window.localStorage.getItem("gugu.mock.newsCover") === "off";
 
   const title = current ? (showOriginal ? current.titleOriginal ?? current.title : current.title) : "";
   const summary = current ? (showOriginal ? current.summaryOriginal ?? current.summary : current.summary) : "";
@@ -83,33 +87,6 @@ export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify
       <section className="card news-card" data-news-card>
         <header className="news-card__head">
           <span className="loader-badge">{t("home.news")}</span>
-          {news && news.length > 1 ? (
-            <div className="news-pager">
-              <button
-                type="button"
-                className="icon-button news-pager__btn"
-                data-action="news-prev"
-                title={t("home.newsPrev")}
-                aria-label={t("home.newsPrev")}
-                onClick={() => step(-1)}
-              >
-                <span className="news-pager__chevron is-prev" aria-hidden="true" />
-              </button>
-              <span className="news-pager__index" data-news-index>
-                {Math.min(index + 1, news.length)} / {news.length}
-              </span>
-              <button
-                type="button"
-                className="icon-button news-pager__btn"
-                data-action="news-next"
-                title={t("home.newsNext")}
-                aria-label={t("home.newsNext")}
-                onClick={() => step(1)}
-              >
-                <span className="news-pager__chevron" aria-hidden="true" />
-              </button>
-            </div>
-          ) : null}
         </header>
 
         {failed ? (
@@ -132,7 +109,7 @@ export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify
         ) : current ? (
           <div className="news-body" key={current.id}>
             <div className="news-cover">
-              {current.coverUrl ? (
+              {current.coverUrl && !hideCover ? (
                 <img className="news-cover__img" src={current.coverUrl} alt="" data-news-cover />
               ) : (
                 <div className="news-cover__placeholder" data-news-cover-empty>

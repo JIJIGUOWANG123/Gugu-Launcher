@@ -20,7 +20,10 @@ pub const MAX_LIMIT: usize = 20;
 /// 成功结果在内存里保留多久。
 pub const MEMORY_TTL: Duration = Duration::from_secs(30 * 60);
 /// 失败后多久不重试。
-pub const NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
+/// 失败后 30 秒内不再重试（原来 5 分钟太长，用户重进页面会一直空）。
+pub const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+/// 请求新闻时用的 UA（Mojang 的内容站会拒绝空 UA / 非浏览器 UA）。
+pub const NEWS_USER_AGENT: &str = "Mozilla/5.0 GuguLauncher/1.0";
 /// 只翻前几条，别把 100 条都发出去。
 pub const TRANSLATE_LIMIT: usize = 5;
 pub const CACHE_FILE: &str = "news.json";
@@ -309,25 +312,62 @@ impl NewsCache {
             *guard = Some(Instant::now());
         }
     }
+
+    /// 用户手动刷新时绕过负缓存。
+    fn clear_failed(&self) {
+        if let Ok(mut guard) = self.failed_at.lock() {
+            *guard = None;
+        }
+    }
 }
 
+/// 拉一份文本：显式 UA + accept，失败时把 URL / 状态码 / 耗时写进 WARN。
 async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
+    let started = Instant::now();
     let response = client
         .get(url)
         .timeout(Duration::from_secs(10))
+        .header(reqwest::header::USER_AGENT, NEWS_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
         .send()
         .await
-        .map_err(|err| AppError::Net(format!("拉取新闻失败：{err}")))?;
+        .map_err(|err| {
+            tracing::warn!(
+                url,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %err,
+                "新闻请求失败（网络层）"
+            );
+            AppError::Net(format!("拉取新闻失败：{err}"))
+        })?;
+    let status = response.status().as_u16();
     if !response.status().is_success() {
-        return Err(AppError::Net(format!(
-            "新闻接口返回 HTTP {}",
-            response.status().as_u16()
-        )));
+        tracing::warn!(
+            url,
+            status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "新闻接口返回非 2xx"
+        );
+        return Err(AppError::Net(format!("新闻接口返回 HTTP {status}")));
     }
-    response
-        .text()
-        .await
-        .map_err(|err| AppError::Net(format!("读取新闻响应失败：{err}")))
+    let text = response.text().await.map_err(|err| {
+        tracing::warn!(
+            url,
+            status,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %err,
+            "读取新闻响应失败"
+        );
+        AppError::Net(format!("读取新闻响应失败：{err}"))
+    })?;
+    tracing::debug!(
+        url,
+        status,
+        bytes = text.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "新闻请求成功"
+    );
+    Ok(text)
 }
 
 /// 拿新闻：内存 30 分钟 → 网络（v2，再兜底站点网格）→ 旧磁盘缓存（stale）。
@@ -337,9 +377,14 @@ pub async fn list(
     cache: &NewsCache,
     translator: Option<(&Settings, &BuiltinTranslator)>,
     limit: usize,
+    force: bool,
 ) -> NewsList {
     let limit = limit.clamp(1, MAX_LIMIT);
-    if let Some(items) = cache.fresh() {
+    if force {
+        cache.clear_failed();
+        tracing::info!("新闻手动刷新：绕过内存缓存与负缓存");
+    } else if let Some(items) = cache.fresh() {
+        tracing::info!(count = items.len(), limit, "新闻命中内存缓存");
         return NewsList {
             items: items.into_iter().take(limit).collect(),
             stale: false,
@@ -379,6 +424,12 @@ pub async fn list(
     }
     if items.is_empty() {
         cache.mark_failed();
+        tracing::warn!(
+            url = NEWS_URL,
+            fallback = FALLBACK_URL,
+            negative_secs = NEGATIVE_TTL.as_secs(),
+            "官方与兜底新闻源都没取到内容，本次返回旧缓存"
+        );
         return match disk {
             Some((_, items)) => NewsList {
                 items: items.into_iter().take(limit).collect(),
@@ -393,6 +444,13 @@ pub async fn list(
 
     let _ = write_cache(&cache_file(paths), &items);
     cache.remember(items.clone());
+    tracing::info!(
+        count = items.len(),
+        limit,
+        from_disk_cache = disk.is_some(),
+        force,
+        "新闻拉取成功"
+    );
 
     // 翻译前 N 条（失败保留原文）
     if let Some((settings, translator)) = translator {
@@ -427,6 +485,8 @@ pub async fn list(
         }
     }
 
+    let translated = items.iter().take(limit).filter(|item| item.translated).count();
+    tracing::info!(translated, limit, "新闻翻译完成");
     NewsList {
         items: items.into_iter().take(limit).collect(),
         stale: false,
@@ -631,6 +691,17 @@ mod tests {
         std::fs::write(&file, text).unwrap();
         assert!(read_cache(&file).is_some());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+#[test]
+    fn negative_cache_is_short_and_clearable() {
+        let cache = NewsCache::new();
+        cache.mark_failed();
+        assert!(cache.blocked(), "失败后短时间内不该再打接口");
+        assert_eq!(NEGATIVE_TTL.as_secs(), 30, "负缓存从 5 分钟缩到 30 秒");
+        cache.clear_failed();
+        assert!(!cache.blocked(), "手动刷新必须能绕过负缓存");
+        assert_eq!(NEWS_USER_AGENT, "Mozilla/5.0 GuguLauncher/1.0");
     }
 
     #[test]

@@ -41,6 +41,11 @@ pub struct Instance {
     pub window_height: u32,
     pub java_path: String,
     pub icon_path: String,
+    /// 整合包名（modpack_install 写入，普通实例为空串）
+    pub pack_name: String,
+    /// 整合包状态：installed / incomplete（普通实例为 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_state: Option<String>,
 }
 
 /// 新建实例的入参。
@@ -73,6 +78,8 @@ pub struct InstanceSettingsView {
     pub height: u32,
     pub java_path: Option<String>,
     pub icon_path: Option<String>,
+    /// 这个版本能不能「直接进入存档」（1.20 及以上）
+    pub supports_quick_play: bool,
 }
 
 /// 设置补丁：只改传进来的字段（null 也表示不改，空字符串表示清空）。
@@ -115,6 +122,7 @@ impl Instance {
             } else {
                 Some(self.icon_path.clone())
             },
+            supports_quick_play: crate::updates::supports_quick_play(&self.mc_version),
         }
     }
 }
@@ -208,12 +216,21 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         window_height: row.get::<_, i64>("window_height")? as u32,
         java_path: row.get("java_path")?,
         icon_path: icon,
+        pack_name: row.get("pack_name")?,
+        pack_state: {
+            let state: String = row.get("pack_state")?;
+            if state.trim().is_empty() {
+                None
+            } else {
+                Some(state)
+            }
+        },
     })
 }
 
 const SELECT_COLUMNS: &str = "id, name, mc_version, loader, loader_version, icon, pinned_home,
                               play_time_secs, created_at, last_played_at, note, memory_mb,
-                              window_width, window_height, java_path";
+                              window_width, window_height, java_path, pack_name, pack_state";
 
 pub fn list(conn: &Connection) -> Result<Vec<Instance>> {
     let mut stmt = conn.prepare(&format!(
@@ -399,6 +416,24 @@ pub fn set_icon(conn: &Connection, id: i64, icon_path: &str) -> Result<()> {
     conn.execute(
         "UPDATE instances SET icon = ?2 WHERE id = ?1",
         params![id, icon_path],
+    )?;
+    Ok(())
+}
+
+/// 整合包安装写 packName + packState（installed / incomplete）。
+pub fn set_pack(conn: &Connection, id: i64, pack_name: &str, state: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE instances SET pack_name = ?2, pack_state = ?3 WHERE id = ?1",
+        params![id, pack_name, state],
+    )?;
+    Ok(())
+}
+
+/// 只刷新最近游玩时间（整合包装完把自己顶到"最近游玩"第一位）。
+pub fn touch_last_played(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE instances SET last_played_at = ?2 WHERE id = ?1",
+        params![id, util::iso8601(util::now_unix())],
     )?;
     Ok(())
 }
@@ -611,6 +646,36 @@ mod tests {
         assert!(json.get("windowWidth").is_some());
         assert!(json.get("width").is_some());
         assert_eq!(json["javaPath"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn pack_state_is_written_and_defaults_to_none() {
+        let (conn, paths) = setup();
+        let created = create(&conn, &paths, &payload("整合包实例")).unwrap();
+        assert!(created.pack_state.is_none(), "普通实例没有整合包状态");
+        assert!(created.pack_name.is_empty());
+
+        set_pack(&conn, created.id, "Fabulously Optimized", "incomplete").unwrap();
+        let marked = get(&conn, created.id).unwrap();
+        assert_eq!(marked.pack_name, "Fabulously Optimized");
+        assert_eq!(marked.pack_state.as_deref(), Some("incomplete"));
+
+        set_pack(&conn, created.id, "Fabulously Optimized", "installed").unwrap();
+        let installed = get(&conn, created.id).unwrap();
+        assert_eq!(installed.pack_state.as_deref(), Some("installed"));
+        // 序列化给前端时字段名是 packName / packState
+        let json = serde_json::to_value(&installed).unwrap();
+        assert_eq!(json["packName"], "Fabulously Optimized");
+        assert_eq!(json["packState"], "installed");
+        // 普通实例不出 packState（前端 optional 类型）
+        let plain = create(&conn, &paths, &payload("普通实例")).unwrap();
+        let plain_json = serde_json::to_value(&plain).unwrap();
+        assert!(plain_json.get("packState").is_none());
+
+        touch_last_played(&conn, created.id).unwrap();
+        let recent = recent(&conn, 10).unwrap();
+        assert_eq!(recent[0].id, created.id, "刚装完的整合包要排最近游玩第一位");
         let _ = std::fs::remove_dir_all(&paths.root);
     }
 

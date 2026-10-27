@@ -9,8 +9,9 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-/// 当前 schema 版本。v2 给实例表加上设置列（备注/内存/窗口/Java）。
-pub const SCHEMA_VERSION: i64 = 2;
+/// 当前 schema 版本。v2 给实例表加上设置列（备注/内存/窗口/Java），
+/// v3 加上整合包列（pack_name / pack_state）。
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 打开（必要时创建）数据库并跑迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -33,6 +34,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         match version {
             1 => apply_v1(&tx)?,
             2 => apply_v2(&tx)?,
+            3 => apply_v3(&tx)?,
             other => {
                 return Err(crate::error::AppError::Other(format!(
                     "缺少 schema v{other} 的迁移实现"
@@ -115,6 +117,30 @@ fn apply_v2(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v3：整合包列（packName 与 packState，普通实例保持空串）。
+fn apply_v3(conn: &Connection) -> Result<()> {
+    let mut existing: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(instances)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            existing.push(row?);
+        }
+    }
+    for (column, definition) in [
+        ("pack_name", "TEXT NOT NULL DEFAULT ''"),
+        ("pack_state", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if existing.iter().any(|name| name == column) {
+            continue;
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE instances ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,8 +171,16 @@ mod tests {
             assert_eq!(count, 1, "表 {table} 未创建");
         }
 
-        // v2 的实例设置列都要在
-        for column in ["note", "memory_mb", "window_width", "window_height", "java_path"] {
+        // v2/v3 的实例列都要在
+        for column in [
+            "note",
+            "memory_mb",
+            "window_width",
+            "window_height",
+            "java_path",
+            "pack_name",
+            "pack_state",
+        ] {
             let found: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('instances') WHERE name = ?1",

@@ -34,6 +34,11 @@ export function InstanceCard({ instance, onLaunch, onOpenFolder, onDetail, onCon
           <div className="instance-card__version">
             <span className="version-badge">{instance.mcVersion}</span>
             <span className="loader-badge">{instance.loader || "Vanilla"}</span>
+            {instance.packState === "incomplete" ? (
+              <span className="pack-badge" data-pack-incomplete title={t("instances.packIncompleteHint")}>
+                {t("instances.packIncomplete")}
+              </span>
+            ) : null}
           </div>
         </div>
       </div>

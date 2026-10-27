@@ -6,9 +6,8 @@ import { StoragePanel } from "../components/StoragePanel";
 import { Modal } from "../components/Modal";
 import { formatBytes } from "../lib/format";
 import { DownloadCenter } from "../components/DownloadCenter";
-import { FunGroups } from "../components/FunSettings";
 import { useT } from "../lib/i18n";
-import { ACCENT_PRESETS, DEFAULT_UI_FONT, fontStack, isFontAvailable } from "../lib/theme";
+import { ACCENT_PRESETS, DEFAULT_UI_FONT, fontStack, isFontAvailable, isPresetAccent, normalizeAccent } from "../lib/theme";
 import { api } from "../lib/tauri-api";
 import type {
   AppInfo,
@@ -23,7 +22,7 @@ import type {
   TranslationTestResult,
 } from "../lib/types";
 
-type SectionKey = "general" | "appearance" | "java" | "download" | "content" | "fun" | "storage" | "about";
+type SectionKey = "general" | "appearance" | "java" | "download" | "content" | "storage" | "about";
 
 interface GroupDef {
   id: string;
@@ -105,15 +104,6 @@ const SECTIONS: SectionDef[] = [
     ],
   },
   {
-    key: "fun",
-    labelKey: "settings.nav.fun",
-    groups: [
-      { id: "fortune", titleKey: "fun.fortune", keywords: ["人品", "运势", "fortune", "抽", "乐子"] },
-      { id: "saying", titleKey: "fun.saying", keywords: ["一言", "saying", "hitokoto", "句子", "抽一句"] },
-      { id: "github", titleKey: "fun.github", keywords: ["github", "下载器", "直链", "加速", "节点", "release"] },
-    ],
-  },
-  {
     key: "storage",
     labelKey: "settings.nav.storage",
     groups: [{ id: "storage", titleKey: "settings.storage", keywords: ["存储", "目录", "磁盘", "路径", "storage"] }],
@@ -132,11 +122,13 @@ const MIRRORS: Array<{ id: DownloadSourceId; titleKey: string; descKey: string |
   { id: "custom", titleKey: "settings.mirrorCustom", descKey: null },
 ];
 
-/** 三个内容来源：点即选中并落盘（CurseForge 的 Key 单独保存）。 */
-const CONTENT_SOURCES: Array<{ id: ResourceSourceId; titleKey: string; hintKey: string }> = [
+/**
+ * 两个内容来源：点即选中并落盘（CurseForge 的 Key 单独保存）。
+ * MCIM 是 CurseForge 的镜像通道，不再作为用户可选来源，这里只留一句说明。
+ */
+const CONTENT_SOURCES: Array<{ id: Extract<ResourceSourceId, "modrinth" | "curseforge">; titleKey: string; hintKey: string }> = [
   { id: "modrinth", titleKey: "settings.contentSourceModrinth", hintKey: "settings.contentSourceModrinthHint" },
   { id: "curseforge", titleKey: "settings.contentSourceCurseforge", hintKey: "settings.contentSourceCurseforgeHint" },
-  { id: "mcim", titleKey: "settings.contentSourceMcim", hintKey: "settings.contentSourceMcimHint" },
 ];
 
 /** 翻译接口草稿：默认沿用默认值（0 表示不填，后端按 0.2 / 512 处理）。 */
@@ -175,6 +167,26 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   const [probes, setProbes] = useState<Partial<Record<DownloadSourceId, SourceProbe | "probing">>>({});
 
   // 内容服务：翻译接口与 CurseForge Key 都用草稿，点「保存」才落盘
+  // 自动翻译开关：老设置没有这个字段时按「开启」处理
+  const translateEnabled = settings.translateEnabled !== false;
+  useEffect(() => {
+    let alive = true;
+    void api
+      .settingsGet()
+      .then((fresh) => {
+        if (!alive) return;
+        // 资源页工具行的开关也会写这份设置，进来时对齐一次，避免显示旧状态
+        if (typeof fresh.translateEnabled === "boolean" && fresh.translateEnabled !== settings.translateEnabled) {
+          onChange({ translateEnabled: fresh.translateEnabled });
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+    // 只在挂载时对齐
+  }, []);
+
   const [translation, setTranslation] = useState<TranslationDraft>(() => ({
     source: settings.translationSource,
     baseUrl: settings.translationBaseUrl,
@@ -567,6 +579,9 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
     </section>
   );
 
+  // 主题色：预设 + 自定义（自定义走系统取色器，两者共用同一套 --accent 变量）
+  const accentValue = normalizeAccent(settings.themeColor ?? settings.accent);
+  const customActive = !isPresetAccent(accentValue);
   const accentGroup = (
     <section className="card settings-card">
       <div className="settings-card__title">{t("settings.accent")}</div>
@@ -575,14 +590,38 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
         {ACCENT_PRESETS.map((preset) => (
           <button
             key={preset.id}
-            className={"accent-swatch" + (settings.accent.toLowerCase() === preset.value ? " is-active" : "")}
+            className={"accent-swatch" + (isPresetAccent(accentValue) && accentValue.toLowerCase() === preset.value.toLowerCase() ? " is-active" : "")}
             style={{ background: preset.value }}
             title={preset.label}
             aria-label={preset.label}
-            onClick={() => onChange({ accent: preset.value })}
+            data-accent-preset={preset.id}
+            onClick={() => onChange({ accent: preset.value, themeColor: preset.value })}
           />
         ))}
+        <label
+          className={"accent-swatch accent-swatch--custom" + (customActive ? " is-active" : "")}
+          title={t("settings.accentCustom")}
+          aria-label={t("settings.accentCustom")}
+          data-accent-custom
+          style={customActive ? { background: accentValue } : undefined}
+        >
+          <input
+            type="color"
+            value={accentValue}
+            data-accent-color
+            aria-label={t("settings.accentCustom")}
+            onChange={(event) => onChange({ accent: event.target.value, themeColor: event.target.value })}
+          />
+          <span className="accent-swatch__plus" aria-hidden="true" style={customActive ? { color: "#ffffff" } : undefined}>
+            {customActive ? "" : "+"}
+          </span>
+        </label>
       </div>
+      {customActive ? (
+        <div className="row__hint" data-accent-custom-value>
+          {t("settings.accentCustomValue", { value: accentValue })}
+        </div>
+      ) : null}
     </section>
   );
 
@@ -720,8 +759,38 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   );
 
   const translationGroup = (
-    <section className="card settings-card">
-      <div className="settings-card__title">{t("settings.translation")}</div>
+    <section className="card settings-card" data-settings-translation>
+      <div className="settings-card__title">{t("settings.translateEnabledTitle")}</div>
+      <div className="settings-switch-row" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={translateEnabled}
+            data-translate-enabled
+            aria-label={t("settings.translateEnabledTitle")}
+            onChange={(event) => onChange({ translateEnabled: event.target.checked })}
+          />
+          <span className="switch__track" aria-hidden="true">
+            <span className="switch__dot" />
+          </span>
+        </label>
+        <span className="settings-switch-row__state" style={{ fontSize: 12, fontWeight: 600, color: "var(--accent-strong)" }} data-translate-enabled-state>
+          {translateEnabled ? t("settings.translateEnabledOn") : t("settings.translateEnabledOff")}
+        </span>
+      </div>
+      <div className="row__hint">{t("settings.translateEnabledHint")}</div>
+
+      <div
+        className={"translation-body" + (translateEnabled ? "" : " is-disabled")}
+        aria-disabled={!translateEnabled}
+        data-translation-body
+        style={{
+          display: "grid",
+          gap: 10,
+          opacity: translateEnabled ? 1 : 0.45,
+          pointerEvents: translateEnabled ? "auto" : "none",
+        }}
+      >
       <div className="row__hint">{t("settings.translationHint")}</div>
 
       <div className="segmented" role="radiogroup" aria-label={t("settings.translation")}>
@@ -864,6 +933,8 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
       )}
 
       <div className="row__hint">{t("settings.translationNote")}</div>
+      </div>
+      {translateEnabled ? null : <div className="row__hint" data-translate-off-hint>{t("settings.translateEnabledOffHint")}</div>}
     </section>
   );
 
@@ -925,6 +996,10 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
             </div>
           </div>
         ))}
+      </div>
+
+      <div className="row__hint" data-content-mirror-note>
+        {t("settings.contentSourceMirrorNote")}
       </div>
 
       {contentSource === "curseforge" ? (
@@ -1228,9 +1303,6 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
               </>
             ) : null}
 
-            {activeSection === "fun" ? (
-              <FunGroups settings={settings} dataRoot={dataRoot} onChange={onChange} onNotify={onNotify} visible={showGroup} />
-            ) : null}
             {activeSection === "storage" ? (showGroup("storage") ? storageGroup : null) : null}
             {activeSection === "about" ? (showGroup("about") ? aboutGroup : null) : null}
           </>

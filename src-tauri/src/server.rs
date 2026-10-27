@@ -634,12 +634,52 @@ pub fn validate_name(paths: &Paths, name: &str) -> Result<String> {
 
 // ------------------------------------------------------------------ 运行时状态表
 
-/// 正在运行的服务器（进程 + 写 stdin 的句柄）。
+/// 控制台历史最多保留多少条用户指令。
+pub const HISTORY_CAP: usize = 50;
+
+/// server_console_state 的返回。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsoleState {
+    pub running: bool,
+    pub stdin_open: bool,
+    pub history: Vec<String>,
+}
+
+/// 归一化用户指令：去掉前导斜杠与空白；空指令直接拒绝。
+pub fn normalize_command(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_start_matches('/').trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Invalid("指令不能为空".to_string()));
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return Err(AppError::Invalid("指令不能包含换行".to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 真正写进 stdin 的那一行（末尾必须带换行，否则服务器不会执行）。
+pub fn command_line(command: &str) -> String {
+    format!("{command}\n")
+}
+
+/// 环形缓冲：只保留最近 HISTORY_CAP 条。
+pub fn push_history(history: &mut Vec<String>, command: &str) {
+    history.push(command.to_string());
+    if history.len() > HISTORY_CAP {
+        let drop_count = history.len() - HISTORY_CAP;
+        history.drain(0..drop_count);
+    }
+}
+
+/// 正在运行的服务器（进程 + 写 stdin 的句柄 + 控制台历史）。
 pub struct LiveServer {
     pub child: tokio::process::Child,
     pub stdin: Option<tokio::process::ChildStdin>,
     pub state: ServerState,
     pub players: u32,
+    /// 最近发过的用户指令（最多 HISTORY_CAP 条）
+    pub history: Vec<String>,
 }
 
 /// 进程表：AppState 里只有一个。
@@ -686,6 +726,50 @@ impl ServerStore {
             } else {
                 live.players.saturating_sub(1)
             };
+        }
+    }
+
+    /// 往服务器 stdin 写一条指令（不带 shell，不经过 cmd.exe）。
+    pub async fn send_command(&self, id: i64, raw: &str) -> Result<()> {
+        let command = normalize_command(raw)?;
+        let mut guard = self.inner.lock().await;
+        let Some(live) = guard.get_mut(&id) else {
+            return Err(AppError::Invalid("服务端未运行".to_string()));
+        };
+        if live.state != ServerState::Running {
+            return Err(AppError::Invalid("服务端未运行".to_string()));
+        }
+        let Some(stdin) = live.stdin.as_mut() else {
+            return Err(AppError::Other("服务端标准输入已关闭".to_string()));
+        };
+        use tokio::io::AsyncWriteExt;
+        stdin
+            .write_all(command_line(&command).as_bytes())
+            .await
+            .map_err(|err| AppError::Other(format!("写入服务器标准输入失败：{err}")))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|err| AppError::Other(format!("刷新服务器标准输入失败：{err}")))?;
+        push_history(&mut live.history, &command);
+        tracing::info!(id, command = %command, "已向服务端发送指令");
+        Ok(())
+    }
+
+    /// 控制台状态：是否运行、stdin 是否可写、最近指令。
+    pub async fn console_state(&self, id: i64) -> ConsoleState {
+        let guard = self.inner.lock().await;
+        match guard.get(&id) {
+            Some(live) => ConsoleState {
+                running: live.state == ServerState::Running,
+                stdin_open: live.stdin.is_some(),
+                history: live.history.clone(),
+            },
+            None => ConsoleState {
+                running: false,
+                stdin_open: false,
+                history: Vec::new(),
+            },
         }
     }
 
@@ -1075,6 +1159,160 @@ mod tests {
             "https://piston-data.mojang.com/v1/objects/xx/server.jar"
         );
         assert!(parse_version_server_url("{}").is_none());
+    }
+
+#[test]
+    fn command_normalisation_strips_slash_and_spaces() {
+        assert_eq!(normalize_command("list").unwrap(), "list");
+        assert_eq!(normalize_command("/list").unwrap(), "list");
+        assert_eq!(normalize_command("  /save-all  ").unwrap(), "save-all");
+        assert_eq!(normalize_command("//list").unwrap(), "list");
+        assert_eq!(normalize_command("say hi there").unwrap(), "say hi there");
+        assert!(normalize_command("").is_err());
+        assert!(normalize_command("   ").is_err());
+        assert!(normalize_command("/").is_err());
+        assert!(normalize_command("list\nstop").is_err());
+        assert!(command_line("list").ends_with('\n'));
+        assert_eq!(command_line("list"), "list\n");
+    }
+
+    #[test]
+    fn history_ring_keeps_last_fifty() {
+        let mut history = Vec::new();
+        for index in 0..60 {
+            push_history(&mut history, &format!("cmd{index}"));
+        }
+        assert_eq!(history.len(), HISTORY_CAP);
+        assert_eq!(HISTORY_CAP, 50);
+        assert_eq!(history.first().map(String::as_str), Some("cmd10"));
+        assert_eq!(history.last().map(String::as_str), Some("cmd59"));
+    }
+
+    #[tokio::test]
+    async fn send_command_rejects_when_server_is_not_running() {
+        let store = ServerStore::new();
+        let error = store.send_command(1, "list").await.unwrap_err().to_string();
+        assert!(error.contains("服务端未运行"), "{error}");
+        let error = store.send_command(1, "/  ").await.unwrap_err().to_string();
+        assert!(error.contains("不能为空"), "{error}");
+        let state = store.console_state(1).await;
+        assert!(!state.running);
+        assert!(!state.stdin_open);
+        assert!(state.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_command_writes_a_line_into_a_real_process_stdin() {
+        use tokio::io::AsyncReadExt;
+        // cmd /c more 会把 stdin 原样回显到 stdout：用它验证「真的写进去了」
+        let mut command = tokio::process::Command::new("cmd");
+        command
+            .args(["/c", "more"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::util::hidden_async(&mut command);
+        let mut child = command.spawn().expect("spawn cmd more");
+        let mut stdin = child.stdin.take();
+        let mut stdout = child.stdout.take().expect("stdout");
+        let store = ServerStore::new();
+        store
+            .insert(
+                7,
+                LiveServer {
+                    child,
+                    stdin: stdin.take(),
+                    state: ServerState::Running,
+                    players: 0,
+                    history: Vec::new(),
+                },
+            )
+            .await;
+        store.send_command(7, "/list").await.unwrap();
+        let mut buffer = [0u8; 64];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stdout.read(&mut buffer),
+        )
+        .await
+        .expect("读回显超时")
+        .expect("读回显失败");
+        let echoed = String::from_utf8_lossy(&buffer[..read]).to_string();
+        assert!(echoed.contains("list"), "回显里要有指令：{echoed:?}");
+        let state = store.console_state(7).await;
+        assert!(state.running);
+        assert!(state.stdin_open);
+        assert_eq!(state.history, vec!["list".to_string()]);
+        // 停止后 stdin 关闭、进程表清空
+        store.remove(7).await;
+        let state = store.console_state(7).await;
+        assert!(!state.running);
+        assert!(!state.stdin_open);
+    }
+
+    #[tokio::test]
+    async fn console_state_exposes_history_and_rejects_after_stop() {
+        let store = ServerStore::new();
+        let mut command = tokio::process::Command::new("cmd");
+        command
+            .args(["/c", "more"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::util::hidden_async(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let stdin = child.stdin.take();
+        store
+            .insert(
+                9,
+                LiveServer {
+                    child,
+                    stdin,
+                    state: ServerState::Running,
+                    players: 2,
+                    history: Vec::new(),
+                },
+            )
+            .await;
+        store.send_command(9, "list").await.unwrap();
+        store.send_command(9, "save-all").await.unwrap();
+        let state = store.console_state(9).await;
+        assert_eq!(
+            state.history,
+            vec!["list".to_string(), "save-all".to_string()]
+        );
+        store.set_state(9, ServerState::Stopping).await;
+        let error = store.send_command(9, "list").await.unwrap_err().to_string();
+        assert!(error.contains("服务端未运行"), "{error}");
+        store.remove(9).await;
+    }
+
+    #[tokio::test]
+    async fn request_stop_needs_a_live_entry_with_stdin() {
+        let store = ServerStore::new();
+        assert!(!store.request_stop(3).await, "没有进程时写不了 stop");
+        let mut command = tokio::process::Command::new("cmd");
+        command
+            .args(["/c", "more"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        crate::util::hidden_async(&mut command);
+        let child = command.spawn().expect("spawn");
+        store
+            .insert(
+                3,
+                LiveServer {
+                    child,
+                    stdin: None,
+                    state: ServerState::Running,
+                    players: 0,
+                    history: Vec::new(),
+                },
+            )
+            .await;
+        assert!(!store.request_stop(3).await, "stdin 不在时不能假装停服");
+        store.remove(3).await;
     }
 
     #[test]

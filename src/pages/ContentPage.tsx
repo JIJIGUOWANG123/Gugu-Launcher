@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { icons } from "../assets/icons";
+import { FilterDrawer } from "../components/FilterDrawer";
 import { Modal } from "../components/Modal";
-import { formatBytes } from "../lib/format";
+import { ALL_VERSIONS, FILTERS_BY_KIND, labelToCategoryId } from "../lib/contentFilters";
 import { useT } from "../lib/i18n";
 import { api } from "../lib/tauri-api";
 import type {
+  ContentDependency,
   ContentItem,
   ContentKindTab,
   ContentProvider,
@@ -12,6 +13,8 @@ import type {
   ContentSort,
   Instance,
   ProjectDetail,
+  ServerInstance,
+  VersionChannel,
   VersionItem,
   VersionManifest,
 } from "../lib/types";
@@ -21,23 +24,38 @@ interface Props {
   versions: VersionManifest | null;
   notify: (message: string) => void;
   onInstalled: () => void;
+  /** 整合包创建完成后跳到实例页 */
+  onOpenInstances: () => void;
+  /** 插件没有服务端时提供跳转（多人 → 服务器） */
+  onOpenServers: () => void;
 }
 
-const PROVIDERS: Array<{ id: ContentProvider; labelKey: string }> = [
+/** 用户可选来源只有两个：MCIM 是 CurseForge 的镜像通道，不作为来源选项。 */
+const PROVIDERS: Array<{ id: Extract<ContentProvider, "modrinth" | "curseforge">; labelKey: string }> = [
   { id: "modrinth", labelKey: "settings.contentSourceModrinth" },
   { id: "curseforge", labelKey: "settings.contentSourceCurseforge" },
-  { id: "mcim", labelKey: "settings.contentSourceMcim" },
 ];
 
-const KIND_TABS: ContentKindTab[] = ["mod", "modpack", "resourcepack", "shader", "datapack"];
+/** CurseForge 没填 Key / 镜像不可用时后端会回 403 一类的错误，这里翻成人话。 */
+function curseforgeKeyIssue(message: string): boolean {
+  return /403|401|api[\s_-]?key|unauthor|forbidden|缺少.*key|需要.*key/i.test(message);
+}
+
+/**
+ * 打开设置页：App 的回调这轮不在改动范围内（App 由其它分支在改），
+ * 直接点顶栏那颗齿轮，等价于用户自己点「设置」。
+ */
+function openSettingsPage(): void {
+  document.querySelector<HTMLButtonElement>('[data-action="settings"]')?.click();
+}
+
+const KIND_TABS: ContentKindTab[] = ["mod", "modpack", "resourcepack", "shader", "datapack", "plugin"];
 const SORTS: Array<{ id: ContentSort; labelKey: string }> = [
   { id: "downloads", labelKey: "content.sort.downloads" },
   { id: "updated", labelKey: "content.sort.updated" },
   { id: "relevance", labelKey: "content.sort.relevance" },
 ];
 const PAGE_SIZES = [20, 40, 60];
-const LOADERS = ["Fabric", "Forge", "NeoForge", "Quilt", "原版"];
-const CATEGORIES = ["优化", "科技", "实用", "装饰", "冒险", "光影", "材质", "数据包", "轻量"];
 
 /** 下载量缩写：291_500_000 → 291.5M */
 function formatCount(value: number): string {
@@ -90,11 +108,13 @@ function incompatibleProvider(provider: ContentProvider, kind: ContentKindTab): 
 interface InstallTarget {
   title: string;
   projectId: string;
+  /** 插件走服务端安装，其它类型走实例 */
+  kind: ContentKindTab;
   versionId?: string;
 }
 
 /** 资源页：类型 tab + 搜索/实例版本 + 工具行 + 筛选 chips + 网格/列表 + 分页器。 */
-export function ContentPage({ instances, versions, notify, onInstalled }: Props) {
+export function ContentPage({ instances, versions, notify, onInstalled, onOpenInstances, onOpenServers }: Props) {
   const t = useT();
 
   const [provider, setProvider] = useState<ContentProvider>("modrinth");
@@ -105,9 +125,15 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
   const [pageSize, setPageSize] = useState(20);
   const [view, setView] = useState<"grid" | "list">("grid");
   const [page, setPage] = useState(1);
+  // 已应用的筛选（chips 显示的就是这几项）
   const [loader, setLoader] = useState("");
-  const [categories, setCategories] = useState<string[]>([]);
+  const [categoryLabels, setCategoryLabels] = useState<string[]>([]);
+  const [mcVersion, setMcVersion] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
+  // 抽屉里的草稿：点「完成」才写回上面三项并发请求
+  const [draftLoader, setDraftLoader] = useState("");
+  const [draftCategories, setDraftCategories] = useState<string[]>([]);
+  const [draftVersion, setDraftVersion] = useState("");
   const [translateOn, setTranslateOn] = useState(true);
   const [instanceId, setInstanceId] = useState<number | null>(instances[0]?.id ?? null);
 
@@ -130,6 +156,29 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
     [instances, instanceId],
   );
 
+  // 插件要装到服务端：进来拉一次服务端列表（页面切换会重新挂载，够用）
+  const [servers, setServers] = useState<ServerInstance[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void api
+      .serverList()
+      .then((list) => {
+        if (alive) setServers(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // 类别标签是界面文案，请求要用 Modrinth 的类别 id（一个标签可能拆成多个）
+  const categoryIds = useMemo(() => categoryLabels.flatMap(labelToCategoryId), [categoryLabels]);
+  const kindFilters = FILTERS_BY_KIND[kind];
+  const versionOptions = useMemo(
+    () => (versions?.versions ?? []).filter((item) => item.versionType === "release"),
+    [versions],
+  );
+
   useEffect(() => {
     let alive = true;
     void api
@@ -137,9 +186,12 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
       .then((loaded) => {
         if (!alive) return;
 
-        if (loaded.resourceSource === "curseforge" || loaded.resourceSource === "mcim" || loaded.resourceSource === "modrinth") {
+        // 旧设置里可能存着 mcim：它不是可选来源，直接回落 Modrinth
+        if (loaded.resourceSource === "curseforge" || loaded.resourceSource === "modrinth") {
           setProvider(loaded.resourceSource);
         }
+        // 翻译开关跟着设置走（老设置没有这个字段时按开启处理）
+        setTranslateOn(loaded.translateEnabled !== false);
       })
       .catch(() => undefined);
     return () => {
@@ -157,9 +209,9 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
       provider,
       kind,
       query: submitted,
-      mcVersion: undefined,
+      mcVersion: mcVersion || undefined,
       loader: loader || undefined,
-      categories: categories.length > 0 ? categories : undefined,
+      categories: categoryIds.length > 0 ? categoryIds : undefined,
       sort,
       page,
       pageSize,
@@ -197,7 +249,7 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
       setErrorMessage(message);
       setLoading(false);
     }
-  }, [provider, kind, submitted, loader, categories, sort, page, pageSize, translateOn, nonce]);
+  }, [provider, kind, submitted, loader, categoryIds, mcVersion, sort, page, pageSize, translateOn, nonce]);
 
   useEffect(() => {
     void load();
@@ -211,27 +263,81 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
     if (typeof window !== "undefined") window.scrollTo({ top: 0 });
   };
 
-  const resetFilters = () => {
+  /** 清掉三组筛选（草稿与应用值一起清），搜索词留着 */
+  const resetPanel = () => {
+    setDraftLoader("");
+    setDraftCategories([]);
+    setDraftVersion("");
     setLoader("");
-    setCategories([]);
+    setCategoryLabels([]);
+    setMcVersion("");
+    setPage(1);
+  };
+
+  /** 翻译开关：立刻写设置并重新请求，卡片随之在译文 / 原文之间切换。 */
+  const toggleTranslate = async () => {
+    const next = !translateOn;
+    setTranslateOn(next);
+    setPage(1);
+    try {
+      const current = await api.settingsGet();
+      await api.settingsSet({ ...current, translateEnabled: next });
+    } catch (error) {
+      notify(String(error));
+    }
+  };
+
+  /** 工具行的「清除全部」：筛选与搜索词一起清 */
+  const resetFilters = () => {
+    resetPanel();
     setSubmitted("");
     setQuery("");
     setPage(1);
   };
 
+  const openFilters = () => {
+    setDraftLoader(loader);
+    setDraftCategories(categoryLabels);
+    setDraftVersion(mcVersion);
+    setFiltersOpen(true);
+  };
+
+  /** 「完成」：草稿落地并发一次请求，然后关抽屉 */
+  const applyFilters = () => {
+    setLoader(draftLoader);
+    setCategoryLabels(draftCategories);
+    setMcVersion(draftVersion);
+    setPage(1);
+    setNonce((value) => value + 1);
+    setFiltersOpen(false);
+  };
+
   const chips = useMemo(() => {
     const out: Array<{ key: string; label: string; clear: () => void }> = [];
     if (loader) out.push({ key: "loader", label: t("content.chip.loader", { value: loader }), clear: () => setLoader("") });
-    for (const category of categories) {
+    if (mcVersion) out.push({ key: "version", label: t("content.chip.version", { value: mcVersion }), clear: () => setMcVersion("") });
+    for (const category of categoryLabels) {
       out.push({
         key: "cat-" + category,
-        label: t("content.chip.category", { value: category }),
-        clear: () => setCategories((prev) => prev.filter((item) => item !== category)),
+        label: category,
+        clear: () => setCategoryLabels((prev) => prev.filter((item) => item !== category)),
       });
     }
     if (submitted) out.push({ key: "q", label: t("content.chip.query", { value: submitted }), clear: () => { setSubmitted(""); setQuery(""); } });
     return out;
-  }, [loader, categories, submitted, t]);
+  }, [loader, mcVersion, categoryLabels, submitted, t]);
+
+  /** 插件：装到选中的服务端（进度走下载中心）。 */
+  const installToServer = async (serverId: string) => {
+    if (!install) return;
+    try {
+      await api.serverContentInstall({ serverId, provider, projectId: install.projectId, versionId: install.versionId });
+      notify(t("content.installedServer", { name: servers.find((server) => server.id === serverId)?.name ?? serverId }));
+      setInstall(null);
+    } catch (error) {
+      notify(String(error));
+    }
+  };
 
   const installTo = async (id: number) => {
     if (!install) return;
@@ -248,9 +354,14 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   const cardFor = (item: ContentItem) => {
-    const translated = translations[item.id];
-    const title = translated?.title ?? (item.translated ? item.title : item.title) ?? item.titleOriginal ?? "";
-    const summary = translated?.summary ?? item.summary ?? item.summaryOriginal ?? "";
+    // 关掉自动翻译 → 一律用后端给的原始字段，绝不显示译文
+    const translated = translateOn ? translations[item.id] : undefined;
+    const title = translateOn
+      ? (translated?.title ?? item.title ?? item.titleOriginal ?? "")
+      : (item.titleOriginal ?? item.title ?? "");
+    const summary = translateOn
+      ? (translated?.summary ?? item.summary ?? item.summaryOriginal ?? "")
+      : (item.summaryOriginal ?? item.summary ?? "");
     const author = item.author || "";
     const tags = [...(item.loaders ?? []), ...(item.categories ?? [])].filter(Boolean).slice(0, 4);
     return { title, summary, author, tags };
@@ -275,6 +386,8 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
                 notify(t("content.providerSwitched", { from: t("content.source." + provider), to: t("content.source." + fallback), kind: t("content.kind." + item) }));
               }
               setKind(item);
+              // 每种类型的筛选项不同，换 tab 时把三组选择清干净，避免带着不存在的类别去请求
+              resetPanel();
               setPage(1);
             }}
           >
@@ -372,7 +485,10 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
             type="button"
             className={"pill-outline" + (filtersOpen ? " is-active" : "")}
             data-action="content-filters"
-            onClick={() => setFiltersOpen((open) => !open)}
+            onClick={() => {
+              if (filtersOpen) setFiltersOpen(false);
+              else openFilters();
+            }}
           >
             {t("content.filters")}
           </button>
@@ -390,7 +506,8 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
             type="button"
             className={"pill-outline" + (translateOn ? " is-active" : "")}
             data-action="content-translate-toggle"
-            onClick={() => setTranslateOn((on) => !on)}
+            data-translate-on={translateOn ? "1" : "0"}
+            onClick={() => void toggleTranslate()}
           >
             {translateOn ? t("content.translateOn") : t("content.translateOff")}
           </button>
@@ -402,46 +519,86 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
         </div>
 
         {filtersOpen ? (
-          <div className="content-filters-panel" data-content-filters>
-            <div className="content-filter-block">
-              <span className="content-filter__label">{t("content.loader")}</span>
-              <div className="chip-row">
-                {LOADERS.map((item) => (
-                  <button
-                    key={item}
-                    type="button"
-                    className={"chip chip--button" + (loader === item ? " is-active" : "")}
-                    data-filter-loader={item}
-                    onClick={() => {
-                      setLoader(loader === item ? "" : item);
-                      setPage(1);
-                    }}
-                  >
-                    {item}
-                  </button>
+          <FilterDrawer
+            title={t("content.filters")}
+            onClose={() => setFiltersOpen(false)}
+            footer={
+              <>
+                <button type="button" className="pill-outline" data-action="filter-reset" onClick={resetPanel}>
+                  {t("content.filtersReset")}
+                </button>
+                <button type="button" className="pill-button" data-action="filter-apply" onClick={applyFilters}>
+                  {t("content.filtersDone")}
+                </button>
+              </>
+            }
+          >
+            <div className="filter-group" data-filter-group="version">
+              <span className="filter-group__label">{t("content.gameVersion")}</span>
+              <select data-filter-version value={draftVersion} onChange={(event) => setDraftVersion(event.target.value)}>
+                <option value="">{ALL_VERSIONS}</option>
+                {versionOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.id}
+                  </option>
                 ))}
+              </select>
+            </div>
+
+            {kindFilters.loaders ? (
+              <div className="filter-group" data-filter-group="loader">
+                <span className="filter-group__label">{t("content.loader")}</span>
+                <div className="chip-row">
+                  {(kindFilters.loaders ?? []).map((option) => {
+                    const isAll = option.ids.length === 0;
+                    const active = isAll ? draftLoader === "" : draftLoader === option.label;
+                    return (
+                      <button
+                        key={option.label}
+                        type="button"
+                        className={"chip chip--button" + (active ? " is-active" : "")}
+                        data-filter-loader={option.label}
+                        data-filter-all={isAll ? "1" : undefined}
+                        onClick={() => setDraftLoader(isAll ? "" : option.label)}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="filter-group" data-filter-group="category">
+              <span className="filter-group__label">{t("content.categories")}</span>
+              <div className="chip-row">
+                {kindFilters.categories.map((option) => {
+                  const isAll = option.ids.length === 0;
+                  const active = isAll ? draftCategories.length === 0 : draftCategories.includes(option.label);
+                  return (
+                    <button
+                      key={option.label}
+                      type="button"
+                      className={"chip chip--button" + (active ? " is-active" : "")}
+                      data-filter-category={option.label}
+                      data-filter-all={isAll ? "1" : undefined}
+                      onClick={() => {
+                        if (isAll) {
+                          setDraftCategories([]);
+                          return;
+                        }
+                        setDraftCategories((prev) =>
+                          prev.includes(option.label) ? prev.filter((value) => value !== option.label) : [...prev, option.label],
+                        );
+                      }}
+                    >
+                      {option.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
-            <div className="content-filter-block">
-              <span className="content-filter__label">{t("content.categories")}</span>
-              <div className="chip-row">
-                {CATEGORIES.map((item) => (
-                  <button
-                    key={item}
-                    type="button"
-                    className={"chip chip--button" + (categories.includes(item) ? " is-active" : "")}
-                    data-filter-category={item}
-                    onClick={() => {
-                      setCategories((prev) => (prev.includes(item) ? prev.filter((value) => value !== item) : [...prev, item]));
-                      setPage(1);
-                    }}
-                  >
-                    {item}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
+          </FilterDrawer>
         ) : null}
 
         {chips.length > 0 ? (
@@ -477,10 +634,24 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
       ) : failed ? (
         <div className="empty-hint content-error" data-content-error>
           <strong data-content-error-title>
-            {/不支持|unsupported/i.test(errorMessage) ? t("content.unsupportedKind") : t("content.loadFailed")}
+            {curseforgeKeyIssue(errorMessage)
+              ? t("content.cfKeyRequired")
+              : /不支持|unsupported/i.test(errorMessage)
+                ? t("content.unsupportedKind")
+                : t("content.loadFailed")}
           </strong>
-          {errorMessage ? <span className="row__hint" data-content-error-message>{errorMessage}</span> : null}
+          {errorMessage ? (
+            // 403 / 缺 Key 时不要把后端原文甩给用户，换成一句人话
+            <span className="row__hint" data-content-error-message>
+              {curseforgeKeyIssue(errorMessage) ? t("content.cfKeyRequiredHint") : errorMessage}
+            </span>
+          ) : null}
           <div className="content-error__actions">
+            {curseforgeKeyIssue(errorMessage) ? (
+              <button type="button" className="pill-button" data-action="content-go-settings" onClick={openSettingsPage}>
+                {t("content.goSettings")}
+              </button>
+            ) : null}
             <button
               type="button"
               className="pill-outline"
@@ -546,9 +717,9 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
                     type="button"
                     className="pill-button"
                     data-action="content-install"
-                    onClick={() => setInstall({ title: data.title, projectId: item.id })}
+                    onClick={() => setInstall({ title: data.title, projectId: item.id, kind: item.kind })}
                   >
-                    {t("content.installShort")}
+                    {t(item.kind === "plugin" ? "content.installToServer" : "content.installShort")}
                   </button>
                 </div>
               </article>
@@ -597,7 +768,22 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
       ) : null}
 
       {detailItem ? (
-        <ContentDetailDrawer item={detailItem} onClose={() => setDetailItem(null)} onInstall={(versionId) => setInstall({ title: cardFor(detailItem).title, projectId: detailItem.id, versionId })} notify={notify} />
+        <ContentDetailModal
+          item={detailItem}
+          instances={instances}
+          servers={servers}
+          onClose={() => setDetailItem(null)}
+          onInstalled={onInstalled}
+          onGoInstances={() => {
+            setDetailItem(null);
+            onOpenInstances();
+          }}
+          onGoServers={() => {
+            setDetailItem(null);
+            onOpenServers();
+          }}
+          notify={notify}
+        />
       ) : null}
 
       {install ? (
@@ -611,7 +797,41 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
           }
         >
           <p className="row__hint">{install.title}</p>
-          {instances.length === 0 ? (
+          {install.kind === "plugin" ? (
+            servers.length === 0 ? (
+              <div className="empty-hint" data-install-no-server>
+                {t("content.noServer")}
+                <button
+                  type="button"
+                  className="pill-outline"
+                  data-action="install-go-servers"
+                  onClick={() => {
+                    setInstall(null);
+                    onOpenServers();
+                  }}
+                >
+                  {t("content.goServers")}
+                </button>
+              </div>
+            ) : (
+              <div className="install-list">
+                {servers.map((server) => (
+                  <button
+                    key={server.id}
+                    type="button"
+                    className="install-row"
+                    data-install-server={server.id}
+                    onClick={() => void installToServer(server.id)}
+                  >
+                    <span className="install-row__name">{server.name}</span>
+                    <span className="install-row__meta">
+                      {t("server.core." + server.core)} {server.mcVersion}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )
+          ) : instances.length === 0 ? (
             <div className="empty-hint">{t("content.noInstance")}</div>
           ) : (
             <div className="install-list">
@@ -634,108 +854,365 @@ export function ContentPage({ instances, versions, notify, onInstalled }: Props)
   );
 }
 
-interface DrawerProps {
+interface DetailProps {
   item: ContentItem;
+  instances: Instance[];
+  servers: ServerInstance[];
   onClose: () => void;
-  onInstall: (versionId?: string) => void;
+  onInstalled: () => void;
+  onGoInstances: () => void;
+  onGoServers: () => void;
   notify: (message: string) => void;
 }
 
-/** 详情抽屉：项目详情 + 版本列表（保留原有能力，id 换成新的 ContentItem.id）。 */
-function ContentDetailDrawer({ item, onClose, onInstall, notify }: DrawerProps) {
+const CHANNELS: Array<{ id: VersionChannel | "all"; labelKey: string }> = [
+  { id: "all", labelKey: "content.channel.all" },
+  { id: "release", labelKey: "content.channel.release" },
+  { id: "beta", labelKey: "content.channel.beta" },
+  { id: "alpha", labelKey: "content.channel.alpha" },
+];
+
+/** 资源详情：居中大弹窗（图标 + 信息 + 快捷操作 + 实例 + 版本页签 + 依赖 + 一键安装）。 */
+function ContentDetailModal({ item, instances, servers, onClose, onInstalled, onGoInstances, onGoServers, notify }: DetailProps) {
   const t = useT();
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [versions, setVersions] = useState<VersionItem[] | null>(null);
-  const [selectedVersion, setSelectedVersion] = useState<string | null>(null);
+  const [deps, setDeps] = useState<ContentDependency[]>([]);
+  const [channel, setChannel] = useState<VersionChannel | "all">("all");
+  const [selected, setSelected] = useState<string | null>(null);
+  const [instanceId, setInstanceId] = useState<number | null>(instances[0]?.id ?? null);
+  const [installing, setInstalling] = useState(false);
+  const [installed, setInstalled] = useState(false);
+  // 整合包：直接建实例
+  const isModpack = item.kind === "modpack";
+  // 插件：装到服务端
+  const isPlugin = item.kind === "plugin";
+  const [serverId, setServerId] = useState<string>(servers[0]?.id ?? "");
+  const [packName, setPackName] = useState(item.title);
+  const [packMemory, setPackMemory] = useState(2048);
+  const [packError, setPackError] = useState("");
+  const [packDone, setPackDone] = useState<{ name: string } | null>(null);
+  // CurseForge 缺 Key / 镜像不可用：不改报错原文，弹窗里给友好提示 + 去设置
+  const [keyIssue, setKeyIssue] = useState("");
+
+  /** 统一的失败处理：缺 Key 类错误进弹窗提示，其它照旧走 toast。 */
+  const reportError = (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (curseforgeKeyIssue(message)) {
+      setKeyIssue(message);
+      return;
+    }
+    notify(message);
+  };
 
   useEffect(() => {
     let alive = true;
-    setDetail(null);
-    setVersions(null);
-    void (async () => {
-      try {
-        const [project, versionList] = await Promise.all([
-          api.contentDetail(item.provider, item.id),
-          api.contentVersions(item.provider, item.id),
-        ]);
-        if (!alive) return;
-        setDetail(project);
-        setVersions(versionList);
-        setSelectedVersion(versionList[0]?.versionId ?? null);
-      } catch (error) {
-        if (alive) notify(String(error));
-      }
-    })();
+    void api
+      .contentDetail(item.provider, item.id)
+      .then((value) => {
+        if (alive) setDetail(value);
+      })
+      .catch((error) => notify(String(error)));
+    void api
+      .contentDependencies(item.provider, item.id)
+      .then((list) => {
+        if (alive) setDeps(list);
+      })
+      .catch(() => undefined);
     return () => {
       alive = false;
     };
   }, [item.provider, item.id, notify]);
 
+  useEffect(() => {
+    let alive = true;
+    setVersions(null);
+    void api
+      .contentVersions(item.provider, item.id, undefined, undefined, channel === "all" ? undefined : channel)
+      .then((list) => {
+        if (!alive) return;
+        setVersions(list);
+        setSelected(list[0]?.versionId ?? null);
+      })
+      .catch((error) => {
+        if (alive) notify(String(error));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [item.provider, item.id, channel, notify]);
+
+  const install = async () => {
+    if (!instanceId) return;
+    setInstalling(true);
+    try {
+      await api.modInstall({ provider: item.provider, projectId: item.id, versionId: selected ?? undefined, instanceId, withDependencies: true });
+      setInstalled(true);
+      onInstalled();
+      notify(t("content.installed", { name: item.title }));
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const installToServer = async () => {
+    if (!serverId) return;
+    setInstalling(true);
+    try {
+      await api.serverContentInstall({ serverId, provider: item.provider, projectId: item.id, versionId: selected ?? undefined });
+      setInstalled(true);
+      onInstalled();
+      notify(t("content.installedServer", { name: servers.find((server) => server.id === serverId)?.name ?? serverId }));
+    } catch (error) {
+      reportError(error);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const copyName = async () => {
+    try {
+      await navigator.clipboard.writeText(item.title);
+      notify(t("content.copied"));
+    } catch {
+      notify(t("content.copyFailed"));
+    }
+  };
+
+  const requiredCount = deps.filter((dep) => dep.kind === "required").length;
+
+  /** 整合包：创建实例并安装（进度进下载中心）。 */
+  const createPackInstance = async () => {
+    const name = packName.trim() || item.title;
+    setInstalling(true);
+    setPackError("");
+    try {
+      await api.modpackInstall({ provider: item.provider, projectId: item.id, versionId: selected ?? undefined, instanceName: name, memoryMb: packMemory });
+      setPackDone({ name });
+      setInstalled(true);
+      onInstalled();
+      notify(t("content.modpackCreated", { name }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setPackError(curseforgeKeyIssue(message) ? t("content.cfKeyRequiredHint") : message);
+      // 实例可能已经建出来了（只是没装完），刷新列表让「整合包未装完」小标出现
+      onInstalled();
+      notify(t("content.modpackCreateFailed"));
+    } finally {
+      setInstalling(false);
+    }
+  };
+
+  const chosenVersion = versions?.find((version) => version.versionId === selected) ?? null;
+
   return (
-    <div className="drawer-overlay" role="dialog" aria-modal="true" aria-label={t("content.detail")} onClick={onClose}>
-      <aside className="drawer" data-content-drawer onClick={(event) => event.stopPropagation()}>
-        <header className="drawer__head">
-          <div className="drawer__title">
-            {item.iconUrl ? <img className="drawer__icon" src={item.iconUrl} alt="" /> : null}
-            <div>
-              <h3>{detail?.title ?? item.title}</h3>
-              <span className="row__hint">
-                {item.author || "—"} · {t("content.source." + item.provider)}
-                {detail?.license ? " · " + detail.license : ""}
-              </span>
-            </div>
-          </div>
-          <button type="button" className="icon-button" data-action="drawer-close" title={t("content.close")} onClick={onClose}>
-            <img src={icons.close} alt={t("content.close")} />
-          </button>
-        </header>
-        <div className="drawer__body">
-          <section className="drawer__section">
-            <div className="drawer__section-head">
-              <span className="detail-card__title">{t("content.description")}</span>
-            </div>
-            <pre className="drawer__text" data-drawer-description>
-              {detail === null ? t("common.loading") : detail.description}
-            </pre>
-          </section>
-          <section className="drawer__section">
-            <div className="drawer__section-head">
-              <span className="detail-card__title">{t("content.versions")}</span>
-              {versions !== null ? <span className="row__hint">{versions.length}</span> : null}
-            </div>
-            {versions === null ? (
-              <div className="row__hint">{t("common.loading")}</div>
-            ) : versions.length === 0 ? (
-              <div className="empty-hint">{t("content.noVersions")}</div>
-            ) : (
-              <div className="version-rows">
-                {versions.map((version) => (
-                  <button
-                    key={version.versionId}
-                    type="button"
-                    className={"version-row" + (selectedVersion === version.versionId ? " is-active" : "")}
-                    data-version={version.versionId}
-                    onClick={() => setSelectedVersion(version.versionId)}
-                  >
-                    <span className="version-row__name">{version.name}</span>
-                    <span className="version-row__meta">
-                      {version.gameVersions.join(" / ")} · {version.loaders.join(" / ")} · {formatBytes(version.fileSize)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-        </div>
-        <footer className="drawer__foot">
+    <Modal
+      title={item.title}
+      onClose={onClose}
+      footer={
+        <>
           <button type="button" className="pill-outline" onClick={onClose}>
             {t("common.close")}
           </button>
-          <button type="button" className="pill-button" data-action="drawer-install" onClick={() => onInstall(selectedVersion ?? undefined)}>
-            {t("content.installVersion")}
+          {packDone ? (
+            <button type="button" className="pill-outline" data-action="detail-go-instances" onClick={onGoInstances}>
+              {t("content.goInstances")}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="pill-button"
+            data-action="detail-install"
+            disabled={installing || installed || (isModpack ? false : isPlugin ? !serverId : !instanceId)}
+            onClick={() => void (isModpack ? createPackInstance() : isPlugin ? installToServer() : install())}
+          >
+            {installed
+              ? t(isModpack ? "content.packDone" : "content.installedBadge")
+              : installing
+                ? t("content.installing")
+                : t(isModpack ? "content.createAndInstall" : isPlugin ? "content.installToServer" : "content.oneClickInstall")}
           </button>
-        </footer>
-      </aside>
-    </div>
+        </>
+      }
+    >
+      <div className="cdetail" data-content-detail-modal>
+        {keyIssue ? (
+          <div className="notice" data-detail-key-issue>
+            <strong>{t("content.cfKeyRequired")}</strong>
+            <span>{t("content.cfKeyRequiredHint")}</span>
+            <button type="button" className="link-button" data-action="detail-go-settings" onClick={openSettingsPage}>
+              {t("content.goSettings")}
+            </button>
+          </div>
+        ) : null}
+        <div className="cdetail__head">
+          {item.iconUrl ? <img className="cdetail__icon" src={item.iconUrl} alt="" /> : null}
+          <div className="cdetail__info">
+            <div className="cdetail__title-row">
+              <span className="cdetail__title">{detail?.title ?? item.title}</span>
+              <span className="chip chip--tiny" data-detail-kind>{t("content.kind." + item.kind)}</span>
+            </div>
+            <div className="row__hint" data-detail-meta>
+              {item.author || "—"} · ↓ {formatCount(item.downloads)} · {relativeTime(item.updatedAt)}
+            </div>
+            <div className="row__hint cdetail__summary">{(detail?.summary ?? item.summary).slice(0, 120)}</div>
+          </div>
+        </div>
+
+        <div className="cdetail__actions">
+          <button type="button" className="pill-outline pill-outline--tiny" data-action="detail-wiki" onClick={() => void api.openExternal(detail?.url ?? item.iconUrl ?? "").catch((error) => notify(String(error)))}>
+            {t("content.wiki")}
+          </button>
+          <button type="button" className="pill-outline pill-outline--tiny" data-action="detail-open" onClick={() => void api.openExternal(detail?.url ?? "").catch((error) => notify(String(error)))}>
+            {t("content.openInBrowser")}
+          </button>
+          <button type="button" className="pill-outline pill-outline--tiny" data-action="detail-copy" onClick={() => void copyName()}>
+            {t("content.copyName")}
+          </button>
+        </div>
+
+        {isModpack ? (
+          <div className="cdetail__pack" data-detail-pack>
+            <div className="field">
+              <label htmlFor="pack-name">{t("content.packName")}</label>
+              <input id="pack-name" type="text" data-detail-pack-name value={packName} onChange={(event) => setPackName(event.target.value)} />
+            </div>
+            <div className="field">
+              <label htmlFor="pack-memory">
+                {t("content.packMemory")}
+                <span className="field__value">{packMemory} MB</span>
+              </label>
+              <input
+                id="pack-memory"
+                type="range"
+                min={1024}
+                max={8192}
+                step={512}
+                value={packMemory}
+                data-detail-pack-memory
+                onChange={(event) => setPackMemory(Number(event.target.value))}
+              />
+            </div>
+            <div className="field">
+              <span className="row__hint">{t("content.packVersion")}</span>
+              <div className="mono" data-detail-pack-version>
+                {(chosenVersion?.gameVersions[0] ?? item.title) + " · " + (chosenVersion?.loaders.join(" / ") ?? "—")}
+              </div>
+            </div>
+          </div>
+        ) : isPlugin ? (
+          <div className="field">
+            <label htmlFor="detail-server">{t("content.installServerPick")}</label>
+            {servers.length === 0 ? (
+              <div className="empty-hint" data-detail-no-server>
+                {t("content.noServer")}
+                <button type="button" className="pill-outline" data-action="detail-go-servers" onClick={onGoServers}>
+                  {t("content.goServers")}
+                </button>
+              </div>
+            ) : (
+              <select id="detail-server" data-detail-server value={serverId} onChange={(event) => setServerId(event.target.value)}>
+                {servers.map((server) => (
+                  <option key={server.id} value={server.id}>
+                    {server.name} · {t("server.core." + server.core)} {server.mcVersion}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        ) : (
+          <div className="field">
+            <label htmlFor="detail-instance">{t("content.installPick")}</label>
+            <select id="detail-instance" data-detail-instance value={instanceId ?? ""} onChange={(event) => setInstanceId(Number(event.target.value) || null)}>
+              {instances.length === 0 ? <option value="">{t("content.noInstance")}</option> : null}
+              {instances.map((instance) => (
+                <option key={instance.id} value={instance.id}>
+                  {instance.name} ({instance.mcVersion} {instance.loader.toLowerCase()})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        <div className="cdetail__versions">
+          <div className="cdetail__versions-head">
+            <span className="detail-card__title">{t("content.versions")}</span>
+            <div className="chip-row">
+              {CHANNELS.map((entry) => (
+                <button
+                  key={entry.id}
+                  type="button"
+                  className={"chip chip--button" + (channel === entry.id ? " is-active" : "")}
+                  data-detail-channel={entry.id}
+                  onClick={() => setChannel(entry.id)}
+                >
+                  {t(entry.labelKey)}
+                </button>
+              ))}
+            </div>
+          </div>
+          {versions === null ? (
+            <div className="row__hint">{t("common.loading")}</div>
+          ) : versions.length === 0 ? (
+            <div className="empty-hint" data-detail-no-version>
+              {t("content.noVersions")}
+            </div>
+          ) : (
+            <div className="cdetail__version-list">
+              {versions.map((version) => {
+                const kind = version.channel ?? "release";
+                return (
+                  <button
+                    key={version.versionId}
+                    type="button"
+                    className={"cdetail__version" + (selected === version.versionId ? " is-active" : "")}
+                    data-detail-version={version.versionId}
+                    onClick={() => setSelected(version.versionId)}
+                  >
+                    <span className="cdetail__version-name">
+                      {version.name} for {version.loaders.join(" / ")} {version.gameVersions.join(" / ")}
+                    </span>
+                    <span className={"version-kind version-kind--" + kind} data-detail-version-kind={kind}>
+                      {t("content.channel." + kind)}
+                    </span>
+                    <span className="row__hint">{version.serverLabel ?? "Server, " + version.gameVersions[0]}</span>
+                    <span className="row__hint">{version.publishedAt.slice(0, 10)}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="cdetail__deps" hidden={isModpack}>
+          <span className="detail-card__title">{t("content.dependencies")}</span>
+          {isModpack ? null : deps.length === 0 ? (
+            <span className="row__hint" data-detail-no-deps>
+              {t("content.noDependencies")}
+            </span>
+          ) : (
+            <>
+              <span className="row__hint" data-detail-deps-hint>
+                {t("content.depsHint", { count: requiredCount })}
+              </span>
+              <div className="chip-row">
+                {deps.map((dep) => (
+                  <span key={dep.projectId} className={"chip dep-chip dep-chip--" + dep.kind} data-detail-dep={dep.name}>
+                    {dep.kind === "required" ? t("content.dep.required") : t("content.dep.optional")} {dep.name}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+        {packError ? (
+          <div className="field-error" data-detail-pack-error>
+            {packError}
+          </div>
+        ) : null}
+      </div>
+    </Modal>
   );
 }

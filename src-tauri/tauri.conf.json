@@ -36,8 +36,8 @@
       "nsis"
     ],
     "resources": [
-      "resources/skins/steve.png",
-      "resources/skins/alex.png"
+      "resources/skins/*",
+      "resources/terracotta/*"
     ],
     "windows": {
       "nsis": {

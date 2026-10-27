@@ -1518,6 +1518,7 @@ name = "gugu-launcher"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "cc",
  "fontdb",
  "reqwest 0.12.28",
  "rusqlite",

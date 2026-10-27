@@ -697,6 +697,46 @@ body.modal-open .topbar {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 自定义主题色：彩虹渐变底 + 隐藏的系统取色器；选中后整圈换成当前色 */
+.accent-swatch--custom {
+  position: relative;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: conic-gradient(from 0deg, #ff5f6d, #ffc371, #47cf73, #4c9aff, #9b7bff, #ff5f6d);
+  cursor: pointer;
+}
+
+.accent-swatch--custom input[type="color"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.accent-swatch__plus {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 58%;
+  height: 58%;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: none;
+}
+
+.accent-swatch--custom.is-active .accent-swatch__plus {
+  background: transparent;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.65) inset;
+}
+
 /* 字体下拉：每一项用该字体自己渲染预览 */
 select.font-picker,
 select.font-picker option {
@@ -2465,8 +2505,63 @@ input[type="password"]:focus-visible {
   color: var(--text-faint);
 }
 
+/*
+ * 存档行：左「名字 + 元信息」＋右「按钮组」的横向布局。
+ * 以前用固定列宽（… 150px 放三个按钮）会挤爆格子、压到大小文字上，这里改成 flex：
+ * 左边可压缩并省略，右边按钮组 flex: 0 0 auto、不换行不压缩。
+ */
 .file-row--saves {
-  grid-template-columns: minmax(0, 1fr) 108px 84px 150px;
+  display: flex;
+  grid-template-columns: none;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.file-row--saves .file-row__main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.file-row--saves .file-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.file-row--saves .file-row__time,
+.file-row--saves .file-row__size {
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.file-row--saves .file-row__ops {
+  flex: 0 0 auto;
+  margin-left: auto;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+/* 按钮不换行、不被压缩 */
+.file-row--saves .file-row__ops > * {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 表头同样走 flex，列宽跟数据行一致 */
+.file-row--head.file-row--saves {
+  display: flex;
+  gap: 12px;
+}
+
+.file-row--head.file-row--saves .file-row__name {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .file-row.is-disabled {
@@ -2770,6 +2865,457 @@ input[type="password"]:focus-visible {
   gap: 8px;
 }
 
+/* ==================================================== M10 服务端详情 */
+
+.server-detail__glyph {
+  display: grid;
+  place-items: center;
+  color: var(--accent-strong);
+}
+
+.srv-panel {
+  display: grid;
+  gap: 12px;
+}
+
+.srv-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.srv-toolbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.srv-toolbar__actions .pill-outline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.srv-rows {
+  display: grid;
+  gap: 6px;
+}
+
+.srv-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 110px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.srv-row--head {
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.srv-row__name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.srv-row__meta {
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.srv-row__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.srv-row__actions > * {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.srv-config {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.srv-config__text {
+  width: 100%;
+  min-height: 260px;
+  box-sizing: border-box;
+  resize: vertical;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+.srv-logs {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ---- M12 服务端控制台 ---- */
+.srv-console {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.srv-console__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.srv-console__prompt {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--accent-strong);
+}
+
+.srv-console__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.srv-console__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.srv-console__quick {
+  gap: 6px;
+}
+
+.srv-console__quick .chip {
+  font-size: 11px;
+  padding: 2px 10px;
+}
+
+.srv-console__quick .chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 控制台回显：> 指令 用浅主色底区分于服务器输出 */
+.log-line--input {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  font-weight: 600;
+}
+
+.switch--mini .switch__track {
+  width: 34px;
+  height: 18px;
+}
+
+.switch--mini .switch__dot {
+  width: 12px;
+  height: 12px;
+}
+
+/* ============================================ M14 本地皮肤：删除 + 空态 */
+
+.skin-tile-wrap {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+
+.skin-tile-wrap.is-deleting .skin-tile {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.skin-tile__delete {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  opacity: 0;
+  transition: opacity var(--transition), border-color var(--transition);
+}
+
+.skin-tile-wrap:hover .skin-tile__delete,
+.skin-tile__delete:focus-visible {
+  opacity: 1;
+}
+
+.skin-tile__delete:hover {
+  border-color: color-mix(in srgb, #d9534f 55%, transparent);
+}
+
+.skin-tile__delete img {
+  width: 14px;
+  height: 14px;
+}
+
+.skin-tile__deleting {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+
+.skin-empty {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  padding: 24px 12px;
+}
+
+/* ================================================== M10 内容筛选抽屉 */
+
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(10, 14, 22, 0.28);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+.filter-drawer {
+  width: min(320px, calc(100vw - 56px));
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px 18px 16px;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  animation: filter-drawer-in 180ms ease-out;
+}
+
+@keyframes filter-drawer-in {
+  from {
+    transform: translateX(28px);
+    opacity: 0.6;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.filter-drawer__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.filter-drawer__title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.filter-drawer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 16px;
+  align-content: start;
+  padding-right: 2px;
+}
+
+.filter-drawer__foot {
+  display: flex;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.filter-drawer__foot .pill-outline,
+.filter-drawer__foot .pill-button {
+  flex: 1 1 0;
+  justify-content: center;
+}
+
+.filter-group {
+  display: grid;
+  gap: 8px;
+}
+
+.filter-group__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.filter-group select {
+  width: 100%;
+}
+
+/* ==================================================== M10 披风设置弹窗 */
+
+.cape-library__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cape-library__thumb {
+  width: 32px;
+  height: 51px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-sm);
+  image-rendering: pixelated;
+}
+
+.cape-library__thumb--none {
+  border: 1px dashed var(--border);
+  background: var(--surface-muted);
+}
+
+.modal.modal--wide {
+  width: min(620px, calc(100vw - 80px));
+}
+
+.cape-modal {
+  display: grid;
+  gap: 10px;
+}
+
+.cape-modal__lead {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.cape-modal__notice button {
+  justify-self: flex-end;
+  margin-top: 8px;
+}
+
+.cape-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 10px;
+}
+
+.cape-pick {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  justify-items: center;
+  padding: 8px 6px 6px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.cape-pick:hover {
+  border-color: var(--accent);
+}
+
+.cape-pick.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.cape-pick__img {
+  width: 40px;
+  height: 64px;
+  image-rendering: pixelated;
+  border-radius: var(--radius-sm);
+}
+
+.cape-pick__img--none {
+  border: 1px dashed var(--border);
+  background: repeating-linear-gradient(45deg, var(--surface) 0 6px, var(--surface-muted) 6px 12px);
+}
+
+.cape-pick__name {
+  max-width: 100%;
+  font-size: 12px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cape-pick__meta {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.cape-pick__check {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-contrast, #1a1a1a);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.skin-stage__note {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  padding: 3px 8px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  pointer-events: none;
+}
+
 /* ======================================================== M3-2 璐﹀彿椤?*/
 
 .accounts-page {
@@ -2912,6 +3458,23 @@ input[type="password"]:focus-visible {
   background: var(--surface);
   border: 1px solid var(--border-strong);
   color: var(--accent-strong);
+}
+
+.device-code__value--xl {
+  font-size: 30px;
+  letter-spacing: 6px;
+  padding: 8px 18px;
+}
+
+.device-code__tools {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.device-code__tools .pill-outline {
+  font-size: 12px;
+  padding: 4px 12px;
 }
 
 .device-code__link {
@@ -3082,6 +3645,13 @@ input[type="password"]:focus-visible {
   grid-column: 1 / -1;
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.content-card__actions > * {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .content-card__actions .pill-button {
@@ -3363,7 +3933,7 @@ input[type="password"]:focus-visible {
   }
 
   .file-row--saves {
-    grid-template-columns: minmax(0, 1fr) 92px 72px 132px;
+    gap: 10px;
   }
 
   .content-filters {
@@ -3400,12 +3970,15 @@ input[type="password"]:focus-visible {
     display: none;
   }
 
+  /* 900 及以下：整行允许换行，按钮组落到下一行右对齐，但都不隐藏 */
   .file-row--saves {
-    grid-template-columns: minmax(0, 1fr) 84px 116px;
+    gap: 8px;
   }
 
-  .file-row--saves .file-row__size {
-    display: none;
+  .file-row--saves .file-row__ops {
+    margin-left: auto;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
 
   .content-grid {
@@ -4317,6 +4890,12 @@ option {
   white-space: nowrap;
 }
 
+.java-row > .pill-outline,
+.java-row__ok {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .java-row__ok {
   font-size: 12px;
   color: color-mix(in srgb, #2f9e6f 80%, var(--text));
@@ -5081,3 +5660,769 @@ option {
     flex-wrap: wrap;
   }
 }
+
+/* ==================================================== M9 资源详情弹窗 */
+
+.cdetail {
+  display: grid;
+  gap: 14px;
+}
+
+.cdetail__head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.cdetail__icon {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-md);
+  object-fit: cover;
+  background: var(--surface-muted);
+  flex: 0 0 auto;
+}
+
+.cdetail__info {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.cdetail__title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cdetail__title {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.cdetail__summary {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.cdetail__actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cdetail__versions {
+  display: grid;
+  gap: 8px;
+}
+
+.cdetail__versions-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cdetail__version-list {
+  display: grid;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.cdetail__version {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  text-align: left;
+}
+
+.cdetail__version.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.cdetail__version-name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cdetail__deps {
+  display: grid;
+  gap: 8px;
+}
+
+.dep-chip--required {
+  border-color: color-mix(in srgb, #c0392b 45%, transparent);
+  color: color-mix(in srgb, #c0392b 85%, var(--text));
+}
+
+.dep-chip--optional {
+  border-color: var(--border-strong);
+  color: var(--text-muted);
+}
+
+.multi-source {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.multi-source__links {
+  display: flex;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .cdetail__version {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+}
+
+/* ============================================ M9 整合包：创建实例区块 */
+
+.cdetail__pack {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--border-strong);
+  background: var(--surface-muted);
+}
+
+.pack-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  border: 1px solid color-mix(in srgb, #fb923c 55%, transparent);
+  color: color-mix(in srgb, #fb923c 85%, var(--text));
+  background: color-mix(in srgb, #fb923c 12%, transparent);
+}
+
+/* ============================================ M9 从 HMCL / PCL2 导入 */
+
+.import-pick,
+.import-list,
+.import-done {
+  display: grid;
+  gap: 10px;
+}
+
+.import-rows {
+  display: grid;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.import-row.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.import-row.is-broken {
+  opacity: 0.6;
+}
+
+.import-row__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.import-row__name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.import-row__broken {
+  font-size: 11px;
+  color: color-mix(in srgb, #c0392b 85%, var(--text));
+  white-space: nowrap;
+}
+
+.import-mode {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.import-failed {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: color-mix(in srgb, #c0392b 80%, var(--text));
+}
+
+/* ==================================== M10 检查更新面板 / 存档快捷进入 */
+
+.tab-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-strong);
+}
+
+.update-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 12px 14px;
+}
+
+.update-panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.update-list {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.update-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.update-row__name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-panel__foot {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.update-failed {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.update-failed ul,
+.update-failed-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.update-failed-list .is-danger {
+  color: color-mix(in srgb, #c0392b 85%, var(--text));
+}
+
+.saves-quickplay-note {
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+  border: 1px dashed var(--border-strong);
+}
+
+/* ============================================ M10 官方默认皮肤 9 宫格 */
+
+.official-skins {
+  display: grid;
+  gap: 10px;
+}
+
+.official-skins__grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.official-skin {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 10px 8px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+}
+
+.official-skin.is-active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.official-skin__img {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-sm);
+  image-rendering: pixelated;
+  object-fit: cover;
+  background: var(--surface);
+}
+
+.official-skin__name {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.official-skin__model {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+@media (max-width: 1200px) {
+  .official-skins__grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 900px) {
+  .official-skins__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ------------------------------------------------- 种子地图（M12） */
+
+/*
+ * 地图页自己占满内容区：app-content 平时是可滚动列，这里改成不可滚动的纵向 flex，
+ * 地图拿到剩下的全部高度（1024×640 下也不溢出）。
+ */
+.app-content--seedmap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.seedmap-page {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.seedmap-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.seedmap-bar--sub {
+  align-items: center;
+}
+
+.seedmap-bar__spacer {
+  flex: 1;
+  min-width: 8px;
+}
+
+.seedmap-field {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.seedmap-field > span {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.seedmap-field input,
+.seedmap-field select {
+  font: inherit;
+  color: var(--text);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  transition: border-color var(--transition), color var(--transition);
+}
+
+.seedmap-field input:hover,
+.seedmap-field select:hover,
+.seedmap-field input:focus,
+.seedmap-field select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.seedmap-field--seed {
+  flex: 1 1 240px;
+  min-width: 180px;
+}
+
+.seedmap-seed {
+  width: 100%;
+  letter-spacing: 0.02em;
+}
+
+.seedmap-field--coord {
+  width: 118px;
+}
+
+.seedmap-field--coord input {
+  width: 100%;
+}
+
+.seedmap-history {
+  position: relative;
+}
+
+.seedmap-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 12;
+  min-width: 190px;
+  padding: 6px;
+  display: grid;
+  gap: 2px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+}
+
+.seedmap-menu--inline {
+  position: static;
+  box-shadow: none;
+  margin-top: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+.seedmap-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-start;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.seedmap-menu__item:hover {
+  background: var(--surface-hover);
+  border-color: var(--border);
+}
+
+.seedmap-menu__empty {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.seedmap-scale {
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* ---- 地图区 ---- */
+
+.seedmap-map {
+  position: relative;
+  flex: 1;
+  min-height: 180px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--surface-muted);
+  overflow: hidden;
+  user-select: none;
+}
+
+.seedmap-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+}
+
+.seedmap-map.is-dragging .seedmap-canvas {
+  cursor: grabbing;
+}
+
+/* ---- 左上角浮层 ---- */
+
+.seedmap-panel {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 3;
+  width: 214px;
+  max-height: calc(100% - 24px);
+  overflow-y: auto;
+  padding: 10px 12px 12px;
+  display: grid;
+  gap: 6px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(6px);
+}
+
+.seedmap-panel__title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.seedmap-panel__sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.seedmap-panel__divider {
+  height: 1px;
+  margin: 2px 0;
+  background: var(--border);
+}
+
+.seedmap-panel__select,
+.seedmap-panel__search {
+  font: inherit;
+  font-size: 13px;
+  width: 100%;
+  color: var(--text);
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+}
+
+.seedmap-panel__search:focus,
+.seedmap-panel__select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.seedmap-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.seedmap-check input {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+}
+
+.seedmap-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.seedmap-chips__empty {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.seedmap-chip__x {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.seedmap-highlight {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.seedmap-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-strong);
+  flex: 0 0 auto;
+}
+
+/* ---- 右上角坐标 / 右下角按钮 ---- */
+
+.seedmap-coords {
+  position: absolute;
+  right: 12px;
+  top: 12px;
+  z-index: 3;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+}
+
+.seedmap-zoom {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.seedmap-zoom button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: var(--radius-pill);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ---- 悬停 tooltip ---- */
+
+.seedmap-tooltip {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  gap: 1px;
+  padding: 6px 9px;
+  max-width: 190px;
+  font-size: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+
+.seedmap-tooltip strong {
+  font-size: 13px;
+}
+
+.seedmap-tooltip .mono {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ---- 加载 / 失败 ---- */
+
+.seedmap-status {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: color-mix(in srgb, var(--surface-muted) 72%, transparent);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.seedmap-status p {
+  margin: 0;
+}
+
+.seedmap-status--error {
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  color: var(--text);
+}
+
+.seedmap-status--error p {
+  max-width: 420px;
+  text-align: center;
+  line-height: 1.6;
+  color: var(--accent-strong);
+}
+
+.seedmap-skeleton {
+  width: 160px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    90deg,
+    var(--surface-muted) 0%,
+    var(--surface-hover) 40%,
+    var(--surface-muted) 80%
+  );
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.2s ease-in-out infinite;
+}
+
+.seedmap-foot {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+@media (max-width: 1024px) {
+  .seedmap-panel {
+    width: 190px;
+  }
+
+  .seedmap-field--coord {
+    width: 96px;
+  }
+}
+

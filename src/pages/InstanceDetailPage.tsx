@@ -6,7 +6,7 @@ import { formatBytes, formatStamp } from "../lib/format";
 import { useT } from "../lib/i18n";
 import { useDownloads } from "../lib/downloads-store";
 import { api } from "../lib/tauri-api";
-import type { ContentFileKind, Instance, InstanceSettings, JavaRuntime, LogFile, ModFileItem, SaveItem } from "../lib/types";
+import type { ContentFileKind, Instance, InstanceSettings, JavaRuntime, LogFile, ModCheckResult, ModFileItem, ModUpdateItem, SaveItem } from "../lib/types";
 
 type Tab = "settings" | "logs" | "mods" | "resourcepacks" | "shader" | "saves";
 
@@ -45,8 +45,21 @@ function requiredJavaFor(mcVersion: string): number {
 export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify, onOpenJavaSettings }: Props) {
   const t = useT();
   const [tab, setTab] = useState<Tab>("settings");
+  const [updateCounts, setUpdateCounts] = useState<Record<string, number>>({});
+
+  const onUpdates = (key: string, count: number) => {
+    setUpdateCounts((prev) => ({ ...prev, [key]: count }));
+  };
 
   const [settings, setSettings] = useState<InstanceSettings | null>(null);
+  // 优先用后端给的 supportsQuickPlay；拿不到就从 mcVersion 判断（1.20+ 或 2xw.. 快照算支持）
+  const supportsQuickPlay = useMemo(() => {
+    if (typeof settings?.supportsQuickPlay === "boolean") return settings.supportsQuickPlay;
+    const version = instance.mcVersion.trim();
+    if (/^\d{2}w\d{2}[a-z]/i.test(version)) return true;
+    const minor = Number.parseInt(version.split(".")[1] ?? "", 10);
+    return Number.isFinite(minor) && minor >= 20;
+  }, [settings, instance.mcVersion]);
   const [java, setJava] = useState<JavaRuntime[]>([]);
   const [saving, setSaving] = useState(false);
 
@@ -231,6 +244,11 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
             onClick={() => setTab(item.key)}
           >
             {t(item.labelKey)}
+            {updateCounts[item.key] ? (
+              <span className="tab-badge" data-tab-badge={item.key}>
+                · {updateCounts[item.key]} 可更新
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
@@ -355,6 +373,7 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
           importLabelKey="detail.mods.import"
           openLabelKey="detail.mods.openFolder"
           emptyKey="detail.mods.empty"
+          onUpdates={(count) => onUpdates("mods", count)}
         />
       ) : null}
 
@@ -366,6 +385,7 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
           importLabelKey="detail.packs.import"
           openLabelKey="detail.packs.openFolder"
           emptyKey="detail.content.empty"
+          onUpdates={(count) => onUpdates("resourcepacks", count)}
         />
       ) : null}
 
@@ -377,10 +397,13 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
           importLabelKey="detail.packs.import"
           openLabelKey="detail.packs.openFolder"
           emptyKey="detail.content.empty"
+          onUpdates={(count) => onUpdates("shader", count)}
         />
       ) : null}
 
-      {tab === "saves" ? <SavesPane instanceId={instance.id} notify={notify} /> : null}
+      {tab === "saves" ? (
+        <SavesPane instanceId={instance.id} notify={notify} supportsQuickPlay={supportsQuickPlay} saveVersionLabel={instance.mcVersion} />
+      ) : null}
 
       {tab === "logs" ? (
         <div className="logs">
@@ -504,19 +527,58 @@ interface FilesPaneProps {
   importLabelKey: string;
   openLabelKey: string;
   emptyKey: string;
+  /** 检查/批量更新后回传剩余可更新数量，用来给 tab 加徽标 */
+  onUpdates?: (count: number) => void;
 }
 
 /**
  * 模组 / 资源包 / 光影共用的列表：开关启用状态、批量启停、删除（二次确认）、按文件名搜索。
  * 启用/禁用只改后缀（.jar ⇄ .jar.disabled，资源包是 .zip），由后端落盘。
  */
-function FilesPane({ instanceId, kind, notify, importLabelKey, openLabelKey, emptyKey }: FilesPaneProps) {
+function FilesPane({ instanceId, kind, notify, importLabelKey, openLabelKey, emptyKey, onUpdates }: FilesPaneProps) {
   const t = useT();
   const [files, setFiles] = useState<ModFileItem[] | null>(null);
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // 检查更新
+  const [checking, setChecking] = useState(false);
+  const [check, setCheck] = useState<ModCheckResult | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyFailed, setApplyFailed] = useState<Array<{ fileName: string; reason: string }>>([]);
+
+  const runCheck = async () => {
+    setChecking(true);
+    setApplyFailed([]);
+    try {
+      const result = await api.modsCheckUpdates({ instanceId, kind });
+      setCheck(result);
+      onUpdates?.(result.updates.length);
+    } catch (error) {
+      notify(String(error));
+      setCheck(null);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const applyAll = async (items: ModUpdateItem[]) => {
+    if (items.length === 0) return;
+    setApplying(true);
+    try {
+      const result = await api.modsApplyUpdates({ instanceId, kind, items });
+      setApplyFailed(result.failed);
+      setCheck((prev) => (prev ? { ...prev, updates: result.failed.length > 0 ? items.slice(0, result.failed.length) : [] } : prev));
+      notify(t("detail.update.applied", { count: result.updated }));
+      onUpdates?.(result.failed.length);
+      await load();
+    } catch (error) {
+      notify(String(error));
+    } finally {
+      setApplying(false);
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -630,8 +692,75 @@ function FilesPane({ instanceId, kind, notify, importLabelKey, openLabelKey, emp
             <img src={icons.refresh} alt="" />
             {t("detail.content.refresh")}
           </button>
+          <button
+            type="button"
+            className="pill-outline pill-outline--primary"
+            data-action="check-updates"
+            disabled={checking || applying}
+            onClick={() => void runCheck()}
+          >
+            {checking ? t("detail.update.checking", { checked: check?.checked ?? 0, total: check ? check.checked : 12 }) : t("detail.update.check")}
+          </button>
         </div>
       </div>
+
+      {check ? (
+        <div className="card update-panel" data-update-panel>
+          <div className="update-panel__head">
+            <span className="detail-card__title" data-update-title>
+              {check.updates.length === 0
+                ? t("detail.update.allLatest")
+                : t("detail.update.found", { count: check.updates.length, failed: check.failed.length })}
+            </span>
+            <button type="button" className="icon-button" title={t("common.close")} onClick={() => setCheck(null)}>
+              {t("common.close")}
+            </button>
+          </div>
+          {check.updates.length > 0 ? (
+            <>
+              <div className="update-list">
+                {check.updates.map((item) => (
+                  <div className="update-row" key={item.fileName} data-update-row={item.fileName}>
+                    <span className="update-row__name">{item.fileName}</span>
+                    <span className="row__hint">
+                      {item.currentVersion ?? "?"} → <strong>{item.latestVersion}</strong>
+                    </span>
+                    <button type="button" className="pill-outline pill-outline--tiny" data-action="update-one" disabled={applying} onClick={() => void applyAll([item])}>
+                      {t("detail.update.apply")}
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="update-panel__foot">
+                <button type="button" className="pill-button" data-action="update-all" disabled={applying} onClick={() => void applyAll(check.updates)}>
+                  {applying ? t("detail.update.applying") : t("detail.update.applyAll")}
+                </button>
+              </div>
+            </>
+          ) : null}
+          {check.failed.length > 0 ? (
+            <details className="update-failed" data-update-failed>
+              <summary>{t("detail.update.failedTitle", { count: check.failed.length })}</summary>
+              <ul>
+                {check.failed.map((item) => (
+                  <li key={item.fileName}>
+                    {item.fileName}：{item.reason}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          ) : null}
+          {applyFailed.length > 0 ? (
+            <ul className="update-failed-list">
+              {applyFailed.map((item) => (
+                <li key={item.fileName} className="is-danger">
+                  {item.fileName}：{item.reason}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
 
       {selected.size > 0 ? (
         <div className="files-pane__batch" data-batch-bar>
@@ -772,14 +901,33 @@ function FilesPane({ instanceId, kind, notify, importLabelKey, openLabelKey, emp
 interface SavesPaneProps {
   instanceId: number;
   notify: (message: string) => void;
+  /** 1.20+ 才支持「进入该存档」，旧版本直接不显示按钮 */
+  supportsQuickPlay: boolean;
+  /** 实例版本号，旧版本说明里显示 */
+  saveVersionLabel: string;
 }
 
 /** 存档标签：存档名 / 最后修改 / 大小 / 游戏版本 + 打开目录、导出 zip、删除。 */
-function SavesPane({ instanceId, notify }: SavesPaneProps) {
+function SavesPane({ instanceId, notify, supportsQuickPlay, saveVersionLabel }: SavesPaneProps) {
   const t = useT();
   const [saves, setSaves] = useState<SaveItem[] | null>(null);
   const [pendingDelete, setPendingDelete] = useState<SaveItem | null>(null);
   const [busy, setBusy] = useState(false);
+  const [launching, setLaunching] = useState<string | null>(null);
+  const [playError, setPlayError] = useState("");
+
+  const playSave = async (save: SaveItem) => {
+    setLaunching(save.name);
+    setPlayError("");
+    try {
+      await api.instanceLaunchWithSave({ instanceId, levelName: save.name });
+      notify(t("detail.saves.launchOk", { name: save.name }));
+    } catch (error) {
+      setPlayError(String(error instanceof Error ? error.message : error));
+    } finally {
+      setLaunching(null);
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -846,24 +994,58 @@ function SavesPane({ instanceId, notify }: SavesPaneProps) {
         <div className="empty-hint">{t("detail.saves.empty")}</div>
       ) : (
         <div className="file-list">
+          {/* 元信息现在跟名字同一侧，表头就只留一句说明，避免标签跑到右边对不上 */}
           <div className="file-row file-row--head file-row--saves">
             <span className="file-row__name">{t("detail.tab.saves")}</span>
-            <span className="file-row__time">{t("detail.saves.modified")}</span>
-            <span className="file-row__size">{t("detail.saves.size")}</span>
+            <span className="row__hint">
+              {t("detail.saves.modified")} / {t("detail.saves.size")}
+            </span>
             <span className="file-row__ops" />
           </div>
+          {supportsQuickPlay ? null : (
+            <div className="row__hint saves-quickplay-note" data-quickplay-unsupported>
+              {t("detail.saves.quickPlayUnsupported", { version: saveVersionLabel })}
+            </div>
+          )}
+          {playError ? (
+            <div className="field-error" data-save-play-error>
+              {playError}
+            </div>
+          ) : null}
           {saves.map((save) => (
             <div className="file-row file-row--saves" key={save.name} data-save={save.name}>
+              {/* 左：名字 + 元信息（可压缩、可省略）；右：按钮组（不换行、不压缩） */}
               <div className="file-row__main">
                 <div className="file-row__title">
-                  <span className="file-row__name">{save.name}</span>
+                  <span className="file-row__name" title={save.name}>
+                    {save.name}
+                  </span>
                   {save.mcVersion ? <span className="chip chip--tiny">{save.mcVersion}</span> : null}
                 </div>
-                <div className="file-row__file">{t("detail.saves.version")} · {save.mcVersion || "—"}</div>
+                <div className="file-row__meta">
+                  <span className="file-row__file" title={t("detail.saves.version") + " · " + (save.mcVersion || "—")}>
+                    {t("detail.saves.version")} · {save.mcVersion || "—"}
+                  </span>
+                  <span className="file-row__time" title={formatStamp(save.modifiedAt)}>
+                    {formatStamp(save.modifiedAt)}
+                  </span>
+                  <span className="file-row__size" title={formatBytes(save.size)}>
+                    {formatBytes(save.size)}
+                  </span>
+                </div>
               </div>
-              <span className="file-row__time">{formatStamp(save.modifiedAt)}</span>
-              <span className="file-row__size">{formatBytes(save.size)}</span>
               <span className="file-row__ops">
+                {supportsQuickPlay ? (
+                  <button
+                    type="button"
+                    className="pill-outline pill-outline--tiny"
+                    data-action="play-save"
+                    disabled={busy || launching !== null}
+                    onClick={() => void playSave(save)}
+                  >
+                    {launching === save.name ? t("detail.saves.launching") : t("detail.saves.play")}
+                  </button>
+                ) : null}
                 <button type="button" className="pill-outline pill-outline--tiny" data-action="save-export" disabled={busy} onClick={() => void doExport(save)}>
                   {t("detail.saves.export")}
                 </button>

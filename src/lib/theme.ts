@@ -27,6 +27,68 @@ export function normalizeAccent(value: string | undefined | null): string {
   return /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value) ? value : fallback;
 }
 
+/** 当前主题色是不是某个预设（自定义态时预设圈都不高亮）。 */
+export function isPresetAccent(value: string | undefined | null): boolean {
+  if (!value) return false;
+  const target = expandHex(value).toLowerCase();
+  return ACCENT_PRESETS.some((preset) => preset.value.toLowerCase() === target);
+}
+
+/** #rgb → #rrggbb，其他原样返回。 */
+function expandHex(value: string): string {
+  const hex = value.trim();
+  if (/^#[0-9a-fA-F]{3}$/.test(hex)) {
+    return "#" + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
+  }
+  return hex;
+}
+
+function hexToRgb(value: string): [number, number, number] {
+  const hex = expandHex(value).replace("#", "");
+  if (hex.length !== 6) return [245, 200, 69];
+  return [parseInt(hex.slice(0, 2), 16), parseInt(hex.slice(2, 4), 16), parseInt(hex.slice(4, 6), 16)];
+}
+
+function rgbToHex(rgb: [number, number, number]): string {
+  return (
+    "#" +
+    rgb
+      .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, "0"))
+      .join("")
+  );
+}
+
+/** 感知亮度（0–1），用来判断该加深还是提亮。 */
+function luminance(rgb: [number, number, number]): number {
+  const [r, g, b] = rgb.map((channel) => {
+    const value = channel / 255;
+    return value <= 0.03928 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * 派生 --accent-strong：浅色主题往深里混（自定义色太亮时混得更多），
+ * 深色主题往白里混，保证文字在两种主题下都有对比度。
+ */
+export function accentStrong(accent: string, theme: ThemeMode): string {
+  const rgb = hexToRgb(normalizeAccent(accent));
+  const lum = luminance(rgb);
+  const dark = theme === "dark";
+  const amount = dark ? (lum < 0.35 ? 0.55 : 0.3) : lum > 0.62 ? 0.55 : 0.32;
+  const target: [number, number, number] = dark ? [255, 255, 255] : [26, 18, 0];
+  return rgbToHex([
+    rgb[0] + (target[0] - rgb[0]) * amount,
+    rgb[1] + (target[1] - rgb[1]) * amount,
+    rgb[2] + (target[2] - rgb[2]) * amount,
+  ]);
+}
+
+/** 主色上的文字颜色：亮底用深字，暗底用白字（自定义色也安全）。 */
+export function accentContrast(accent: string): string {
+  return luminance(hexToRgb(normalizeAccent(accent))) > 0.55 ? "#1a1400" : "#ffffff";
+}
+
 /**
  * 界面字体：把 `--font-ui` 写到 :root，全局 CSS（含表单控件）都用这个变量。
  * 名字里可能带空格，一律加引号；别名（SimSun/宋体 这种）按顺序拼进回退链，
@@ -90,11 +152,15 @@ export function readCachedFont(): string {
 
 export function applyTheme(theme: ThemeMode, accent: string): void {
   const root = document.documentElement;
+  const value = normalizeAccent(accent);
   root.dataset.theme = theme;
-  root.style.setProperty("--accent", normalizeAccent(accent));
+  root.style.setProperty("--accent", value);
+  // 派生色以内联变量写死：自定义色不在预设里，CSS 的 color-mix 基线仍然是默认黄
+  root.style.setProperty("--accent-strong", accentStrong(value, theme));
+  root.style.setProperty("--accent-contrast", accentContrast(value));
   try {
     window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-    window.localStorage.setItem(ACCENT_STORAGE_KEY, accent);
+    window.localStorage.setItem(ACCENT_STORAGE_KEY, value);
   } catch {
     /* 忽略隐私模式写入失败 */
   }

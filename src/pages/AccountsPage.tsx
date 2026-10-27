@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { icons } from "../assets/icons";
 import { HeadAvatar } from "../components/HeadAvatar";
 import { Modal } from "../components/Modal";
+import { copyText } from "../lib/clipboard";
 import { useT } from "../lib/i18n";
 import { api } from "../lib/tauri-api";
 import type { Account, MsAuthStatus, MsLoginStart } from "../lib/types";
@@ -151,10 +152,10 @@ export function AccountsPage({ accounts, onRefresh, notify, onOpenSettings }: Pr
           accounts={accounts ?? []}
           onOpenSettings={onOpenSettings}
           onClose={() => setAddOpen(false)}
-          onAdded={async (name) => {
+          onAdded={async (name, kind) => {
             await onRefresh();
             setAddOpen(false);
-            notify(t("accounts.applied", { name }));
+            notify(kind === "ms" ? t("accounts.ms.loggedIn", { name }) : t("accounts.applied", { name }));
           }}
           notify={notify}
         />
@@ -185,9 +186,18 @@ export function AccountsPage({ accounts, onRefresh, notify, onOpenSettings }: Pr
 interface AddProps {
   accounts: Account[];
   onClose: () => void;
-  onAdded: (name: string) => void | Promise<void>;
+  /** kind 用来区分 toast 文案（微软登录 →「已登录 X」） */
+  onAdded: (name: string, kind?: "ms" | "offline") => void | Promise<void>;
   notify: (message: string) => void;
   onOpenSettings: () => void;
+}
+
+/** 剩余有效时间：mm:ss */
+function formatRemaining(seconds: number): string {
+  const clamped = Math.max(0, seconds);
+  const mm = String(Math.floor(clamped / 60)).padStart(2, "0");
+  const ss = String(clamped % 60).padStart(2, "0");
+  return mm + ":" + ss;
 }
 
 /** 添加账号悬浮窗：微软设备码登录 + 离线账号两页。 */
@@ -223,6 +233,20 @@ function AddAccountModal({ accounts, onClose, onAdded, notify, onOpenSettings }:
     };
   }, []);
 
+  // 设备码有效期倒计时（秒），每秒刷一次
+  const [remaining, setRemaining] = useState(0);
+
+  /** 打开登录页：地址来自后端（verificationUri / verifyUrl 两个名字都认）。 */
+  const openVerifyPage = async (value: { verificationUri?: string | null; verifyUrl?: string | null } | null) => {
+    const url = value?.verificationUri ?? value?.verifyUrl ?? "";
+    if (!url) return;
+    try {
+      await api.openExternal(url);
+    } catch {
+      /* 打不开浏览器不影响用户手动点链接 */
+    }
+  };
+
   const beginMsLogin = async () => {
     setMsMessage("");
     try {
@@ -231,11 +255,28 @@ function AddAccountModal({ accounts, onClose, onAdded, notify, onOpenSettings }:
       if (result.configured && result.deviceCode) {
         setPolling(true);
         startedAtRef.current = Date.now();
+        setRemaining(result.expiresIn ?? 900);
+        // 自动开浏览器 + 自动复制设备码（复制失败也不拦流程）
+        await openVerifyPage(result);
+        const copied = await copyText(result.userCode ?? "");
+        notify(copied ? t("accounts.ms.codeCopied") : t("accounts.ms.copyFailed"));
       }
     } catch (error) {
       setMsMessage(String(error));
     }
   };
+
+  useEffect(() => {
+    if (!polling) return;
+    const total = start?.expiresIn ?? 900;
+    const tick = () => {
+      const left = total - Math.floor((Date.now() - startedAtRef.current) / 1000);
+      setRemaining(Math.max(0, left));
+    };
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [polling, start?.expiresIn]);
 
   // onAdded 每次父组件渲染都是新函数，用 ref 拿最新值，避免把轮询 effect 重订阅（会把设备码立刻轮询完）
   const onAddedRef = useRef(onAdded);
@@ -261,7 +302,7 @@ function AddAccountModal({ accounts, onClose, onAdded, notify, onOpenSettings }:
         if (result.state === "pending") return;
         setPolling(false);
         if (result.state === "done" && result.account) {
-          await onAddedRef.current(result.account.name);
+          await onAddedRef.current(result.account.name, "ms");
           return;
         }
         setMsMessage(result.message ?? t("accounts.ms.expired"));
@@ -303,12 +344,8 @@ function AddAccountModal({ accounts, onClose, onAdded, notify, onOpenSettings }:
 
   const copyCode = async () => {
     if (!start?.userCode) return;
-    try {
-      await navigator.clipboard.writeText(start.userCode);
-      notify(start.userCode);
-    } catch {
-      /* 剪贴板不可用就算了，用户能看见设备码 */
-    }
+    const copied = await copyText(start.userCode);
+    notify(copied ? t("accounts.ms.codeCopied") : t("accounts.ms.copyFailed"));
   };
 
   const msConfigured = Boolean(msStatus?.configured);
@@ -379,15 +416,38 @@ function AddAccountModal({ accounts, onClose, onAdded, notify, onOpenSettings }:
             <div className="device-code">
               <div className="device-code__row">
                 <span className="device-code__label">{t("accounts.ms.code")}</span>
-                <button type="button" className="device-code__value mono" data-ms-user-code onClick={() => void copyCode()}>
+                <button
+                  type="button"
+                  className="device-code__value device-code__value--xl mono"
+                  data-ms-user-code
+                  title={t("accounts.ms.recopy")}
+                  onClick={() => void copyCode()}
+                >
                   {start.userCode}
+                </button>
+              </div>
+              <div className="device-code__tools">
+                <button type="button" className="pill-outline" data-action="ms-recopy" onClick={() => void copyCode()}>
+                  {t("accounts.ms.recopy")}
+                </button>
+                <button type="button" className="pill-outline" data-action="ms-reopen" onClick={() => void openVerifyPage(start)}>
+                  {t("accounts.ms.reopen")}
                 </button>
               </div>
               <div className="device-code__row">
                 <span className="device-code__label">{t("accounts.ms.url")}</span>
-                <a className="device-code__link" href={start.verifyUrl ?? "#"} target="_blank" rel="noreferrer" data-ms-verify-url>
-                  {start.verifyUrl}
+                <a
+                  className="device-code__link"
+                  href={start.verificationUri ?? start.verifyUrl ?? "#"}
+                  target="_blank"
+                  rel="noreferrer"
+                  data-ms-verify-url
+                >
+                  {start.verificationUri ?? start.verifyUrl}
                 </a>
+              </div>
+              <div className="row__hint" data-ms-countdown>
+                {t("accounts.ms.countdown", { time: formatRemaining(remaining) })}
               </div>
               <div className="row__hint" data-ms-state>
                 {polling ? t("accounts.ms.pending") : msMessage || t("accounts.ms.expired")}

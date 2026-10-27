@@ -8,6 +8,7 @@ import { api, normalizeAppearance, RUNTIME_MODE, subscribeLauncherEvents } from 
 import { applyFont, applyTheme, normalizeAccent, readCachedFont, readCachedTheme } from "./lib/theme";
 import type { Account, AppInfo, FontChoice, Instance, Settings, UpdateCheckResult, VersionManifest } from "./lib/types";
 import { AboutPage } from "./pages/AboutPage";
+import { FunPage } from "./pages/FunPage";
 import { AccountsPage } from "./pages/AccountsPage";
 import { ContentPage } from "./pages/ContentPage";
 import { HomePage } from "./pages/HomePage";
@@ -15,6 +16,7 @@ import { InstancesPage } from "./pages/InstancesPage";
 import { MultiplayerPage } from "./pages/MultiplayerPage";
 import { PlaceholderPage } from "./pages/PlaceholderPage";
 import { SettingsPage } from "./pages/SettingsPage";
+import { SeedMapPage } from "./pages/SeedMapPage";
 import { SkinsPage } from "./pages/SkinsPage";
 
 const PAGE_TITLE_KEY: Record<PageKey, string> = {
@@ -25,6 +27,8 @@ const PAGE_TITLE_KEY: Record<PageKey, string> = {
   skins: "nav.skins",
   net: "nav.net",
   about: "nav.about",
+  fun: "nav.fun",
+  seedmap: "nav.seedmap",
   settings: "nav.settings",
 };
 
@@ -67,7 +71,7 @@ export default function App() {
       if (info) setAppInfo(info);
       if (loaded) {
         setSettings(normalizeAppearance(loaded));
-        applyTheme(loaded.theme, loaded.accent);
+        applyTheme(loaded.theme, loaded.themeColor ?? loaded.accent);
         applyFont(loaded.uiFont);
       } else {
         applyTheme(cached.theme, cached.accent);
@@ -117,7 +121,7 @@ export default function App() {
   // 设置变化立刻落地到 DOM（不必等后端回包）；字体带上后端给的别名链
   useEffect(() => {
     if (!settings) return;
-    applyTheme(settings.theme, normalizeAccent(settings.accent));
+    applyTheme(settings.theme, normalizeAccent(settings.themeColor ?? settings.accent));
     const aliases = fonts.find((font) => font.family === settings.uiFont)?.aliases;
     applyFont(settings.uiFont, aliases);
   }, [settings, fonts]);
@@ -265,7 +269,12 @@ export default function App() {
     }
     if (page === "skins") {
       return (
-        <SkinsPage notify={notify} settings={settings} onChangeSettings={updateSettings} />
+        <SkinsPage
+          notify={notify}
+          settings={settings}
+          onChangeSettings={updateSettings}
+          onOpenAccounts={() => setPage("accounts")}
+        />
       );
     }
     if (page === "accounts") {
@@ -287,12 +296,17 @@ export default function App() {
           instances={instances}
           versions={versions}
           notify={notify}
-          onInstalled={() => refreshDownloads()}
+          onInstalled={() => {
+            refreshDownloads();
+            void refreshInstances();
+          }}
+          onOpenInstances={() => setPage("instances")}
+          onOpenServers={() => setPage("net")}
         />
       );
     }
     if (page === "net") {
-      return <MultiplayerPage notify={notify} />;
+      return <MultiplayerPage notify={notify} onOpenContent={() => setPage("content")} />;
     }
     if (page === "about") {
       return (
@@ -305,6 +319,12 @@ export default function App() {
           notify={notify}
         />
       );
+    }
+    if (page === "fun" && settings) {
+      return <FunPage settings={settings} dataRoot={appInfo?.dataRoot ?? ""} onChange={updateSettings} notify={notify} />;
+    }
+    if (page === "seedmap") {
+      return <SeedMapPage notify={notify} />;
     }
     if (page === "settings" && settings) {
       return (
@@ -339,7 +359,11 @@ export default function App() {
         }}
       />
       <div className="app-body">
-        <main className={"app-content" + (page === "home" ? " app-content--home" : "")}>
+        <main
+          className={
+            "app-content" + (page === "home" ? " app-content--home" : "") + (page === "seedmap" ? " app-content--seedmap" : "")
+          }
+        >
           {page !== "home" && page !== "instances" && page !== "settings" ? (
             <h1 className="page-title">{t(PAGE_TITLE_KEY[page])}</h1>
           ) : null}

@@ -52,6 +52,12 @@ pub struct Settings {
     pub theme: String,
     /// 主题色：#rgb 或 #rrggbb
     pub accent: String,
+    /// 自定义主题色（空 = 跟随 accent；前端会把同一个值同时写进两个字段）
+    pub theme_color: String,
+    /// 内容文件默认走 MCIM 镜像下载（镜像失败会自动回退原始地址）
+    pub content_download_via_mcim: bool,
+    /// 内容搜索是否翻译标题/简介
+    pub translate_enabled: bool,
     pub update_mode: String,
     pub download_source: String,
     pub resource_source: String,
@@ -112,6 +118,9 @@ impl Default for Settings {
             language: "zh-CN".to_string(),
             theme: "light".to_string(),
             accent: DEFAULT_ACCENT.to_string(),
+            theme_color: String::new(),
+            content_download_via_mcim: true,
+            translate_enabled: true,
             // 1.0.0 为首个正式版本：默认关闭自更新（解析/测速代码保留，运行期不调用）
             update_mode: "off".to_string(),
             download_source: "auto".to_string(),
@@ -170,6 +179,18 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// 实际生效的主题色：themeColor 有就用它，否则用 accent。
+    pub fn effective_accent(&self) -> String {
+        let custom = self.theme_color.trim();
+        if custom.is_empty() {
+            self.accent.clone()
+        } else {
+            custom.to_string()
+        }
+    }
+}
+
 /// #rgb / #rrggbb 校验（不引正则依赖）。
 pub fn is_valid_accent(value: &str) -> bool {
     let Some(hex) = value.strip_prefix('#') else {
@@ -207,6 +228,12 @@ impl Settings {
         }
         if !is_valid_accent(&self.accent) {
             self.accent = defaults.accent;
+        }
+        // themeColor 是可选的：空串合法；非法就退回 accent，别丢用户已选的主题色
+        self.theme_color = self.theme_color.trim().to_string();
+        if !self.theme_color.is_empty() && !is_valid_accent(&self.theme_color) {
+            tracing::warn!(theme_color = %self.theme_color, "themeColor 不是合法颜色，改用 accent");
+            self.theme_color = String::new();
         }
         if !UPDATE_MODES.contains(&self.update_mode.as_str()) {
             self.update_mode = defaults.update_mode;
@@ -310,6 +337,12 @@ impl Settings {
         }
         if !is_valid_accent(&self.accent) {
             return Err(AppError::Invalid(format!("accent 必须是 #rgb 或 #rrggbb，收到 {:?}", self.accent)));
+        }
+        if !self.theme_color.trim().is_empty() && !is_valid_accent(self.theme_color.trim()) {
+            return Err(AppError::Invalid(format!(
+                "themeColor 必须是 #rgb 或 #rrggbb 或留空，收到 {:?}",
+                self.theme_color
+            )));
         }
         if !UPDATE_MODES.contains(&self.update_mode.as_str()) {
             return Err(AppError::Invalid(format!("updateMode 非法：{:?}", self.update_mode)));

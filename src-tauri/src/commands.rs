@@ -17,9 +17,11 @@ use crate::instance::{self, Instance, InstanceCreate, InstanceSettingsPatch, Ins
 use crate::java::{self, JavaRuntime, JavaSourceInfo, JavaSourceProbe, JavaVersionInfo};
 use crate::launch::{self, LaunchOptions};
 use crate::meta::{self, VersionManifestView};
+use crate::modpack;
 use crate::ms_auth::{self, MsAuthStatus};
 use crate::paths::Paths;
 use crate::server::{self, ServerCore, ServerState, ServerVersion, ServerView};
+use crate::server_content;
 use crate::settings::Settings;
 use crate::shell::{self, LogFile};
 use crate::sources::{self, SourceInfo, SourceProbe};
@@ -267,9 +269,9 @@ pub async fn instance_launch(app: AppHandle, state: State<'_, AppState>, id: i64
     );
     let events = events_of(&app);
 
-    let result = launch_instance(paths, client, events, &task, target, settings).await;
+    let result = launch_instance(paths, client, events, &task, target, settings, None).await;
     match result {
-        Ok(()) => {
+        Ok(_pid) => {
             task.finish();
             Ok(())
         }
@@ -284,6 +286,75 @@ pub async fn instance_launch(app: AppHandle, state: State<'_, AppState>, id: i64
     }
 }
 
+/// 启动并直接进入某个存档（1.20+ 的 --quickPlaySingleplayer）。
+#[tauri::command]
+pub async fn instance_launch_with_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    instance_id: i64,
+    level_name: String,
+) -> Result<LaunchStarted> {
+    let paths = state.paths.clone();
+    let client = state.client.clone();
+    let settings = state.settings();
+    let target = {
+        let conn = state.db()?;
+        instance::get(&conn, instance_id)?
+    };
+    if !crate::updates::supports_quick_play(&target.mc_version) {
+        return Err(AppError::Invalid(crate::updates::quick_play_rejection(
+            &target.mc_version,
+        )));
+    }
+    let level = level_name.trim().to_string();
+    crate::mods::validate_save_name(&level)?;
+    let saves = crate::mods::saves_dir(&paths, &target.name);
+    if !saves.join(&level).is_dir() {
+        return Err(AppError::Invalid(format!("存档不存在：{level}")));
+    }
+    let task = state.tasks.create(
+        "launch",
+        &format!("启动 {} 并进入存档 {level}", target.name),
+        &instance::instance_dir(&paths, &target.name)
+            .display()
+            .to_string(),
+    );
+    let events = events_of(&app);
+    let result = launch_instance(
+        paths,
+        client,
+        events,
+        &task,
+        target,
+        settings,
+        Some(level.clone()),
+    )
+    .await;
+    match result {
+        Ok(pid) => {
+            task.finish();
+            let pid = pid.ok_or_else(|| AppError::Other("游戏进程没有返回 pid".to_string()))?;
+            tracing::info!(%level, pid, "已带存档启动游戏");
+            Ok(LaunchStarted { pid })
+        }
+        Err(AppError::Cancelled) => {
+            task.cancel();
+            Err(AppError::Cancelled)
+        }
+        Err(err) => {
+            task.fail(&err.to_string());
+            Err(err)
+        }
+    }
+}
+
+/// instance_launch_with_save 的返回。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchStarted {
+    pub pid: u32,
+}
+
 async fn launch_instance(
     paths: Paths,
     client: reqwest::Client,
@@ -291,7 +362,8 @@ async fn launch_instance(
     task: &crate::tasks::TaskHandle,
     target: Instance,
     settings: Settings,
-) -> Result<()> {
+    quick_play: Option<String>,
+) -> Result<Option<u32>> {
     let origins = sources::resolve_with_probe(&client, &settings).await;
 
     // 1) 依赖自检：缺库/缺 assets/缺 natives 先补齐
@@ -338,6 +410,7 @@ async fn launch_instance(
         username,
         uuid,
         access_token,
+        quick_play,
     };
 
     // 4) 拼参数 → 起进程
@@ -347,10 +420,11 @@ async fn launch_instance(
     tracing::info!(
         instance = %target.name,
         pid = ?session.pid,
+        quick_play = ?options.quick_play,
         log = %session.log_path.display(),
         "已拉起游戏进程"
     );
-    Ok(())
+    Ok(session.pid)
 }
 
 /// 选 Java：实例指定 → 设置指定 → 磁盘扫描 → （允许时）自动下载。
@@ -974,6 +1048,7 @@ pub async fn server_start(app: AppHandle, state: State<'_, AppState>, id: i64) -
                 stdin,
                 state: ServerState::Starting,
                 players: 0,
+                history: Vec::new(),
             },
         )
         .await;
@@ -1123,6 +1198,12 @@ pub fn log_read(state: State<'_, AppState>, instance_id: Option<i64>, name: Stri
 #[tauri::command]
 pub fn log_open_folder(state: State<'_, AppState>) -> Result<()> {
     shell::open_folder(&state.paths.logs)
+}
+
+/// 写剪贴板：前端 navigator.clipboard 不可用时的兜底。
+#[tauri::command]
+pub fn clipboard_write(text: String) -> Result<()> {
+    shell::clipboard_write(&text)
 }
 
 /// open_path(kind, id)：实例目录 / 日志目录 / 数据根 / versions。
@@ -1333,6 +1414,58 @@ pub fn mods_import(
     crate::mods::list_mods(&state.paths, &target.name, kind, Some(target.loader.clone()))
 }
 
+/// 批量检查实例内容的更新（记录优先，其次 CurseForge 指纹）。
+#[tauri::command]
+pub async fn mods_check_updates(
+    state: State<'_, AppState>,
+    instance_id: i64,
+    kind: String,
+) -> Result<crate::updates::ModCheckResult> {
+    let target = {
+        let conn = state.db()?;
+        instance::get(&conn, instance_id)?
+    };
+    let kind_id = crate::mods::ModKind::from_id(&kind)?;
+    let content_dir = crate::mods::kind_dir(&state.paths, &target.name, kind_id);
+    let instance_dir = instance::instance_dir(&state.paths, &target.name);
+    let settings = state.settings();
+    let key = settings.curseforge_api_key.clone();
+    let loader = if target.loader.trim().is_empty() {
+        "fabric".to_string()
+    } else {
+        target.loader.clone()
+    };
+    crate::updates::check_updates(
+        &state.client,
+        &instance_dir,
+        &content_dir,
+        &kind,
+        &target.mc_version,
+        &loader,
+        if key.trim().is_empty() { None } else { Some(key.as_str()) },
+    )
+    .await
+}
+
+/// 应用更新：先备份到 <instance>/.gugu-backup/<时间戳>/，再原子替换。
+#[tauri::command]
+pub async fn mods_apply_updates(
+    state: State<'_, AppState>,
+    instance_id: i64,
+    kind: String,
+    items: Vec<crate::updates::ModUpdateItem>,
+) -> Result<crate::updates::ModApplyResult> {
+    let target = {
+        let conn = state.db()?;
+        instance::get(&conn, instance_id)?
+    };
+    let kind_id = crate::mods::ModKind::from_id(&kind)?;
+    let content_dir = crate::mods::kind_dir(&state.paths, &target.name, kind_id);
+    let instance_dir = instance::instance_dir(&state.paths, &target.name);
+    let via_mcim = state.settings().content_download_via_mcim;
+    crate::updates::apply_updates(&state.client, &instance_dir, &content_dir, &items, via_mcim).await
+}
+
 /// 打开实例内的模组/资源包/光影目录。
 #[tauri::command]
 pub fn mods_open_folder(
@@ -1443,6 +1576,250 @@ pub async fn instance_export(
     Ok(GithubDownloadStarted { task_id })
 }
 
+// ------------------------------------------------------------------ 服务端详情（M10）
+
+/// serverId 既可能是数字也可能是字符串：统一按 i64 解析。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ServerIdParam {
+    Num(i64),
+    Text(String),
+}
+
+impl ServerIdParam {
+    pub fn value(&self) -> Result<i64> {
+        match self {
+            ServerIdParam::Num(id) => Ok(*id),
+            ServerIdParam::Text(text) => text
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| AppError::Invalid(format!("服务端 id 不合法：{text}"))),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn server_content_list(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    kind: String,
+) -> Result<Vec<server_content::ServerContentItem>> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    let kind = server_content::ServerContentKind::from_id(&kind)?;
+    server_content::list_content(&dir, kind)
+}
+
+/// 装一个插件/模组进服务端：立刻返回 taskId，进度走 install://progress。
+#[tauri::command]
+pub async fn server_content_install(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    provider: String,
+    project_id: String,
+    version_id: Option<String>,
+) -> Result<server_content::InstallStarted> {
+    let provider = content::Provider::from_id(&provider)?;
+    let (dir, meta) = server::find(&state.paths, server_id.value()?)?;
+    let kind = if meta.core.eq_ignore_ascii_case("fabric")
+        || meta.core.eq_ignore_ascii_case("forge")
+        || meta.core.eq_ignore_ascii_case("neoforge")
+    {
+        server_content::ServerContentKind::Mod
+    } else {
+        server_content::ServerContentKind::Plugin
+    };
+    let settings = state.settings();
+    let task = state.tasks.create_with_prefix(
+        "content",
+        &format!("安装 {} {}", kind.id(), project_id),
+        &server_content::kind_dir(&dir, kind).display().to_string(),
+        "content",
+    );
+    let task_id = task.id().to_string();
+    let task_bg = task.clone();
+    let client = state.client.clone();
+    let loader = kind.loader_for(&meta.core);
+    let via_mcim = settings.content_download_via_mcim;
+    let version_id = version_id.unwrap_or_default();
+    tauri::async_runtime::spawn(async move {
+        let key = settings.curseforge_api_key.clone();
+        match server_content::install(
+            &client,
+            &dir,
+            kind,
+            provider,
+            &project_id,
+            &version_id,
+            &meta.mc_version,
+            &loader,
+            if key.trim().is_empty() { None } else { Some(key.as_str()) },
+            via_mcim,
+            &task_bg,
+        )
+        .await
+        {
+            Ok(path) => {
+                tracing::info!(path = %path.display(), "服务端内容安装完成");
+                task_bg.finish();
+            }
+            Err(AppError::Cancelled) => task_bg.cancel(),
+            Err(err) => {
+                tracing::error!(%err, "服务端内容安装失败");
+                task_bg.fail(&err.to_string());
+            }
+        }
+    });
+    Ok(server_content::InstallStarted { task_id })
+}
+
+#[tauri::command]
+pub fn server_content_toggle(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    kind: String,
+    file_name: String,
+    enabled: bool,
+) -> Result<()> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    let kind = server_content::ServerContentKind::from_id(&kind)?;
+    server_content::toggle_content(&dir, kind, &file_name, enabled)
+}
+
+#[tauri::command]
+pub async fn server_content_check(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    kind: String,
+) -> Result<server_content::ContentCheckResult> {
+    let (dir, meta) = server::find(&state.paths, server_id.value()?)?;
+    let kind = server_content::ServerContentKind::from_id(&kind)?;
+    let settings = state.settings();
+    let key = settings.curseforge_api_key.clone();
+    let loader = kind.loader_for(&meta.core);
+    server_content::check_content(
+        &state.client,
+        &dir,
+        kind,
+        &meta.mc_version,
+        &loader,
+        if key.trim().is_empty() { None } else { Some(key.as_str()) },
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn server_content_apply_updates(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    kind: String,
+    items: Vec<server_content::ContentUpdateItem>,
+) -> Result<server_content::ContentApplyResult> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    let kind = server_content::ServerContentKind::from_id(&kind)?;
+    let via_mcim = state.settings().content_download_via_mcim;
+    server_content::apply_updates(&state.client, &dir, kind, &items, via_mcim).await
+}
+
+#[tauri::command]
+pub fn server_saves_list(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+) -> Result<Vec<server_content::ServerSaveItem>> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    server_content::list_saves(&dir)
+}
+
+#[tauri::command]
+pub async fn server_saves_backup(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    name: String,
+) -> Result<server_content::BackupResult> {
+    let (dir, meta) = server::find(&state.paths, server_id.value()?)?;
+    let task = state.tasks.create_with_prefix(
+        "backup",
+        &format!("备份存档 {name}"),
+        &dir.join(server_content::BACKUP_DIR).display().to_string(),
+        server_content::BACKUP_PREFIX,
+    );
+    let task_bg = task.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        server_content::backup_save(&dir, &name, Some(&task_bg))
+    })
+    .await
+    .map_err(|err| AppError::Other(format!("备份任务异常退出：{err}")))?;
+    match result {
+        Ok(path) => {
+            task.finish();
+            let path = path.display().to_string();
+            tracing::info!(server = meta.name, %path, "服务端存档备份完成");
+            Ok(server_content::BackupResult { path })
+        }
+        Err(err) => {
+            task.fail(&err.to_string());
+            Err(err)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn server_config_read(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+) -> Result<server_content::ServerConfigResult> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    server_content::read_config(&dir)
+}
+
+#[tauri::command]
+pub fn server_config_write(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    patch: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    server_content::write_config(&dir, &patch)
+}
+
+/// 服务端控制台：把一条指令写进服务端进程的 stdin。
+#[tauri::command]
+pub async fn server_send_command(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    command: String,
+) -> Result<()> {
+    let id = server_id.value()?;
+    let normalized = server::normalize_command(&command)?;
+    state.servers.send_command(id, &normalized).await?;
+    // 让前端立刻看到自己发出去的指令
+    use tauri::Emitter;
+    let _ = app.emit(
+        "server://log",
+        serde_json::json!({ "id": id, "line": format!("> {normalized}") }),
+    );
+    Ok(())
+}
+
+/// 控制台状态：运行中？stdin 还能写吗？最近 50 条指令。
+#[tauri::command]
+pub async fn server_console_state(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+) -> Result<server::ConsoleState> {
+    Ok(state.servers.console_state(server_id.value()?).await)
+}
+
+#[tauri::command]
+pub fn server_logs_tail(
+    state: State<'_, AppState>,
+    server_id: ServerIdParam,
+    lines: Option<usize>,
+) -> Result<Vec<String>> {
+    let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
+    server_content::logs_tail(&dir, lines.unwrap_or(200).clamp(1, 5000))
+}
+
 // ------------------------------------------------------------------ 皮肤 / 披风
 
 #[tauri::command]
@@ -1464,14 +1841,15 @@ pub fn skin_upload(
     crate::skins::upload_skin(&state.paths, &name, &png_base64)
 }
 
+/// 删除本地皮肤文件（删的是当前皮肤时回落内置 Steve）。
 #[tauri::command]
-pub fn skin_current(state: State<'_, AppState>) -> Option<crate::skins::SkinItem> {
-    crate::skins::current_skin(&state.paths)
+pub fn skins_delete(state: State<'_, AppState>, name: String) -> Result<()> {
+    crate::skins::delete_local_skin(&state.paths, &name)
 }
 
 #[tauri::command]
-pub fn cape_current(state: State<'_, AppState>) -> Option<crate::skins::CapeItem> {
-    crate::skins::current_cape(&state.paths)
+pub fn skin_current(state: State<'_, AppState>) -> Option<crate::skins::SkinItem> {
+    crate::skins::current_skin(&state.paths)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1482,12 +1860,12 @@ pub struct DefaultSkin {
     pub sha256: String,
 }
 
-/// 随包内置的 Steve / Alex（model: classic|slim）。
+/// 随包内置的 9 个官方皮肤（name 缺省是 Steve / Alex；model: classic|slim）。
 #[tauri::command]
-pub fn skin_default(model: Option<String>) -> DefaultSkin {
+pub fn skin_default(name: Option<String>, model: Option<String>) -> Result<DefaultSkin> {
     let model = model.unwrap_or_else(|| "classic".to_string());
-    let (item, sha256) = crate::skins::default_skin(&model);
-    DefaultSkin { item, sha256 }
+    let (item, sha256) = crate::skins::default_skin_named(name.as_deref(), &model)?;
+    Ok(DefaultSkin { item, sha256 })
 }
 
 /// 正版玩家皮肤：走 uapis 的 userinfo 接口，下载后落盘（不自动应用）。
@@ -1519,14 +1897,52 @@ pub async fn skin_import_from_url(
     crate::skins::import_from_url(&state.client, &state.paths, &url, name.as_deref()).await
 }
 
+/// 账号上的披风列表：只有微软账号支持，其余返回 supported=false + 中文原因。
 #[tauri::command]
-pub fn capes_list(state: State<'_, AppState>) -> Vec<crate::skins::CapeItem> {
-    crate::skins::list_capes(&state.paths)
+pub async fn capes_list(
+    state: State<'_, AppState>,
+) -> Result<crate::capes::CapesListResult> {
+    let settings = state.settings();
+    crate::capes::capes_list(&state.client, &state.paths, &settings).await
 }
 
+/// 装备披风；capeId=null 表示不使用披风。
 #[tauri::command]
-pub fn cape_apply(state: State<'_, AppState>, name: String) -> Result<crate::skins::CapeItem> {
-    crate::skins::apply_cape(&state.paths, &name)
+pub async fn cape_set_active(
+    state: State<'_, AppState>,
+    cape_id: Option<String>,
+) -> Result<crate::capes::CapeState> {
+    let settings = state.settings();
+    crate::capes::cape_set_active(&state.client, &state.paths, &settings, cape_id).await
+}
+
+/// 上传皮肤到 Mojang 账号（顺带把披风选回来）。
+#[tauri::command]
+pub async fn ms_skin_upload(
+    state: State<'_, AppState>,
+    png_path: Option<String>,
+    png_base64: Option<String>,
+    variant: String,
+) -> Result<crate::capes::MsSkinUploadResult> {
+    let settings = state.settings();
+    crate::capes::skin_upload(
+        &state.client,
+        &state.paths,
+        &settings,
+        png_path.as_deref(),
+        png_base64.as_deref(),
+        &variant,
+    )
+    .await
+}
+
+/// ms_profile：当前微软账号的真实资料（名字 / uuid / 皮肤 / 披风 / 模型）。
+#[tauri::command]
+pub async fn ms_profile(
+    state: State<'_, AppState>,
+) -> Result<crate::capes::AccountProfile> {
+    let settings = state.settings();
+    crate::capes::ms_profile(&state.client, &state.paths, &settings).await
 }
 
 #[tauri::command]
@@ -1610,6 +2026,11 @@ async fn translate_content_items(state: &AppState, items: &mut [content::Content
         return;
     }
     let settings = state.settings();
+    // 关掉翻译开关就完全不打翻译接口：标题保持原文、translated 恒为 false
+    if !settings.translate_enabled {
+        content::disable_translation(items);
+        return;
+    }
     let mut texts: Vec<String> = Vec::with_capacity(limit * 2);
     for item in items.iter().take(limit) {
         texts.push(item.title_original.clone());
@@ -1677,31 +2098,37 @@ pub async fn content_search(
             page_size,
         });
     }
-    {
-        let filter = format!("内容搜索筛选（暂未映射到接口参数）：{:?}/{:?}", categories, sort);
-        tracing::debug!("{filter}");
-    }
     let offset = content::page_offset(page, page_size);
-    let url = content::search_url(
-        provider,
-        &kind,
-        &query,
-        mc_version.as_deref(),
-        loader.as_deref(),
-        offset,
-        page_size,
-    )?;
     let key = state.settings().curseforge_api_key;
-    let text = content::http_text(
-        &state.client,
-        &url,
-        if provider == content::Provider::Curseforge {
-            Some(key.as_str())
-        } else {
-            None
-        },
-    )
-    .await?;
+    let has_key = !key.trim().is_empty();
+    if provider == content::Provider::Curseforge && !has_key {
+        tracing::info!("CurseForge 无 Key，自动走 MCIM 镜像");
+    }
+    let api_key = if provider == content::Provider::Curseforge && has_key {
+        Some(key.as_str())
+    } else {
+        None
+    };
+    let categories = categories.unwrap_or_default();
+    // CurseForge 只认分类 id：名字→id 走 /v1/categories 的 24h 缓存
+    let category_ids = if provider == content::Provider::Curseforge {
+        content::resolve_category_ids(&state.client, provider, api_key, &categories).await?
+    } else {
+        Vec::new()
+    };
+    let url = content::search_url_for(&content::SearchQuery {
+        provider,
+        kind: &kind,
+        query: &query,
+        mc_version: mc_version.as_deref(),
+        loader: loader.as_deref(),
+        categories: &categories,
+        sort: sort.as_deref(),
+        category_ids: &category_ids,
+        offset,
+        limit: page_size,
+    }, has_key)?;
+    let text = content::http_text(&state.client, &url, api_key).await?;
     let mut result = content::parse_search(provider, &text, &kind, page, page_size)?;
     translate_content_items(&state, &mut result.items).await;
     Ok(result)
@@ -1714,12 +2141,16 @@ pub async fn content_detail(
     project_id: String,
 ) -> Result<content::ProjectDetail> {
     let provider = content::Provider::from_id(&provider)?;
-    let url = content::detail_url(provider, &project_id)?;
     let key = state.settings().curseforge_api_key;
+    let has_key = !key.trim().is_empty();
+    if provider == content::Provider::Curseforge && !has_key {
+        tracing::info!("CurseForge 无 Key，自动走 MCIM 镜像");
+    }
+    let url = content::detail_url_for(provider, has_key, &project_id)?;
     let text = content::http_text(
         &state.client,
         &url,
-        if provider == content::Provider::Curseforge {
+        if provider == content::Provider::Curseforge && has_key {
             Some(key.as_str())
         } else {
             None
@@ -1738,17 +2169,22 @@ pub async fn content_versions(
     loader: Option<String>,
 ) -> Result<Vec<content::VersionItem>> {
     let provider = content::Provider::from_id(&provider)?;
-    let url = content::versions_url(
+    let key = state.settings().curseforge_api_key;
+    let has_key = !key.trim().is_empty();
+    if provider == content::Provider::Curseforge && !has_key {
+        tracing::info!("CurseForge 无 Key，自动走 MCIM 镜像");
+    }
+    let url = content::versions_url_for(
         provider,
+        has_key,
         &project_id,
         mc_version.as_deref(),
         loader.as_deref(),
     )?;
-    let key = state.settings().curseforge_api_key;
     let text = content::http_text(
         &state.client,
         &url,
-        if provider == content::Provider::Curseforge {
+        if provider == content::Provider::Curseforge && has_key {
             Some(key.as_str())
         } else {
             None
@@ -1776,6 +2212,7 @@ pub async fn mod_install(
         instance::get(&conn, instance_id)?
     };
     let title = format!("安装模组 {}", project_id);
+    let via_mcim = settings.content_download_via_mcim;
     let task = state.tasks.create_with_prefix(
         "content",
         &title,
@@ -1796,6 +2233,7 @@ pub async fn mod_install(
             &project_id,
             &version_id,
             if key.trim().is_empty() { None } else { Some(key.as_str()) },
+            via_mcim,
             &task_bg,
         )
         .await
@@ -1812,6 +2250,92 @@ pub async fn mod_install(
         }
     });
     Ok(GithubDownloadStarted { task_id })
+}
+
+/// modpack_install 的返回：整合包直接建实例，taskId 前缀 modpack。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModpackInstallStarted {
+    pub task_id: String,
+    pub instance_id: i64,
+}
+
+/// 安装整合包（Modrinth .mrpack / CurseForge zip）：直接创建一个新实例并装进去。
+///
+/// 这条命令等到装完才返回（前端靠失败时的错误文案判断是否落到 incomplete）；
+/// 进度仍然实时走 install://progress，taskId 前缀 modpack。
+#[tauri::command]
+pub async fn modpack_install(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    provider: String,
+    project_id: String,
+    version_id: Option<String>,
+    instance_name: Option<String>,
+    memory_mb: Option<u32>,
+) -> Result<ModpackInstallStarted> {
+    let provider = content::Provider::from_id(&provider)?;
+    let settings = state.settings();
+    let paths = state.paths.clone();
+    let origins = sources::resolve(&settings);
+    let label = modpack::sanitize_instance_name(
+        instance_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(project_id.trim()),
+    );
+    let task = state.tasks.create_with_prefix(
+        modpack::TASK_KIND,
+        &format!("安装整合包 {label}"),
+        &paths.cache.join("packs").display().to_string(),
+        modpack::TASK_PREFIX,
+    );
+    let context = modpack::PackContext {
+        client: state.client.clone(),
+        paths: paths.clone(),
+        origins,
+        connections: settings.effective_connections(),
+        concurrency: settings.effective_concurrency(),
+        curseforge_api_key: settings.curseforge_api_key.clone(),
+        via_mcim: settings.content_download_via_mcim,
+    };
+    let request = modpack::PackRequest {
+        provider,
+        project_id: project_id.trim().to_string(),
+        version_id: version_id.unwrap_or_default(),
+        instance_name: instance_name.unwrap_or_default(),
+        memory_mb: modpack::normalize_memory(memory_mb),
+    };
+    let sink = modpack::DbInstanceSink::new(&paths);
+
+    let result = modpack::install(&context, &request, &sink, &task).await;
+    // 成功失败都发一次：失败时前端要靠这条事件把「整合包未装完」小标刷出来
+    {
+        use tauri::Emitter;
+        if let Err(err) = app.emit("instances://changed", ()) {
+            tracing::warn!(%err, "发送 instances://changed 失败");
+        }
+    }
+    match result {
+        Ok(outcome) => {
+            tracing::info!("{}", outcome.summary());
+            task.finish();
+            Ok(ModpackInstallStarted {
+                task_id: task.id().to_string(),
+                instance_id: outcome.instance_id,
+            })
+        }
+        Err(AppError::Cancelled) => {
+            task.cancel();
+            Err(AppError::Cancelled)
+        }
+        Err(err) => {
+            tracing::error!(%err, "整合包安装失败");
+            task.fail(&err.to_string());
+            Err(err)
+        }
+    }
 }
 
 /// 批量翻译（内容服务展示用）。limited=true 表示内置接口被限流。
@@ -1930,9 +2454,13 @@ pub fn tera_status(state: State<'_, AppState>) -> crate::terracotta::TeraStatus 
 #[serde(rename_all = "camelCase")]
 pub struct TeraInstalled {
     pub version: String,
+    /// bundled（安装包内嵌）/ downloaded（联网下载）
+    pub source: String,
+    pub license: String,
+    pub homepage: String,
 }
 
-/// 安装陶瓦联机：下载官方包 → 校验 → 解压（进度走 install://progress，taskId 前缀 tera-）。
+/// 准备陶瓦联机：优先部署安装包里内嵌的二进制，内嵌缺失才下载官方包。
 #[tauri::command]
 pub async fn tera_install(state: State<'_, AppState>) -> Result<TeraInstalled> {
     let paths = state.paths.clone();
@@ -1943,11 +2471,21 @@ pub async fn tera_install(state: State<'_, AppState>) -> Result<TeraInstalled> {
         &crate::terracotta::terracotta_dir(&paths).display().to_string(),
         "tera",
     );
-    let result = state.tera.install(&client, &paths, &task).await;
+    let result = state.tera.ensure(&client, &paths, &task).await;
     match result {
-        Ok(version) => {
+        Ok(ready) => {
             task.finish();
-            Ok(TeraInstalled { version })
+            tracing::info!(
+                source = %ready.source,
+                version = %ready.version,
+                "陶瓦联机已就绪"
+            );
+            Ok(TeraInstalled {
+                version: ready.version,
+                source: ready.source,
+                license: crate::terracotta::TERRACOTTA_LICENSE.to_string(),
+                homepage: crate::terracotta::TERRACOTTA_HOMEPAGE.to_string(),
+            })
         }
         Err(AppError::Cancelled) => {
             task.cancel();
@@ -2037,6 +2575,7 @@ pub fn ms_auth_status(state: State<'_, AppState>) -> MsAuthStatus {
 pub async fn news_list(
     state: State<'_, AppState>,
     limit: Option<usize>,
+    force: Option<bool>,
 ) -> Result<crate::news::NewsList> {
     let settings = state.settings();
     Ok(
@@ -2046,6 +2585,27 @@ pub async fn news_list(
             &state.news,
             Some((&settings, &state.translator)),
             limit.unwrap_or(crate::news::DEFAULT_LIMIT),
+            force.unwrap_or(false),
+        )
+        .await,
+    )
+}
+
+/// 首页新闻重试：强制绕过缓存与负缓存（前端「重试」按钮用）。
+#[tauri::command]
+pub async fn news_refresh(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<crate::news::NewsList> {
+    let settings = state.settings();
+    Ok(
+        crate::news::list(
+            &state.client,
+            &state.paths,
+            &state.news,
+            Some((&settings, &state.translator)),
+            limit.unwrap_or(crate::news::DEFAULT_LIMIT),
+            true,
         )
         .await,
     )
@@ -2200,3 +2760,80 @@ fn build_time() -> Option<i64> {
 // 避免 unused import 警告（同时说明内置源仍然走同一套映射）。
 const _: fn(&str) -> Option<DownloadSource> = DownloadSource::from_id;
 const _: fn() -> Vec<download::DownloadSource> = || download::DownloadSource::ALL.to_vec();
+
+
+// ------------------------------------------------------------------ 种子地图
+
+/// seedmap_versions：种子地图支持的 MC 版本（前端只显示这些）。
+#[tauri::command]
+pub fn seedmap_versions() -> Vec<crate::seedmap::VersionInfo> {
+    crate::seedmap::versions()
+}
+
+/// seedmap_biomes：算一块区域（tiles_x × tiles_y 像素）的群系图。
+/// rgba 是 PNG 的 base64，biomes 是逐像素群系 id（[z * width + x]）。
+#[tauri::command]
+pub async fn seedmap_biomes(
+    mc: String,
+    dimension: i32,
+    seed: crate::seedmap::SeedArg,
+    scale: i32,
+    x0: i32,
+    z0: i32,
+    tiles_x: u32,
+    tiles_y: u32,
+) -> Result<crate::seedmap::BiomeMapView> {
+    let request = crate::seedmap::BiomeRequest {
+        mc: crate::seedmap::resolve_version(&mc)?,
+        dim: crate::seedmap::dimension_to_cubiomes(dimension)?,
+        seed: seed.to_seed()?,
+        scale,
+        x0,
+        z0,
+        tiles_x,
+        tiles_y,
+    };
+    crate::seedmap::biome_map(request).await
+}
+
+/// seedmap_biome_at：单个方块坐标的群系（含中文名）。
+#[tauri::command]
+pub async fn seedmap_biome_at(
+    mc: String,
+    dimension: i32,
+    seed: crate::seedmap::SeedArg,
+    x: i32,
+    z: i32,
+) -> Result<crate::seedmap::BiomeAtView> {
+    let mc = crate::seedmap::resolve_version(&mc)?;
+    let dim = crate::seedmap::dimension_to_cubiomes(dimension)?;
+    crate::seedmap::biome_at(mc, dim, seed.to_seed()?, x, z).await
+}
+
+/// seedmap_spawn：主世界出生点。
+#[tauri::command]
+pub async fn seedmap_spawn(
+    mc: String,
+    seed: crate::seedmap::SeedArg,
+) -> Result<crate::seedmap::SpawnView> {
+    let mc = crate::seedmap::resolve_version(&mc)?;
+    crate::seedmap::spawn_point(mc, seed.to_seed()?).await
+}
+
+/// seedmap_structures：搜索 (x,z) 半径 radius 内的结构，按距离排序。
+/// structure：village|temple|monument|mansion|stronghold|fortress|bastion|
+/// outpost|ruined_portal|shipwreck|ocean_ruin|treasure
+#[tauri::command]
+pub async fn seedmap_structures(
+    mc: String,
+    seed: crate::seedmap::SeedArg,
+    structure: String,
+    x: Option<i32>,
+    z: Option<i32>,
+    radius: i32,
+) -> Result<Vec<crate::seedmap::StructureHit>> {
+    let mc = crate::seedmap::resolve_version(&mc)?;
+    let (x, z) = (x.unwrap_or(0), z.unwrap_or(0));
+    crate::seedmap::structures(mc, seed.to_seed()?, structure, x, z, radius).await
+}
+

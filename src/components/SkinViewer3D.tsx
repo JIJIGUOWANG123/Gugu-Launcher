@@ -16,6 +16,8 @@ interface Props {
   /** 深色预览背景 */
   dark: boolean;
   cape: string | null;
+  /** 预览角落的小字提示（离线/第三方账号不支持披风时用） */
+  capeNote?: string | null;
   /** 每加一就重置到默认机位（「重置视角」按钮用） */
   resetToken?: number;
 }
@@ -34,7 +36,7 @@ function animationFor(action: SkinAction): PlayerAnimation | null {
  * - 环境没有 WebGL 时回落到 2D 头像，界面不至于空一块；
  * - preserveDrawingBuffer 打开，自检脚本可以直接读 canvas 像素。
  */
-export function SkinViewer3D({ skin, model, action, autoRotate, dark, cape, resetToken = 0 }: Props) {
+export function SkinViewer3D({ skin, model, action, autoRotate, dark, cape, capeNote, resetToken = 0 }: Props) {
   const t = useT();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewerRef = useRef<SkinViewer | null>(null);
@@ -77,7 +79,9 @@ export function SkinViewer3D({ skin, model, action, autoRotate, dark, cape, rese
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer || !skin) return;
-    void Promise.resolve(viewer.loadSkin(skin, { model, ears: "load-only" })).catch(() => undefined);
+    // ModelType 是 skinview-utils 的联合类型（"default" | "slim"），default 即经典模型
+    const modelType = model === "slim" ? "slim" : "default";
+    void Promise.resolve(viewer.loadSkin(skin, { model: modelType, ears: "load-only" })).catch(() => undefined);
   }, [skin, model]);
 
   useEffect(() => {
@@ -124,6 +128,11 @@ export function SkinViewer3D({ skin, model, action, autoRotate, dark, cape, rese
         ) : null}
       </div>
       <span className="skin-stage__hint">{t("skin.hintDrag")}</span>
+      {capeNote ? (
+        <span className="skin-stage__note" data-cape-note>
+          {capeNote}
+        </span>
+      ) : null}
     </div>
   );
 }

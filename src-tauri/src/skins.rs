@@ -56,11 +56,131 @@ fn builtin_item(model: &str, is_current: bool) -> SkinItem {
     }
 }
 
-/// skin_default({model})：返回内置 Steve / Alex（带 sha256 便于校验）。
+
+/// 随包的 9 个官方角色（每个都是 wide=经典 + slim=纤细两张）。
+pub const BUILTIN_SKINS: [(&str, &[u8], &[u8]); 9] = [
+    (
+        "ari",
+        include_bytes!("../resources/skins/ari-wide.png"),
+        include_bytes!("../resources/skins/ari-slim.png"),
+    ),
+    (
+        "efe",
+        include_bytes!("../resources/skins/efe-wide.png"),
+        include_bytes!("../resources/skins/efe-slim.png"),
+    ),
+    (
+        "kai",
+        include_bytes!("../resources/skins/kai-wide.png"),
+        include_bytes!("../resources/skins/kai-slim.png"),
+    ),
+    (
+        "makena",
+        include_bytes!("../resources/skins/makena-wide.png"),
+        include_bytes!("../resources/skins/makena-slim.png"),
+    ),
+    (
+        "noor",
+        include_bytes!("../resources/skins/noor-wide.png"),
+        include_bytes!("../resources/skins/noor-slim.png"),
+    ),
+    (
+        "steve",
+        include_bytes!("../resources/skins/steve-wide.png"),
+        include_bytes!("../resources/skins/steve-slim.png"),
+    ),
+    (
+        "sunny",
+        include_bytes!("../resources/skins/sunny-wide.png"),
+        include_bytes!("../resources/skins/sunny-slim.png"),
+    ),
+    (
+        "zuri",
+        include_bytes!("../resources/skins/zuri-wide.png"),
+        include_bytes!("../resources/skins/zuri-slim.png"),
+    ),
+    (
+        "alex",
+        include_bytes!("../resources/skins/alex-wide.png"),
+        include_bytes!("../resources/skins/alex-slim.png"),
+    ),
+];
+
+/// 内置角色名表（第一项是默认皮肤）。
+pub const BUILTIN_CHARACTERS: [&str; 9] = [
+    "steve", "alex", "ari", "efe", "kai", "makena", "noor", "sunny", "zuri",
+];
+
+/// 模型名归一：classic/default/wide → wide，slim → slim。
+fn model_key(model: &str) -> &'static str {
+    match model.trim().to_lowercase().as_str() {
+        "slim" | "alex" => "slim",
+        _ => "wide",
+    }
+}
+
+fn character_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// 取一个内置角色的字节；名字不认识返回 None。
+pub fn builtin_skin(name: &str, model: &str) -> Option<(&'static str, &'static [u8])> {
+    let key = character_key(name);
+    let entry = BUILTIN_SKINS
+        .iter()
+        .find(|(candidate, _, _)| *candidate == key)?;
+    let bytes = if model_key(model) == "slim" {
+        entry.2
+    } else {
+        entry.1
+    };
+    Some((entry.0, bytes))
+}
+
+fn display_name(key: &str) -> String {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => key.to_string(),
+    }
+}
+
+/// 内置角色条目（不落盘、不能删）。
+pub fn builtin_skin_item(name: &str, model: &str, is_current: bool) -> Option<(SkinItem, String)> {
+    let (key, bytes) = builtin_skin(name, model)?;
+    let item = SkinItem {
+        name: display_name(key),
+        path: format!("builtin://{key}-{}", model_key(model)),
+        is_current,
+        size: bytes.len() as u64,
+        data_url: Some(format!("data:image/png;base64,{}", util::base64_encode(bytes))),
+        builtin: true,
+        uuid: None,
+        source: Some("builtin".to_string()),
+    };
+    Some((item, util::hex(&util::sha256(bytes))))
+}
+
+/// skin_default({name?, model?})：9 个官方角色 × classic/slim。
+pub fn default_skin_named(name: Option<&str>, model: &str) -> Result<(SkinItem, String)> {
+    let key = match name.map(character_key).filter(|value| !value.is_empty()) {
+        Some(key) => key,
+        // 没给名字时沿用老的 Steve / Alex
+        None => {
+            if model_key(model) == "slim" {
+                "alex".to_string()
+            } else {
+                "steve".to_string()
+            }
+        }
+    };
+    builtin_skin_item(&key, model, false)
+        .ok_or_else(|| AppError::Invalid(format!("没有这个内置皮肤：{key}")))
+}
+
+/// skin_default({model})：没给角色名时返回内置 Steve / Alex（带 sha256 便于校验）。
 pub fn default_skin(model: &str) -> (SkinItem, String) {
-    let (name, bytes) = builtin_bytes(model);
-    let item = builtin_item(if name == "Alex" { "slim" } else { "classic" }, false);
-    (item, util::hex(&util::sha256(bytes)))
+    default_skin_named(None, model).expect("默认内置皮肤一定存在")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +329,44 @@ pub fn current_skin(paths: &Paths) -> Option<SkinItem> {
 /// cape_current()：当前披风（没选就是 None）。
 pub fn current_cape(paths: &Paths) -> Option<CapeItem> {
     list_capes(paths).into_iter().find(|item| item.is_current)
+}
+
+/// 只允许删 .mc/skins 下的 png：禁止分隔符、.. 与绝对路径。
+pub fn validate_skin_file_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::Invalid("皮肤名不能为空".to_string()));
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || Path::new(trimmed).is_absolute()
+    {
+        return Err(AppError::Invalid(format!("皮肤名不合法：{name}")));
+    }
+    if !trimmed.to_lowercase().ends_with(".png") {
+        return Err(AppError::Invalid(format!("只能删除 png 皮肤：{name}")));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// skins_delete：删掉本地皮肤；删的是当前皮肤时回落内置 Steve。
+pub fn delete_local_skin(paths: &Paths, name: &str) -> Result<()> {
+    let file = validate_skin_file_name(name)?;
+    let dir = skins_dir(paths);
+    let path = dir.join(&file);
+    if !path.is_file() {
+        return Err(AppError::Invalid(
+            "该皮肤不存在（可能已被删除）".to_string(),
+        ));
+    }
+    std::fs::remove_file(&path)?;
+    if read_current(&dir, CURRENT_SKIN).as_deref() == Some(file.as_str()) {
+        let marker = dir.join(CURRENT_SKIN);
+        let _ = std::fs::remove_file(marker);
+    }
+    tracing::info!(name = %file, "删除本地皮肤");
+    Ok(())
 }
 
 /// 校验 PNG 头并取尺寸；只允许 64x64 / 64x32。
@@ -525,6 +683,27 @@ pub fn parse_thirdparty_profile(json: &str, server: &str) -> Result<ThirdPartySk
     })
 }
 
+/// 下载皮肤用的 UA（textures.minecraft.net 与各家皮肤站都认这个）。
+pub const SKIN_DOWNLOAD_USER_AGENT: &str = "Mozilla/5.0 GuguLauncher/1.0";
+
+/// 导入落盘时的文件名：清洗掉空格与路径分隔符，统一补 .png。
+pub fn skin_file_name_for(name: Option<&str>) -> String {
+    let base = match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => safe_name(value).trim().to_string(),
+        None => String::new(),
+    };
+    let base = if base.is_empty() {
+        "skin".to_string()
+    } else {
+        base
+    };
+    if base.to_lowercase().ends_with(".png") {
+        base
+    } else {
+        format!("{base}.png")
+    }
+}
+
 /// 把状态码 / 网络错误翻成中文。
 pub fn map_lookup_error(status: Option<u16>, message: &str, server: &str) -> String {
     match status {
@@ -663,6 +842,9 @@ pub async fn import_from_url(
     let response = client
         .get(url)
         .timeout(std::time::Duration::from_secs(15))
+        // traits 会拒绝空 UA/非浏览器 UA；官方贴图只有 1–2KB，一样照收
+        .header(reqwest::header::USER_AGENT, SKIN_DOWNLOAD_USER_AGENT)
+        .header(reqwest::header::ACCEPT, "image/png,image/*;q=0.8,*/*;q=0.5")
         .send()
         .await
         .map_err(|err| AppError::Other(format!("下载皮肤失败：{err}")))?;
@@ -679,15 +861,7 @@ pub async fn import_from_url(
     validate_skin_png(&bytes)?;
     let dir = skins_dir(paths);
     std::fs::create_dir_all(&dir)?;
-    let base = match name.map(|value| value.trim()).filter(|value| !value.is_empty()) {
-        Some(value) => safe_name(value),
-        None => "skin".to_string(),
-    };
-    let file_name = if base.to_lowercase().ends_with(".png") {
-        base
-    } else {
-        format!("{base}.png")
-    };
+    let file_name = skin_file_name_for(name);
     let target = unique_skin_target(&dir, &file_name);
     std::fs::write(&target, &bytes)?;
     let (size, data_url) = size_and_data_url(&target);
@@ -991,6 +1165,136 @@ mod tests {
         assert_eq!(items.len(), 3);
         assert!(!items[2].builtin);
         let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+#[test]
+    fn textures_minecraft_net_urls_are_allowed() {
+        assert!(crate::settings::is_http_url(
+            "https://textures.minecraft.net/texture/292009a49bba793b6e2b4a1a8bb0f7c8d3a2f4b1"
+        ));
+        assert!(crate::settings::is_http_url("http://textures.minecraft.net/texture/abc"));
+        assert!(crate::settings::is_http_url("https://mod.mcimirror.top/curseforge/files/1/a.png"));
+        assert!(crate::settings::is_http_url("https://littleskin.cn/textures/abc"));
+        assert!(!crate::settings::is_http_url("file:///C:/x.png"));
+        assert!(!crate::settings::is_http_url("ftp://textures.minecraft.net/x.png"));
+        assert_eq!(SKIN_DOWNLOAD_USER_AGENT, "Mozilla/5.0 GuguLauncher/1.0");
+    }
+
+    #[test]
+    fn import_file_name_is_sanitized() {
+        assert_eq!(skin_file_name_for(Some("my skin")), "my skin.png");
+        assert_eq!(skin_file_name_for(Some("a/b\\c")), "a_b_c.png");
+        assert_eq!(skin_file_name_for(Some("  ")), "skin.png");
+        assert_eq!(skin_file_name_for(None), "skin.png");
+        assert!(!skin_file_name_for(Some("名字")).is_empty());
+        assert!(skin_file_name_for(Some("x.png")).ends_with(".png"));
+        assert!(!skin_file_name_for(Some("x.png")).ends_with(".png.png"));
+    }
+
+    #[test]
+    fn small_official_skin_textures_are_accepted() {
+        assert_eq!(validate_skin_png(&png_bytes(64, 32)).unwrap(), (64, 32));
+        assert_eq!(validate_skin_png(&png_bytes(64, 64)).unwrap(), (64, 64));
+        assert!(png_bytes(64, 64).len() < 8 * 1024, "官方贴图 1-2KB 也要接受");
+    }
+
+    #[test]
+    fn non_png_import_payload_is_rejected() {
+        let error = validate_skin_png(b"<html>403 Forbidden</html>")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不是合法的 PNG"), "{error}");
+        let error = validate_skin_png(&png_bytes(32, 32)).unwrap_err().to_string();
+        assert!(error.contains("64x64") || error.contains("尺寸"), "{error}");
+    }
+
+    #[test]
+    fn delete_local_skin_removes_file() {
+        let paths = temp_paths("skin-delete");
+        std::fs::write(paths.skins.join("自定义.png"), png_bytes(64, 64)).unwrap();
+        assert!(delete_local_skin(&paths, " 自定义.png ").is_ok());
+        assert!(!paths.skins.join("自定义.png").exists());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn delete_local_skin_rejects_path_traversal() {
+        let paths = temp_paths("skin-delete-trav");
+        for bad in ["../x.png", "a\\b.png", "sub/dir.png", "C:\\Windows\\x.png", "..\\x.png"] {
+            let error = delete_local_skin(&paths, bad).unwrap_err().to_string();
+            assert!(error.contains("皮肤名不合法"), "{bad} => {error}");
+        }
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn delete_local_skin_rejects_non_png() {
+        let paths = temp_paths("skin-delete-ext");
+        std::fs::write(paths.skins.join("readme.txt"), b"x").unwrap();
+        let error = delete_local_skin(&paths, "readme.txt").unwrap_err().to_string();
+        assert!(error.contains("只能删除 png 皮肤"), "{error}");
+        assert!(paths.skins.join("readme.txt").exists());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn delete_local_skin_missing_file_message() {
+        let paths = temp_paths("skin-delete-missing");
+        let error = delete_local_skin(&paths, "ghost.png").unwrap_err().to_string();
+        assert!(error.contains("该皮肤不存在（可能已被删除）"), "{error}");
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn deleting_current_skin_falls_back_to_builtin_steve() {
+        let paths = temp_paths("skin-delete-current");
+        let file = paths.skins.join("mine.png");
+        std::fs::write(&file, png_bytes(64, 64)).unwrap();
+        let applied = apply_skin(&paths, &file.display().to_string()).unwrap();
+        assert!(applied.is_current);
+        assert_eq!(
+            current_skin(&paths).map(|item| item.name),
+            Some("mine.png".to_string())
+        );
+        delete_local_skin(&paths, "mine.png").unwrap();
+        let current = current_skin(&paths).expect("永远不为 None");
+        assert_eq!(current.name, "Steve");
+        assert!(current.builtin);
+        assert!(!paths.skins.join("mine.png").exists());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn nine_bundled_characters_read_in_both_models() {
+        assert_eq!(BUILTIN_CHARACTERS.len(), 9);
+        assert_eq!(BUILTIN_SKINS.len(), 9);
+        let mut seen = Vec::new();
+        for key in BUILTIN_CHARACTERS {
+            for model in ["classic", "slim"] {
+                let (item, sha256) = default_skin_named(Some(key), model).unwrap();
+                assert!(item.builtin, "{key}/{model} 必须标记为内置");
+                let expected = if model == "slim" { "slim" } else { "wide" };
+                assert_eq!(item.path, format!("builtin://{key}-{expected}"));
+                assert_eq!(
+                    item.data_url
+                        .as_deref()
+                        .map(|url| url.starts_with("data:image/png;base64,")),
+                    Some(true)
+                );
+                // 每张都是真的 64×64 PNG，且 sha256 与文件字节一致
+                let bytes = builtin_skin(key, model).unwrap().1;
+                assert_eq!(validate_skin_png(bytes).unwrap(), (64, 64));
+                assert_eq!(sha256, util::hex(&util::sha256(bytes)));
+                assert_eq!(item.size as usize, bytes.len());
+                seen.push(sha256);
+            }
+        }
+        // 18 张互不相同（每位角色 wide/slim 也不同）
+        let unique: std::collections::HashSet<&String> = seen.iter().collect();
+        assert_eq!(unique.len(), 18);
+        assert_eq!(default_skin_named(Some("Ari"), "classic").unwrap().0.name, "Ari");
+        assert_eq!(default_skin_named(Some("alex"), "slim").unwrap().0.name, "Alex");
+        assert!(default_skin_named(Some("nobody"), "classic").is_err());
     }
 
     /// 32 位十六进制（不带横线，不是 UUID 形态）。

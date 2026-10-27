@@ -6,9 +6,12 @@ import { useT } from "../lib/i18n";
 import { api, subscribeLauncherEvents } from "../lib/tauri-api";
 import type { ServerCore, ServerCreateRequest, ServerInstance, ServerVersion } from "../lib/types";
 import { Modal } from "./Modal";
+import { ServerDetailPage } from "../pages/ServerDetailPage";
 
 interface Props {
   notify: (message: string) => void;
+  /** 服务端详情里「从资源页安装」要跳到资源页 */
+  onOpenContent: () => void;
 }
 
 const MAX_LOG_LINES = 500;
@@ -33,7 +36,7 @@ function ServerGlyph({ size = 72 }: { size?: number }) {
  * 多人 → 服务器：空态 / 卡片列表 / 展开日志 / 删除二次确认 / 创建服务器弹窗。
  * 状态与日志都来自 server://state、server://log 事件（mock 里同一套事件）。
  */
-export function ServersPanel({ notify }: Props) {
+export function ServersPanel({ notify, onOpenContent }: Props) {
   const t = useT();
   const { refresh: refreshDownloads } = useDownloads();
   const [servers, setServers] = useState<ServerInstance[] | null>(null);
@@ -41,6 +44,8 @@ export function ServersPanel({ notify }: Props) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ServerInstance | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  // 点卡片进服务端详情（和实例详情的进出方式一致）
+  const [detail, setDetail] = useState<ServerInstance | null>(null);
   const logRefs = useRef<Record<string, HTMLPreElement | null>>({});
 
   const reload = useCallback(async () => {
@@ -132,6 +137,24 @@ export function ServersPanel({ notify }: Props) {
 
   const list = servers ?? [];
 
+  if (detail) {
+    return (
+      <ServerDetailPage
+        server={detail}
+        onBack={() => {
+          setDetail(null);
+          void reload();
+        }}
+        notify={notify}
+        onOpenContent={onOpenContent}
+        onDeleted={() => {
+          setDetail(null);
+          void reload();
+        }}
+      />
+    );
+  }
+
   return (
     <div className="servers-panel">
       <div className="servers-panel__head">
@@ -159,7 +182,15 @@ export function ServersPanel({ notify }: Props) {
             const open = expanded === server.id;
             return (
               <article className="card server-card" key={server.id} data-server={server.id} data-server-state={server.state}>
-                <div className="server-card__row">
+                <div
+                  className="server-card__row"
+                  data-action="server-open-detail"
+                  onClick={(event) => {
+                    // 快捷按钮自己处理点击，别顺带进详情
+                    if ((event.target as HTMLElement).closest("button")) return;
+                    setDetail(server);
+                  }}
+                >
                   <span className="server-card__glyph" aria-hidden="true">
                     <ServerGlyph size={34} />
                   </span>

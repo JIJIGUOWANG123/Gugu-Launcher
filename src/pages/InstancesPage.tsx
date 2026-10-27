@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { icons } from "../assets/icons";
 import { InstanceCard } from "../components/InstanceCard";
 import { Modal } from "../components/Modal";
+import { ImportExternalModal } from "../components/ImportExternalModal";
 import { NewInstanceModal, type NewInstancePayload } from "../components/NewInstanceModal";
 import { formatDuration } from "../lib/format";
 import { useT } from "../lib/i18n";
@@ -34,6 +35,7 @@ interface MenuState {
 export function InstancesPage({ instances, versions, onCreate, onDelete, onLaunch, onOpenFolder, onRefresh, notify, onOpenJavaSettings }: Props) {
   const t = useT();
   const [creating, setCreating] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [detail, setDetail] = useState<Instance | null>(null);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Instance | null>(null);
@@ -111,6 +113,9 @@ export function InstancesPage({ instances, versions, onCreate, onDelete, onLaunc
         <button className="pill-outline" onClick={() => notify(t("instances.importLater"))}>
           + {t("instances.importModpack")}
         </button>
+        <button className="pill-outline" data-action="import-external" onClick={() => setImporting(true)}>
+          + {t("import.entry")}
+        </button>
         <button className="pill-outline pill-outline--primary" onClick={() => setCreating(true)}>
           + {t("instances.create")}
         </button>
@@ -164,6 +169,15 @@ export function InstancesPage({ instances, versions, onCreate, onDelete, onLaunc
             {t("instances.menuDelete")}
           </button>
         </div>
+      ) : null}
+
+      {importing ? (
+        <ImportExternalModal
+          onClose={() => setImporting(false)}
+          onImported={onRefresh}
+          onGoInstances={() => setImporting(false)}
+          notify={notify}
+        />
       ) : null}
 
       {creating ? (

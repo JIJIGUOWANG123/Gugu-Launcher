@@ -47,7 +47,7 @@ impl Provider {
         }
     }
 
-    fn curseforge_root(&self) -> String {
+    pub fn curseforge_root(&self) -> String {
         match self {
             Provider::Mcim => format!("{MCIM_BASE}/curseforge/v1"),
             _ => CURSEFORGE_API.to_string(),
@@ -56,6 +56,9 @@ impl Provider {
 }
 
 /// 内容类型 → (Modrinth project_type, CurseForge classId)。
+///
+/// plugin 的 classId=5（Bukkit Plugins）是实测确认的：
+/// GET /v1/categories?gameId=432 返回 id=5 name="Bukkit Plugins"（官方与 MCIM 镜像一致）。
 pub fn kind_mapping(kind: &str) -> Result<(&'static str, u32)> {
     match kind {
         "mod" => Ok(("mod", 6)),
@@ -63,9 +66,65 @@ pub fn kind_mapping(kind: &str) -> Result<(&'static str, u32)> {
         "modpack" => Ok(("modpack", 4471)),
         "resourcepack" => Ok(("resourcepack", 12)),
         "shader" => Ok(("shader", 6552)),
+        "plugin" => Ok(("plugin", 5)),
         // 数据包只有 Modrinth/MCIM 支持；classId 0 表示「CurseForge 没有对应分类」
         "datapack" => Ok(("datapack", 0)),
         other => Err(AppError::Invalid(format!("不支持的内容类型：{other}"))),
+    }
+}
+
+/// 插件加载器：Modrinth 用 categories 过滤，CurseForge 没有对应的 modLoaderType。
+pub const PLUGIN_LOADERS: [&str; 7] = [
+    "bukkit",
+    "spigot",
+    "paper",
+    "folia",
+    "purpur",
+    "sponge",
+    "pufferfish",
+];
+
+/// 排序档位（前端只给这四个）。
+pub const SORT_IDS: [&str; 4] = ["relevance", "downloads", "updated", "newest"];
+
+/// 排序归一：不认识的按 relevance。
+pub fn normalize_sort(sort: Option<&str>) -> &'static str {
+    match sort.map(str::trim).map(str::to_lowercase).as_deref() {
+        Some("downloads") => "downloads",
+        Some("updated") => "updated",
+        Some("newest") => "newest",
+        _ => "relevance",
+    }
+}
+
+/// Modrinth 的 index 参数（与前端档位同名，保留映射函数便于单测）。
+pub fn modrinth_index(sort: &str) -> &'static str {
+    match sort {
+        "downloads" => "downloads",
+        "updated" => "updated",
+        "newest" => "newest",
+        _ => "relevance",
+    }
+}
+
+/// CurseForge 的 sortField：2=Popularity 3=LastUpdated 6=TotalDownloads 11=ReleasedDate。
+pub fn curseforge_sort_field(sort: &str) -> u32 {
+    match sort {
+        "downloads" => 6,
+        "updated" => 3,
+        "newest" => 11,
+        _ => 2,
+    }
+}
+
+/// CurseForge 的 modLoaderType：1=Forge 4=Fabric 5=Quilt 6=NeoForge。
+pub fn curseforge_loader_type(loader: &str) -> Option<u32> {
+    match loader.trim().to_lowercase().as_str() {
+        "forge" => Some(1),
+        "fabric" => Some(4),
+        "quilt" => Some(5),
+        "neoforge" => Some(6),
+        _ => None,
     }
 }
 
@@ -114,7 +173,105 @@ fn url_encode(value: &str) -> String {
     out
 }
 
+/// 一次搜索的全部筛选条件。
+#[derive(Debug, Clone)]
+pub struct SearchQuery<'a> {
+    pub provider: Provider,
+    pub kind: &'a str,
+    pub query: &'a str,
+    pub mc_version: Option<&'a str>,
+    pub loader: Option<&'a str>,
+    pub categories: &'a [String],
+    pub sort: Option<&'a str>,
+    /// CurseForge 的 categoryIds（由 categories 的名字查表得到）
+    pub category_ids: &'a [u32],
+    pub offset: u32,
+    pub limit: u32,
+}
+
+/// Modrinth facets：组之间 AND，组内数组 OR。
+pub fn modrinth_facets(
+    project_type: &str,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+    categories: &[String],
+) -> Vec<String> {
+    fn group(values: &[String]) -> String {
+        let items: Vec<String> = values
+            .iter()
+            .map(|value| format!("\"{}\"", value.replace('"', "")))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+    let mut facets = vec![group(&[format!("project_type:{project_type}")])];
+    if let Some(version) = mc_version.map(str::trim).filter(|value| !value.is_empty()) {
+        facets.push(group(&[format!("versions:{version}")]));
+    }
+    if let Some(loader) = loader.map(str::trim).filter(|value| !value.is_empty()) {
+        facets.push(group(&[format!("categories:{}", loader.to_lowercase())]));
+    }
+    let picks: Vec<String> = categories
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("categories:{value}"))
+        .collect();
+    if !picks.is_empty() {
+        facets.push(group(&picks));
+    }
+    facets
+}
+
 /// 搜索地址。curseforge 走官方接口时要额外带 x-api-key（由命令层加头）。
+pub fn search_url_with(query: &SearchQuery<'_>) -> Result<String> {
+    let (project_type, class_id) = kind_mapping(query.kind)?;
+    let limit = query.limit.clamp(1, 50);
+    let sort = normalize_sort(query.sort);
+    match query.provider {
+        Provider::Modrinth | Provider::Mcim => {
+            let facets = modrinth_facets(
+                project_type,
+                query.mc_version,
+                query.loader,
+                query.categories,
+            );
+            Ok(format!(
+                "{}/search?query={}&limit={}&offset={}&index={}&facets={}",
+                query.provider.modrinth_root(),
+                url_encode(query.query),
+                limit,
+                query.offset,
+                modrinth_index(sort),
+                url_encode(&format!("[{}]", facets.join(",")))
+            ))
+        }
+        Provider::Curseforge => {
+            let mut url = format!(
+                "{}/mods/search?gameId={CURSEFORGE_GAME_ID}&classId={class_id}&searchFilter={}&index={}&pageSize={}&sortField={}&sortOrder=desc",
+                query.provider.curseforge_root(),
+                url_encode(query.query),
+                query.offset,
+                limit,
+                curseforge_sort_field(sort)
+            );
+            if let Some(version) = query.mc_version.map(str::trim).filter(|value| !value.is_empty()) {
+                url.push_str(&format!("&gameVersion={}", url_encode(version)));
+            }
+            if let Some(loader) = query.loader.map(str::trim).filter(|value| !value.is_empty()) {
+                if let Some(loader_type) = curseforge_loader_type(loader) {
+                    url.push_str(&format!("&modLoaderType={loader_type}"));
+                }
+            }
+            if !query.category_ids.is_empty() {
+                let ids: Vec<String> = query.category_ids.iter().map(u32::to_string).collect();
+                url.push_str(&format!("&categoryIds={}", ids.join(",")));
+            }
+            Ok(url)
+        }
+    }
+}
+
+/// 老签名（不带 categories/sort）的薄封装：等价于空筛选。
 pub fn search_url(
     provider: Provider,
     kind: &str,
@@ -124,52 +281,318 @@ pub fn search_url(
     offset: u32,
     limit: u32,
 ) -> Result<String> {
-    let (project_type, class_id) = kind_mapping(kind)?;
-    let limit = limit.clamp(1, 50);
+    search_url_with(&SearchQuery {
+        provider,
+        kind,
+        query,
+        mc_version,
+        loader,
+        categories: &[],
+        sort: None,
+        category_ids: &[],
+        offset,
+        limit,
+    })
+}
+
+// ------------------------------------------------------------------ 无 Key 走镜像
+
+/// MCIM 的 CurseForge 通道（官方接口在没有 API Key 时的兜底）。
+pub fn mcim_curseforge_root() -> String {
+    format!("{MCIM_BASE}/curseforge/v1")
+}
+
+/// 官方 CurseForge 接口必须有 Key；没有 Key 就改走 MCIM 镜像。
+pub fn effective_provider(provider: Provider, has_key: bool) -> Provider {
     match provider {
-        Provider::Modrinth | Provider::Mcim => {
-            let mut facets = vec![format!("[\"project_type:{project_type}\"]")];
-            if let Some(version) = mc_version.filter(|value| !value.trim().is_empty()) {
-                facets.push(format!("[\"versions:{}\" ]", version.trim()).replace("\" ]", "\"]"));
-            }
-            if let Some(loader) = loader.filter(|value| !value.trim().is_empty()) {
-                facets.push(format!("[\"categories:{}\" ]", loader.trim().to_lowercase()).replace("\" ]", "\"]"));
-            }
-            Ok(format!(
-                "{}/search?query={}&limit={}&offset={}&facets={}",
-                provider.modrinth_root(),
-                url_encode(query),
-                limit,
-                offset,
-                url_encode(&format!("[{}]", facets.join(",")))
-            ))
-        }
+        Provider::Curseforge if !has_key => Provider::Mcim,
+        other => other,
+    }
+}
+
+/// CurseForge 实际要用的根地址：有 Key 用官方，没 Key 用镜像。
+pub fn curseforge_root_for(provider: Provider, has_key: bool) -> String {
+    match provider {
+        Provider::Curseforge if !has_key => mcim_curseforge_root(),
+        other => other.curseforge_root(),
+    }
+}
+
+/// 与 search_url_with 相同，但 CurseForge 可以走镜像通道（无 Key 时）。
+pub fn search_url_for(query: &SearchQuery<'_>, has_key: bool) -> Result<String> {
+    let (_, class_id) = kind_mapping(query.kind)?;
+    let limit = query.limit.clamp(1, 50);
+    let sort = normalize_sort(query.sort);
+    match query.provider {
+        Provider::Modrinth | Provider::Mcim => search_url_with(query),
         Provider::Curseforge => {
             let mut url = format!(
-                "{}/mods/search?gameId={CURSEFORGE_GAME_ID}&classId={class_id}&searchFilter={}&index={}&pageSize={}",
-                provider.curseforge_root(),
-                url_encode(query),
-                offset,
-                limit
+                "{}/mods/search?gameId={CURSEFORGE_GAME_ID}&classId={class_id}&searchFilter={}&index={}&pageSize={}&sortField={}&sortOrder=desc",
+                curseforge_root_for(query.provider, has_key),
+                url_encode(query.query),
+                query.offset,
+                limit,
+                curseforge_sort_field(sort)
             );
-            if let Some(version) = mc_version.filter(|value| !value.trim().is_empty()) {
-                url.push_str(&format!("&gameVersion={}", url_encode(version.trim())));
+            if let Some(version) = query.mc_version.map(str::trim).filter(|value| !value.is_empty()) {
+                url.push_str(&format!("&gameVersion={}", url_encode(version)));
             }
-            if let Some(loader) = loader.filter(|value| !value.trim().is_empty()) {
-                // 4=Fabric 5=Forge 6=NeoForge 1=Forge(旧) —— 只区分 fabric/forge
-                let loader_type = match loader.trim().to_lowercase().as_str() {
-                    "fabric" | "quilt" => 4,
-                    "forge" => 1,
-                    "neoforge" => 6,
-                    _ => 0,
-                };
-                if loader_type > 0 {
+            if let Some(loader) = query.loader.map(str::trim).filter(|value| !value.is_empty()) {
+                if let Some(loader_type) = curseforge_loader_type(loader) {
                     url.push_str(&format!("&modLoaderType={loader_type}"));
                 }
+            }
+            if !query.category_ids.is_empty() {
+                let ids: Vec<String> = query.category_ids.iter().map(u32::to_string).collect();
+                url.push_str(&format!("&categoryIds={}", ids.join(",")));
             }
             Ok(url)
         }
     }
+}
+
+/// 详情地址（CurseForge 无 Key 时走镜像）。
+pub fn detail_url_for(provider: Provider, has_key: bool, project_id: &str) -> Result<String> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::Invalid("项目 id 不能为空".to_string()));
+    }
+    Ok(match provider {
+        Provider::Modrinth | Provider::Mcim => format!(
+            "{}/project/{}",
+            provider.modrinth_root(),
+            url_encode(project_id.trim())
+        ),
+        Provider::Curseforge => format!(
+            "{}/mods/{}",
+            curseforge_root_for(provider, has_key),
+            url_encode(project_id.trim())
+        ),
+    })
+}
+
+/// 版本列表地址（CurseForge 无 Key 时走镜像）。
+pub fn versions_url_for(
+    provider: Provider,
+    has_key: bool,
+    project_id: &str,
+    mc_version: Option<&str>,
+    loader: Option<&str>,
+) -> Result<String> {
+    if project_id.trim().is_empty() {
+        return Err(AppError::Invalid("项目 id 不能为空".to_string()));
+    }
+    match provider {
+        Provider::Modrinth | Provider::Mcim => versions_url(provider, project_id, mc_version, loader),
+        Provider::Curseforge => Ok(format!(
+            "{}/mods/{}/files?pageSize=50",
+            curseforge_root_for(provider, has_key),
+            url_encode(project_id.trim())
+        )),
+    }
+}
+
+// ------------------------------------------------------------------ 下载通道
+
+/// 把原始下载地址改写成 MCIM 镜像地址；改写不了返回 None。
+pub fn mirror_download_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() || url.contains("mod.mcimirror.top") {
+        return None;
+    }
+    // Modrinth CDN：cdn.modrinth.com/data/<项目>/<版本>/<文件>
+    if let Some(rest) = url
+        .strip_prefix("https://cdn.modrinth.com/")
+        .or_else(|| url.strip_prefix("http://cdn.modrinth.com/"))
+    {
+        return Some(format!("{MCIM_BASE}/modrinth/{rest}"));
+    }
+    // CurseForge CDN：edge/media.forgecdn.net/files/<head>/<tail4>/<文件> → 还原成文件 id
+    for host in [
+        "https://edge.forgecdn.net/files/",
+        "http://edge.forgecdn.net/files/",
+        "https://media.forgecdn.net/files/",
+        "http://media.forgecdn.net/files/",
+        "https://beta.curseforge.com/files/",
+    ] {
+        if let Some(rest) = url.strip_prefix(host) {
+            let mut parts = rest.split('/');
+            let (head, tail, file) = (parts.next()?, parts.next()?, parts.next()?);
+            if head.is_empty() || tail.len() != 4 || file.is_empty() {
+                return None;
+            }
+            let id: u64 = format!("{head}{tail}").parse().ok()?;
+            return Some(format!(
+                "{MCIM_BASE}/curseforge/files/{id}/{}",
+                url_encode(file)
+            ));
+        }
+    }
+    None
+}
+
+/// 关掉翻译：标题/简介回落到原文，translated 恒为 false。
+pub fn disable_translation(items: &mut [ContentItem]) {
+    for item in items.iter_mut() {
+        item.title = item.title_original.clone();
+        item.summary = item.summary_original.clone();
+        item.translated = false;
+    }
+}
+
+/// 按设置选下载地址：via_mcim=true 时优先镜像。
+pub fn preferred_download_url(url: &str, via_mcim: bool) -> Option<String> {
+    if !via_mcim {
+        return None;
+    }
+    mirror_download_url(url)
+}
+
+/// 下载一个文件内容：先试镜像（成功就直接用），失败（404/超时/网络错）回退原始地址。
+pub async fn download_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    via_mcim: bool,
+) -> Result<Vec<u8>> {
+    let mirror = preferred_download_url(url, via_mcim);
+    let mut last_error = String::new();
+    if let Some(mirror) = mirror.as_deref() {
+        match get_bytes(client, mirror).await {
+            Ok(bytes) => {
+                tracing::info!(url = %mirror, bytes = bytes.len(), "内容下载走 MCIM 镜像");
+                return Ok(bytes);
+            }
+            Err(err) => {
+                last_error = err.to_string();
+                tracing::warn!(url = %mirror, %err, "MCIM 镜像下载失败，回退原始地址");
+            }
+        }
+    }
+    match get_bytes(client, url).await {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            if last_error.is_empty() {
+                Err(err)
+            } else {
+                Err(AppError::Net(format!("{err}（镜像也不可用：{last_error}）")))
+            }
+        }
+    }
+}
+
+async fn get_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| AppError::Net(format!("下载失败：{err}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Net(format!(
+            "下载失败：HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|err| AppError::Net(format!("读取下载内容失败：{err}")))
+}
+
+// ------------------------------------------------------------------ CurseForge 分类缓存
+
+/// 分类缓存有效期 24 小时。
+pub const CATEGORY_TTL_SECS: u64 = 24 * 3600;
+
+/// name/slug（小写）→ 分类 id。
+pub type CategoryIds = std::collections::HashMap<String, u32>;
+
+static CATEGORY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(u64, CategoryIds)>>> =
+    std::sync::OnceLock::new();
+
+fn category_cache() -> &'static std::sync::Mutex<Option<(u64, CategoryIds)>> {
+    CATEGORY_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+pub fn category_cache_is_fresh(fetched_at: u64, now: u64) -> bool {
+    now.saturating_sub(fetched_at) < CATEGORY_TTL_SECS
+}
+
+/// /v1/categories?gameId=432 的地址。
+pub fn categories_url(provider: Provider) -> String {
+    format!(
+        "{}/categories?gameId={CURSEFORGE_GAME_ID}",
+        provider.curseforge_root()
+    )
+}
+
+/// 解析分类响应：name 与 slug 都建索引（都小写）。
+pub fn parse_categories(json: &str) -> Result<CategoryIds> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|err| AppError::Net(format!("分类列表格式不对：{err}")))?;
+    let data = value
+        .get("data")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| AppError::Net("分类列表缺少 data".to_string()))?;
+    let mut ids = CategoryIds::new();
+    for entry in data {
+        let Some(id) = entry.get("id").and_then(|item| item.as_u64()) else {
+            continue;
+        };
+        for key in ["name", "slug"] {
+            if let Some(text) = entry.get(key).and_then(|item| item.as_str()) {
+                let trimmed = text.trim().to_lowercase();
+                if !trimmed.is_empty() {
+                    ids.insert(trimmed, id as u32);
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// 从缓存里查名字 → id（缓存过期/缺失返回 None）。
+pub fn cached_category_ids(names: &[String], now: u64) -> Option<Vec<u32>> {
+    let guard = category_cache().lock().ok()?;
+    let (fetched_at, ids) = guard.as_ref()?;
+    if !category_cache_is_fresh(*fetched_at, now) {
+        return None;
+    }
+    Some(lookup_category_ids(ids, names))
+}
+
+fn lookup_category_ids(ids: &CategoryIds, names: &[String]) -> Vec<u32> {
+    let mut out = Vec::new();
+    for name in names {
+        let key = name.trim().to_lowercase();
+        match ids.get(&key) {
+            Some(id) => out.push(*id),
+            None => tracing::warn!(category = %name, "CurseForge 分类名没查到 id，忽略"),
+        }
+    }
+    out
+}
+
+/// 把名字换成 CurseForge 的 categoryIds（缓存 24h，过期重新拉一次）。
+pub async fn resolve_category_ids(
+    client: &reqwest::Client,
+    provider: Provider,
+    api_key: Option<&str>,
+    names: &[String],
+) -> Result<Vec<u32>> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = crate::util::now_unix();
+    if let Some(ids) = cached_category_ids(names, now) {
+        return Ok(ids);
+    }
+    let text = http_text(client, &categories_url(provider), api_key).await?;
+    let ids = parse_categories(&text)?;
+    let resolved = lookup_category_ids(&ids, names);
+    if let Ok(mut guard) = category_cache().lock() {
+        *guard = Some((now, ids));
+    }
+    Ok(resolved)
 }
 
 pub fn detail_url(provider: Provider, project_id: &str) -> Result<String> {
@@ -662,11 +1085,12 @@ pub async fn install_mod(
     project_id: &str,
     version_id: &str,
     api_key: Option<&str>,
+    via_mcim: bool,
     task: &crate::tasks::TaskHandle,
 ) -> Result<std::path::PathBuf> {
     use crate::events::Phase;
     task.progress(Phase::Downloading, "正在读取版本文件列表", 0, 0);
-    let url = versions_url(provider, project_id, None, None)?;
+    let url = versions_url_for(provider, api_key.is_some(), project_id, None, None)?;
     let text = http_text(client, &url, api_key).await?;
     let versions = parse_versions(provider, &text)?;
     let chosen = versions
@@ -694,21 +1118,7 @@ pub async fn install_mod(
     let target = dir.join(crate::mods::validate_file_name(&file_name).map(|_| file_name.clone())?);
 
     task.progress(Phase::Downloading, &format!("正在下载 {file_name}"), 0, 0);
-    let response = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|err| AppError::Net(format!("下载模组失败：{err}")))?;
-    if !response.status().is_success() {
-        return Err(AppError::Net(format!(
-            "下载模组失败：HTTP {}",
-            response.status().as_u16()
-        )));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| AppError::Net(format!("读取模组内容失败：{err}")))?;
+    let bytes = download_bytes(client, &download_url, via_mcim).await?;
     let tmp = target.with_extension("part");
     std::fs::write(&tmp, &bytes)?;
     if let Some(expected) = &chosen.sha1 {
@@ -947,5 +1357,278 @@ mod tests {
             items[0].download_url.as_deref(),
             Some("https://edge.forgecdn.net/files/424/2424/jei.jar")
         );
+    }
+
+    // ------------------------------------------------ 筛选与插件类型（M10）
+
+    fn cats(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn facets_of(query: SearchQuery<'_>) -> String {
+        let url = search_url_with(&query).unwrap();
+        url.split("facets=").nth(1).expect("没有 facets 参数").to_string()
+    }
+
+    fn modrinth_query<'a>(sort: &'a str, loader: Option<&'a str>, categories: &'a [String]) -> SearchQuery<'a> {
+        SearchQuery {
+            provider: Provider::Modrinth,
+            kind: "mod",
+            query: "sodium",
+            mc_version: Some("1.20.1"),
+            loader,
+            categories,
+            sort: Some(sort),
+            category_ids: &[],
+            offset: 0,
+            limit: 20,
+        }
+    }
+
+    #[test]
+    fn modrinth_sort_maps_to_index_for_all_four_tiers() {
+        assert_eq!(modrinth_index(normalize_sort(Some("relevance"))), "relevance");
+        assert_eq!(modrinth_index(normalize_sort(Some("downloads"))), "downloads");
+        assert_eq!(modrinth_index(normalize_sort(Some("updated"))), "updated");
+        assert_eq!(modrinth_index(normalize_sort(Some("newest"))), "newest");
+        // 不认识的档位回落到 relevance
+        assert_eq!(normalize_sort(Some("follows")), "relevance");
+        assert_eq!(normalize_sort(None), "relevance");
+        assert_eq!(curseforge_sort_field("downloads"), 6);
+        assert_eq!(curseforge_sort_field("updated"), 3);
+        assert_eq!(curseforge_sort_field("newest"), 11);
+        assert_eq!(curseforge_sort_field("relevance"), 2);
+        let url = search_url_with(&modrinth_query("downloads", None, &[])).unwrap();
+        assert!(url.contains("index=downloads"), "{url}");
+        assert!(url.contains("offset=0"));
+        assert!(url.contains("limit=20"));
+    }
+
+    #[test]
+    fn modrinth_facets_put_each_filter_in_its_own_and_group() {
+        let categories = cats(&["optimization"]);
+        let facets = facets_of(modrinth_query("downloads", Some("Fabric"), &categories));
+        let decoded = facets
+            .replace("%5B", "[")
+            .replace("%5D", "]")
+            .replace("%22", "\"")
+            .replace("%3A", ":")
+            .replace("%2C", ",");
+        assert_eq!(
+            decoded,
+            "[[\"project_type:mod\"],[\"versions:1.20.1\"],[\"categories:fabric\"],[\"categories:optimization\"]]"
+        );
+    }
+
+    #[test]
+    fn modrinth_facets_ors_multiple_categories() {
+        let categories = cats(&["optimization", "storage", "technology"]);
+        let facets = modrinth_facets("mod", Some("1.20.1"), None, &categories);
+        assert_eq!(facets.len(), 3, "{facets:?}");
+        assert_eq!(
+            facets[2],
+            "[\"categories:optimization\",\"categories:storage\",\"categories:technology\"]"
+        );
+    }
+
+    #[test]
+    fn empty_filters_are_not_appended() {
+        let facets = modrinth_facets("mod", None, Some("  "), &[]);
+        assert_eq!(facets, vec!["[\"project_type:mod\"]".to_string()]);
+        let categories = cats(&["  "]);
+        let facets = modrinth_facets("mod", Some(""), Some(""), &categories);
+        assert_eq!(facets, vec!["[\"project_type:mod\"]".to_string()]);
+    }
+
+    #[test]
+    fn plugin_kind_maps_to_modrinth_plugin_and_curseforge_bukkit() {
+        // classId=5 实测自 GET /v1/categories?gameId=432（Bukkit Plugins）
+        assert_eq!(kind_mapping("plugin").unwrap(), ("plugin", 5));
+        assert!(kind_supported(Provider::Modrinth, "plugin"));
+        assert!(kind_supported(Provider::Curseforge, "plugin"));
+        assert!(kind_supported(Provider::Mcim, "plugin"));
+        let url = search_url(Provider::Curseforge, "plugin", "", Some("1.20.1"), None, 0, 20).unwrap();
+        assert!(url.contains("classId=5"), "{url}");
+    }
+
+    #[test]
+    fn plugin_loaders_become_category_facets() {
+        assert_eq!(PLUGIN_LOADERS.len(), 7);
+        for loader in PLUGIN_LOADERS {
+            let facets = modrinth_facets("plugin", Some("1.20.1"), Some(loader), &[]);
+            assert_eq!(facets[0], "[\"project_type:plugin\"]");
+            assert_eq!(facets[2], format!("[\"categories:{loader}\"]"));
+            // CurseForge 没有插件加载器枚举，不能瞎塞 modLoaderType
+            assert_eq!(curseforge_loader_type(loader), None);
+        }
+        assert_eq!(curseforge_loader_type("forge"), Some(1));
+        assert_eq!(curseforge_loader_type("Fabric"), Some(4));
+        assert_eq!(curseforge_loader_type("quilt"), Some(5));
+        assert_eq!(curseforge_loader_type("neoforge"), Some(6));
+    }
+
+    #[test]
+    fn curseforge_url_carries_every_filter() {
+        let categories = cats(&["optimization"]);
+        let ids = [1534u32];
+        let url = search_url_with(&SearchQuery {
+            provider: Provider::Curseforge,
+            kind: "mod",
+            query: "sodium",
+            mc_version: Some("1.20.1"),
+            loader: Some("fabric"),
+            categories: &categories,
+            sort: Some("downloads"),
+            category_ids: &ids,
+            offset: 40,
+            limit: 20,
+        })
+        .unwrap();
+        assert!(url.starts_with("https://api.curseforge.com/v1/mods/search?gameId=432&classId=6"));
+        assert!(url.contains("searchFilter=sodium"));
+        assert!(url.contains("index=40"));
+        assert!(url.contains("pageSize=20"));
+        assert!(url.contains("sortField=6"));
+        assert!(url.contains("sortOrder=desc"));
+        assert!(url.contains("gameVersion=1.20.1"));
+        assert!(url.contains("modLoaderType=4"));
+        assert!(url.contains("categoryIds=1534"), "{url}");
+    }
+
+    #[test]
+    fn mcim_mirror_follows_the_same_two_paths() {
+        let categories = cats(&["optimization"]);
+        let modrinth = search_url_with(&SearchQuery {
+            provider: Provider::Mcim,
+            kind: "plugin",
+            query: "essentialsx",
+            mc_version: Some("1.20.1"),
+            loader: Some("paper"),
+            categories: &categories,
+            sort: Some("newest"),
+            category_ids: &[],
+            offset: 0,
+            limit: 20,
+        })
+        .unwrap();
+        assert!(modrinth.starts_with("https://mod.mcimirror.top/modrinth/v2/search"));
+        assert!(modrinth.contains("index=newest"));
+        // mcim 的搜索永远走镜像的 Modrinth 路径（CurseForge 那边只有文件与分类接口）
+        assert!(modrinth.contains("facets="));
+        use_curseforge_mirror_for_categories();
+    }
+
+    /// mcim 的 CurseForge 侧确实存在（分类接口实测可用），搜索仍走 Modrinth 镜像。
+    fn use_curseforge_mirror_for_categories() {
+        assert_eq!(
+            categories_url(Provider::Mcim),
+            "https://mod.mcimirror.top/curseforge/v1/categories?gameId=432"
+        );
+    }
+
+// ------------------------------------------------ 无 Key 走镜像 / 下载通道
+
+    #[test]
+    fn download_urls_are_rewritten_to_the_mcim_mirror() {
+        assert_eq!(
+            mirror_download_url("https://cdn.modrinth.com/data/AANobbMI/versions/abc/sodium.jar")
+                .as_deref(),
+            Some("https://mod.mcimirror.top/modrinth/data/AANobbMI/versions/abc/sodium.jar")
+        );
+        // CurseForge 的 CDN 路径要还原成文件 id
+        assert_eq!(
+            mirror_download_url("https://edge.forgecdn.net/files/424/2424/jei.jar").as_deref(),
+            Some("https://mod.mcimirror.top/curseforge/files/4242424/jei.jar")
+        );
+        assert_eq!(
+            mirror_download_url("https://media.forgecdn.net/files/5123/4567/a b.jar").as_deref(),
+            Some("https://mod.mcimirror.top/curseforge/files/51234567/a%20b.jar")
+        );
+        // 认不出来的地址、已经镜像过的地址都不改写
+        assert!(mirror_download_url("https://example.com/x.jar").is_none());
+        assert!(mirror_download_url("https://mod.mcimirror.top/curseforge/files/1/a.jar").is_none());
+        assert!(mirror_download_url("  ").is_none());
+        // 关闭设置时一律不改写
+        assert!(preferred_download_url("https://cdn.modrinth.com/data/a/b/c.jar", false).is_none());
+        assert_eq!(
+            preferred_download_url("https://cdn.modrinth.com/data/a/b/c.jar", true).as_deref(),
+            Some("https://mod.mcimirror.top/modrinth/data/a/b/c.jar")
+        );
+    }
+
+    #[test]
+    fn curseforge_without_key_goes_through_the_mirror() {
+        assert_eq!(mcim_curseforge_root(), "https://mod.mcimirror.top/curseforge/v1");
+        assert_eq!(effective_provider(Provider::Curseforge, false), Provider::Mcim);
+        assert_eq!(effective_provider(Provider::Curseforge, true), Provider::Curseforge);
+        let categories = cats(&["optimization"]);
+        let query = SearchQuery {
+            provider: Provider::Curseforge,
+            kind: "mod",
+            query: "sodium",
+            mc_version: Some("1.20.1"),
+            loader: Some("fabric"),
+            categories: &categories,
+            sort: Some("downloads"),
+            category_ids: &[1534],
+            offset: 0,
+            limit: 20,
+        };
+        let mirror = search_url_for(&query, false).unwrap();
+        assert!(mirror.starts_with("https://mod.mcimirror.top/curseforge/v1/mods/search"), "{mirror}");
+        assert!(mirror.contains("classId=6"));
+        assert!(mirror.contains("categoryIds=1534"));
+        let official = search_url_for(&query, true).unwrap();
+        assert!(official.starts_with("https://api.curseforge.com/v1/mods/search"), "{official}");
+        // 详情/版本同样处理
+        let mirror_detail = detail_url_for(Provider::Curseforge, false, "238222").unwrap();
+        assert_eq!(mirror_detail, "https://mod.mcimirror.top/curseforge/v1/mods/238222");
+        let official_detail = detail_url_for(Provider::Curseforge, true, "238222").unwrap();
+        assert_eq!(official_detail, "https://api.curseforge.com/v1/mods/238222");
+        let mirror_versions = versions_url_for(Provider::Curseforge, false, "238222", None, None).unwrap();
+        assert!(mirror_versions.starts_with("https://mod.mcimirror.top/curseforge/v1/mods/238222/files"));
+        let official_versions = versions_url_for(Provider::Curseforge, true, "238222", None, None).unwrap();
+        assert!(official_versions.starts_with("https://api.curseforge.com/v1/mods/238222/files"));
+    }
+
+    #[test]
+    fn disabled_translation_returns_originals() {
+        let json = r#"{"hits":[{"project_id":"abc","title":"Sodium","description":"A mod","downloads":1,"categories":["optimization"],"loaders":["fabric"]}],"total_hits":1}"#;
+        let mut page = parse_search(Provider::Modrinth, json, "mod", 1, 20).unwrap();
+        page.items[0].title = "钠".to_string();
+        page.items[0].summary = "一个模组".to_string();
+        page.items[0].translated = true;
+        disable_translation(&mut page.items);
+        assert_eq!(page.items[0].title, page.items[0].title_original);
+        assert_eq!(page.items[0].summary, page.items[0].summary_original);
+        assert!(!page.items[0].translated);
+        assert_eq!(page.items[0].title, "Sodium");
+    }
+
+    #[test]
+    fn categories_parse_into_lowercase_name_and_slug_index() {
+        let json = r#"{"data":[
+            {"id":5,"name":"Bukkit Plugins","slug":"bukkit-plugins"},
+            {"id":6,"name":"Mods","slug":"mc-mods"},
+            {"id":1534,"name":"Optimization","slug":"optimization"},
+            {"name":"没有 id"}]}"#;
+        let ids = parse_categories(json).unwrap();
+        assert_eq!(ids.get("bukkit plugins"), Some(&5));
+        assert_eq!(ids.get("bukkit-plugins"), Some(&5));
+        assert_eq!(ids.get("optimization"), Some(&1534));
+        assert_eq!(ids.get("mc-mods"), Some(&6));
+        assert_eq!(ids.len(), 5);
+        assert_eq!(categories_url(Provider::Curseforge), "https://api.curseforge.com/v1/categories?gameId=432");
+        assert!(categories_url(Provider::Mcim).starts_with("https://mod.mcimirror.top/curseforge/v1/categories"));
+        assert!(parse_categories("{}").is_err());
+    }
+
+    #[test]
+    fn category_cache_expires_after_24_hours() {
+        assert!(category_cache_is_fresh(1_000, 1_000));
+        assert!(category_cache_is_fresh(1_000, 1_000 + CATEGORY_TTL_SECS - 1));
+        assert!(!category_cache_is_fresh(1_000, 1_000 + CATEGORY_TTL_SECS));
+        // 没拉过时缓存里查不到
+        assert!(cached_category_ids(&cats(&["optimization"]), crate::util::now_unix()).is_none());
     }
 }

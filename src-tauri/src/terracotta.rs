@@ -22,6 +22,26 @@ use crate::tasks::TaskHandle;
 use crate::util;
 
 pub const RELEASE: &str = "v0.4.2";
+/// 内嵌在安装包里的资源目录（tauri.conf.json 的 bundle.resources）。
+pub const BUNDLED_DIR: &str = "resources/terracotta";
+pub const BUNDLED_EXE_NAME: &str = "terracotta.exe";
+pub const BUNDLED_LICENSE_NAME: &str = "LICENSE-AGPL-3.0.txt";
+pub const BUNDLED_SOURCE_NAME: &str = "SOURCE.txt";
+/// 内嵌二进制的体积与 sha256（复制后按它校验，SOURCE.txt 里也是同一份数字）。
+pub const BUNDLED_EXE_SIZE: u64 = 9_402_880;
+pub const BUNDLED_EXE_SHA256: &str =
+    "74c10568a7fea9c1d38cf8d2d4ca90baf1517f8e5a26c63d3349db70bc449796";
+/// 内嵌版本（与上游 release 对应）。
+/// 内嵌的 VC 运行库（缺它时 terracotta.exe 在这类机器上跑不起来）。
+pub const BUNDLED_DLL_NAME: &str = "VCRUNTIME140.DLL";
+pub const BUNDLED_DLL_SIZE: u64 = 97_656;
+pub const BUNDLED_DLL_SHA256: &str =
+    "475ab98b7722e965bd38c8fa6ed23502309582ccf294ff1061cb290c7988f0d1";
+pub const BUNDLED_VERSION: &str = "0.4.2";
+pub const TERRACOTTA_LICENSE: &str = "AGPL-3.0";
+pub const TERRACOTTA_HOMEPAGE: &str = "https://github.com/burningtnt/Terracotta";
+/// 记录「本地这份陶瓦是从哪来的」的标记文件。
+pub const STAMP_FILE: &str = ".gugu-terracotta.json";
 pub const ARCHIVE_NAME: &str = "terracotta-0.4.2-windows-x86_64-pkg.tar.gz";
 pub const EXE_NAME: &str = "terracotta.exe";
 pub const DLL_NAME: &str = "VCRUNTIME140.DLL";
@@ -56,6 +76,54 @@ pub fn terracotta_dir(paths: &Paths) -> PathBuf {
     paths.root.join("terracotta")
 }
 
+/// 内嵌资源的候选目录：安装包（exe 同级的 resources/）→ 开发期（target/debug 或 src-tauri）。
+pub fn bundled_dir_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join(BUNDLED_DIR.replace('/', &std::path::MAIN_SEPARATOR.to_string())));
+            // NSIS 装完之后资源可能落在 exe 同级的 terracotta/
+            out.push(dir.join("terracotta"));
+            // target/debug 上两级就是 src-tauri（cargo run 开发期）
+            if let Some(up) = dir.parent().and_then(|parent| parent.parent()) {
+                out.push(up.join(BUNDLED_DIR.replace('/', &std::path::MAIN_SEPARATOR.to_string())));
+            }
+        }
+    }
+    out.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(BUNDLED_DIR.replace('/', &std::path::MAIN_SEPARATOR.to_string())),
+    );
+    out
+}
+
+/// 找到内嵌的 terracotta.exe（找不到返回 None，调用方回退到下载）。
+pub fn bundled_exe() -> Option<PathBuf> {
+    bundled_dir_candidates()
+        .into_iter()
+        .map(|dir| dir.join(BUNDLED_EXE_NAME))
+        .find(|path| path.is_file())
+}
+
+/// 内嵌资源目录（用于报错时提示路径）。
+pub fn bundled_dir() -> Option<PathBuf> {
+    bundled_exe().and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+/// 这份可执行文件是不是内嵌版本（体积 + sha256 都对得上）。
+pub fn is_bundled_copy(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != BUNDLED_EXE_SIZE {
+        return false;
+    }
+    match crate::util::sha256_file(path) {
+        Ok(hash) => hash.eq_ignore_ascii_case(BUNDLED_EXE_SHA256),
+        Err(_) => false,
+    }
+}
+
 pub fn exe_path(paths: &Paths) -> PathBuf {
     terracotta_dir(paths).join(EXE_NAME)
 }
@@ -77,6 +145,11 @@ pub struct TeraPlayer {
 pub struct TeraStatus {
     pub installed: bool,
     pub version: String,
+    /// 本地这份二进制从哪来：bundled（安装包内嵌）/ downloaded（联网下载）
+    pub source: String,
+    /// 许可（内嵌分发的合规信息）
+    pub license: String,
+    pub homepage: String,
     pub hosting: bool,
     pub players: Vec<TeraPlayer>,
     pub room_code: String,
@@ -94,6 +167,7 @@ pub(crate) struct Inner {
     players: Vec<TeraPlayer>,
     error: Option<String>,
     version: String,
+    source: String,
     index: i64,
     stop_flag: Arc<AtomicBool>,
     poller: Option<tokio::task::JoinHandle<()>>,
@@ -110,6 +184,7 @@ impl Default for Inner {
             players: Vec::new(),
             error: None,
             version: String::new(),
+            source: String::new(),
             index: -1,
             stop_flag: Arc::new(AtomicBool::new(false)),
             poller: None,
@@ -522,6 +597,7 @@ impl TeraRuntime {
                             let _ = std::fs::remove_file(&archive);
                             if let Ok(mut guard) = self.inner.lock() {
                                 guard.version = RELEASE.trim_start_matches('v').to_string();
+                                guard.source = "downloaded".to_string();
                                 guard.error = None;
                             }
                             task.progress_forced(Phase::Finished, "陶瓦联机安装完成", 1, 1);
@@ -542,13 +618,238 @@ impl TeraRuntime {
     }
 }
 
+/// terracotta_ensure 的返回：来源与版本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeraEnsure {
+    /// bundled | downloaded
+    pub source: String,
+    pub version: String,
+}
+
+/// 复制内嵌二进制并按 sha256 校验（源头与常量不一致时只告警，仍按源头校验）。
+pub fn deploy_bundled(bundled: &Path, target: &Path) -> Result<String> {
+    let source_hash = crate::util::sha256_file(bundled).map_err(|err| {
+        AppError::Other(format!("读取内嵌陶瓦失败（{}）：{err}", bundled.display()))
+    })?;
+    if !source_hash.eq_ignore_ascii_case(BUNDLED_EXE_SHA256) {
+        tracing::warn!(
+            expected = BUNDLED_EXE_SHA256,
+            actual = %source_hash,
+            "内嵌陶瓦的 sha256 与常量不一致（资源被更新过？），按资源本身校验"
+        );
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(bundled, target).map_err(|err| {
+        AppError::Other(format!(
+            "部署内嵌陶瓦失败（{} → {}）：{err}",
+            bundled.display(),
+            target.display()
+        ))
+    })?;
+    let target_hash = crate::util::sha256_file(target).map_err(|err| {
+        AppError::Other(format!("校验内嵌陶瓦失败（{}）：{err}", target.display()))
+    })?;
+    if !target_hash.eq_ignore_ascii_case(&source_hash) {
+        let _ = std::fs::remove_file(target);
+        return Err(AppError::Other(format!(
+            "内嵌陶瓦复制后校验失败：源 {source_hash} / 目标 {target_hash}"
+        )));
+    }
+    Ok(target_hash)
+}
+
+/// 复制内嵌 VC 运行库并按 sha256 校验；内嵌资源里没有 DLL 时返回 Ok(None)。
+pub fn deploy_bundled_dll(bundled_dir: &Path, target_dir: &Path) -> Result<Option<String>> {
+    let source = bundled_dir.join(BUNDLED_DLL_NAME);
+    if !source.is_file() {
+        return Ok(None);
+    }
+    let source_hash = crate::util::sha256_file(&source).map_err(|err| {
+        AppError::Other(format!(
+            "读取内嵌 VC 运行库失败（{}）：{err}",
+            source.display()
+        ))
+    })?;
+    if !source_hash.eq_ignore_ascii_case(BUNDLED_DLL_SHA256) {
+        tracing::warn!(
+            expected = BUNDLED_DLL_SHA256,
+            actual = %source_hash,
+            "内嵌 VC 运行库的 sha256 与常量不一致（资源被更新过？），按资源本身校验"
+        );
+    }
+    std::fs::create_dir_all(target_dir)?;
+    let target = target_dir.join(DLL_NAME);
+    std::fs::copy(&source, &target).map_err(|err| {
+        AppError::Other(format!(
+            "部署内嵌 VC 运行库失败（{} → {}）：{err}",
+            source.display(),
+            target.display()
+        ))
+    })?;
+    let target_hash = crate::util::sha256_file(&target).map_err(|err| {
+        AppError::Other(format!("校验内嵌 VC 运行库失败（{}）：{err}", target.display()))
+    })?;
+    if !target_hash.eq_ignore_ascii_case(&source_hash) {
+        let _ = std::fs::remove_file(&target);
+        return Err(AppError::Other(format!(
+            "内嵌 VC 运行库复制后校验失败：源 {source_hash} / 目标 {target_hash}"
+        )));
+    }
+    Ok(Some(target_hash))
+}
+
+/// 本地这份陶瓦能不能直接用：exe 是内嵌副本，且 VC 运行库在位。
+pub fn local_bundled_usable(exe: &Path, dll: &Path) -> bool {
+    exe.is_file() && is_bundled_copy(exe) && dll.is_file()
+}
+
+impl TeraRuntime {
+    fn set_source(&self, source: &str, version: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.source = source.to_string();
+            if !version.is_empty() {
+                guard.version = version.to_string();
+            }
+        }
+    }
+
+    /// 写一份来源标记（.mc/terracotta/.gugu-terracotta.json），方便排查。
+    fn write_stamp(&self, dir: &Path, source: &str, hash: &str) {
+        let stamp = serde_json::json!({
+            "source": source,
+            "version": BUNDLED_VERSION,
+            "license": TERRACOTTA_LICENSE,
+            "homepage": TERRACOTTA_HOMEPAGE,
+            "sha256": hash,
+            "installedAt": crate::util::now_unix(),
+        });
+        let path = dir.join(STAMP_FILE);
+        let text = serde_json::to_string_pretty(&stamp).unwrap_or_default();
+        if let Err(err) = std::fs::write(&path, text) {
+            tracing::warn!(%err, path = %path.display(), "写陶瓦来源标记失败");
+        }
+    }
+
+    /// 确保本地有可用的陶瓦：优先从安装包里复制内嵌二进制，内嵌缺失才回退到下载。
+    ///
+    /// 判定规则：本地 exe 不存在 / 不是内嵌版本的 hash / 缺少 VCRUNTIME140.DLL → 需要修复。
+    pub async fn ensure(
+        &self,
+        client: &reqwest::Client,
+        paths: &Paths,
+        task: &TaskHandle,
+    ) -> Result<TeraEnsure> {
+        let dir = terracotta_dir(paths);
+        std::fs::create_dir_all(&dir)?;
+        let exe = exe_path(paths);
+        let dll_path = dir.join(DLL_NAME);
+        let mut dll_ready = dll_path.is_file();
+        if local_bundled_usable(&exe, &dll_path) {
+            self.set_source("bundled", BUNDLED_VERSION);
+            tracing::info!(
+                version = BUNDLED_VERSION,
+                license = TERRACOTTA_LICENSE,
+                homepage = TERRACOTTA_HOMEPAGE,
+                "使用内嵌陶瓦 v{}",
+                BUNDLED_VERSION
+            );
+            return Ok(TeraEnsure {
+                source: "bundled".to_string(),
+                version: BUNDLED_VERSION.to_string(),
+            });
+        }
+
+        if let Some(bundled) = bundled_exe() {
+            task.progress_forced(Phase::Extracting, "正在部署内嵌陶瓦联机", 0, 0);
+            match deploy_bundled(&bundled, &exe) {
+                Ok(hash) => {
+                    self.write_stamp(&dir, "bundled", &hash);
+                    self.set_source("bundled", BUNDLED_VERSION);
+                    // 顺手把 VC 运行库一起部署（缺它的话 terracotta.exe 起不来）
+                    if let Some(parent) = bundled.parent() {
+                        match deploy_bundled_dll(parent, &dir) {
+                            Ok(Some(dll_hash)) => {
+                                dll_ready = true;
+                                tracing::info!(
+                                    dll = DLL_NAME,
+                                    bytes = BUNDLED_DLL_SIZE,
+                                    sha256 = %dll_hash,
+                                    "已部署内嵌 VC 运行库"
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    missing = DLL_NAME,
+                                    "内嵌资源不含 VCRUNTIME140.DLL，回退到完整下载"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "部署内嵌 VC 运行库失败，回退到完整下载");
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        version = BUNDLED_VERSION,
+                        from = %bundled.display(),
+                        to = %exe.display(),
+                        bytes = BUNDLED_EXE_SIZE,
+                        sha256 = %hash,
+                        license = TERRACOTTA_LICENSE,
+                        with_vc_runtime = dll_ready,
+                        "从内嵌资源恢复陶瓦 v{}（含 VC 运行库）",
+                        BUNDLED_VERSION
+                    );
+                    tracing::info!("使用内嵌陶瓦 v{}", BUNDLED_VERSION);
+                    if dll_ready {
+                        task.progress_forced(Phase::Finished, "内嵌陶瓦已就绪", 1, 1);
+                        return Ok(TeraEnsure {
+                            source: "bundled".to_string(),
+                            version: BUNDLED_VERSION.to_string(),
+                        });
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "部署内嵌陶瓦失败，回退到下载");
+                }
+            }
+        } else {
+            tracing::warn!("安装包里没有内嵌陶瓦资源，回退到下载");
+        }
+
+        let version = self.install(client, paths, task).await?;
+        self.set_source("downloaded", &version);
+        self.write_stamp(&dir, "downloaded", "");
+        Ok(TeraEnsure {
+            source: "downloaded".to_string(),
+            version,
+        })
+    }
+}
+
 /// 除 waiting/idle/exception 之外都算「正在进行中」（hosting/guesting 给前端用）。
 pub fn is_active_state(state: &str) -> bool {
     !matches!(state, "" | "waiting" | "idle" | "exception")
 }
 
+/// 本地这份二进制是从哪来的：内嵌副本（hash 对得上）就是 bundled，否则是联网下载的。
+pub fn source_of(paths: &Paths) -> String {
+    let exe = exe_path(paths);
+    if !exe.is_file() {
+        return String::new();
+    }
+    if is_bundled_copy(&exe) {
+        "bundled".to_string()
+    } else {
+        "downloaded".to_string()
+    }
+}
+
 fn status_of(inner: &Arc<Mutex<Inner>>, paths: &Paths) -> TeraStatus {
     let installed = TeraRuntime::installed(paths);
+    let detected = source_of(paths);
     match inner.lock() {
         Ok(guard) => TeraStatus {
             installed,
@@ -557,6 +858,13 @@ fn status_of(inner: &Arc<Mutex<Inner>>, paths: &Paths) -> TeraStatus {
             } else {
                 guard.version.clone()
             },
+            source: if guard.source.is_empty() {
+                detected
+            } else {
+                guard.source.clone()
+            },
+            license: TERRACOTTA_LICENSE.to_string(),
+            homepage: TERRACOTTA_HOMEPAGE.to_string(),
             hosting: is_active_state(&guard.state),
             players: guard.players.clone(),
             room_code: guard.room.clone(),
@@ -566,6 +874,9 @@ fn status_of(inner: &Arc<Mutex<Inner>>, paths: &Paths) -> TeraStatus {
         Err(_) => TeraStatus {
             installed,
             version: String::new(),
+            source: detected,
+            license: TERRACOTTA_LICENSE.to_string(),
+            homepage: TERRACOTTA_HOMEPAGE.to_string(),
             hosting: false,
             players: Vec::new(),
             room_code: String::new(),
@@ -998,6 +1309,146 @@ mod tests {
         let paths = Paths::from_root(&root);
         paths.ensure().unwrap();
         paths
+    }
+
+    #[test]
+    fn bundled_candidates_include_the_manifest_dir() {
+        let candidates = bundled_dir_candidates();
+        assert!(!candidates.is_empty());
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(BUNDLED_DIR.replace('/', &std::path::MAIN_SEPARATOR.to_string()));
+        assert!(candidates.contains(&manifest), "候选里要有 src-tauri/resources/terracotta");
+    }
+
+    #[test]
+    fn is_bundled_copy_rejects_any_other_file() {
+        let dir = std::env::temp_dir().join(format!("gugu-tera-hash-{}", util::unique_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("terracotta.exe");
+        std::fs::write(&fake, b"not the real binary").unwrap();
+        assert!(!is_bundled_copy(&fake));
+        assert!(!is_bundled_copy(&dir.join("missing.exe")));
+        assert!(bundled_exe().is_some(), "仓库里必须带着内嵌资源");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+#[test]
+    fn deploy_bundled_dll_copies_both_files() {
+        let dir = std::env::temp_dir().join(format!("gugu-tera-dll-{}", util::unique_suffix()));
+        let source = dir.join("resources");
+        let target = dir.join("data");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join(BUNDLED_DLL_NAME), b"fake-dll-bytes").unwrap();
+        std::fs::write(source.join(BUNDLED_EXE_NAME), b"fake-exe").unwrap();
+        let hash = deploy_bundled(&source.join(BUNDLED_EXE_NAME), &target.join(EXE_NAME)).unwrap();
+        assert_eq!(hash, util::sha256_file(&source.join(BUNDLED_EXE_NAME)).unwrap());
+        let dll_hash = deploy_bundled_dll(&source, &target).unwrap().expect("DLL 要一起复制");
+        assert_eq!(dll_hash, util::sha256_file(&target.join(DLL_NAME)).unwrap());
+        assert!(target.join(EXE_NAME).is_file());
+        assert!(target.join(DLL_NAME).is_file());
+        assert_eq!(std::fs::read(target.join(DLL_NAME)).unwrap(), b"fake-dll-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_bundled_dll_reports_missing_source() {
+        let dir = std::env::temp_dir().join(format!("gugu-tera-nodll-{}", util::unique_suffix()));
+        let source = dir.join("resources");
+        let target = dir.join("data");
+        std::fs::create_dir_all(&source).unwrap();
+        // 内嵌目录没有 DLL：返回 Ok(None)，由调用方决定回退
+        assert!(deploy_bundled_dll(&source, &target).unwrap().is_none());
+        // 内嵌目录读不到时依然是可读的 Ok(None)（不 panic）
+        assert!(deploy_bundled_dll(&dir.join("missing-dir"), &target)
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_bundled_usable_requires_both_exe_and_dll() {
+        let dir = std::env::temp_dir().join(format!("gugu-tera-usable-{}", util::unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(EXE_NAME);
+        let dll = dir.join(DLL_NAME);
+        std::fs::write(&exe, b"not-the-bundled-binary").unwrap();
+        assert!(!local_bundled_usable(&exe, &dll), "exe hash 不对就不能用");
+        std::fs::write(&dll, b"dll").unwrap();
+        assert!(!local_bundled_usable(&exe, &dll), "exe 不对，有 DLL 也没用");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundled_resources_ship_the_vc_runtime() {
+        let dir = bundled_dir().expect("仓库里必须带着内嵌资源");
+        let dll = dir.join(BUNDLED_DLL_NAME);
+        assert!(dll.is_file(), "内嵌资源里必须有 {BUNDLED_DLL_NAME}：{}", dll.display());
+        let metadata = std::fs::metadata(&dll).unwrap();
+        assert_eq!(metadata.len(), BUNDLED_DLL_SIZE);
+        assert_eq!(util::sha256_file(&dll).unwrap(), BUNDLED_DLL_SHA256);
+    }
+
+    #[test]
+    fn deploy_bundled_copies_and_verifies() {
+        let dir = std::env::temp_dir().join(format!("gugu-tera-deploy-{}", util::unique_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("bundled.exe");
+        std::fs::write(&source, b"fake-bundled-binary").unwrap();
+        let target = dir.join("sub").join("terracotta.exe");
+        let hash = deploy_bundled(&source, &target).unwrap();
+        assert_eq!(hash, util::sha256_file(&source).unwrap());
+        assert_eq!(std::fs::read(&target).unwrap(), b"fake-bundled-binary");
+        // 目标被破坏后重新部署可以覆盖
+        std::fs::write(&target, b"broken").unwrap();
+        deploy_bundled(&source, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"fake-bundled-binary");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_of_is_empty_without_binary() {
+        let paths = temp_paths("source");
+        assert_eq!(source_of(&paths), "");
+        let dir = terracotta_dir(&paths);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(exe_path(&paths), b"downloaded-binary").unwrap();
+        assert_eq!(source_of(&paths), "downloaded", "hash 对不上就是联网下载的");
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn status_carries_license_and_source_fields() {
+        let paths = temp_paths("status");
+        let runtime = TeraRuntime::new();
+        let status = runtime.status(&paths);
+        assert!(!status.installed);
+        assert_eq!(status.source, "");
+        assert_eq!(status.license, "AGPL-3.0");
+        assert_eq!(status.homepage, "https://github.com/burningtnt/Terracotta");
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["license"], "AGPL-3.0");
+        assert_eq!(json["homepage"], "https://github.com/burningtnt/Terracotta");
+        assert_eq!(json["source"], "");
+        let ready = TeraEnsure {
+            source: "bundled".to_string(),
+            version: BUNDLED_VERSION.to_string(),
+        };
+        let json = serde_json::to_value(&ready).unwrap();
+        assert_eq!(json["source"], "bundled");
+        assert_eq!(json["version"], "0.4.2");
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn bundled_constants_match_so_source_text() {
+        // SOURCE.txt 里写的数字必须和常量一致（防止换二进制忘了同步）
+        assert_eq!(BUNDLED_EXE_SIZE, 9_402_880);
+        assert_eq!(BUNDLED_EXE_SHA256.len(), 64);
+        assert_eq!(BUNDLED_VERSION, RELEASE.trim_start_matches('v'));
+        assert_eq!(TERRACOTTA_LICENSE, "AGPL-3.0");
+        assert!(TERRACOTTA_HOMEPAGE.starts_with("https://github.com/"));
     }
 
     #[test]

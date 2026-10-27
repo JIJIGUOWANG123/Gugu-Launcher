@@ -16,6 +16,8 @@ export interface Settings {
   language: Lang;
   theme: ThemeMode;
   accent: string;
+  /** 自定义主题色（十六进制）；未自定义时不写，界面回落到 accent */
+  themeColor?: string;
   updateMode: UpdateMode;
   downloadSource: DownloadSourceId;
   /** 同时下载文件数（1–32，默认 8） */
@@ -25,6 +27,8 @@ export interface Settings {
   /** 自定义镜像根地址，仅 downloadSource === "custom" 时生效 */
   customMirror: string;
   resourceSource: ResourceSourceId;
+  /** 自动翻译开关：关掉后资源卡片显示原文（titleOriginal / summaryOriginal） */
+  translateEnabled: boolean;
   /** 资源描述翻译来源 */
   translationSource: TranslationSource;
   /** 自定义翻译接口根地址（OpenAI 兼容，自动拼 /chat/completions） */
@@ -111,10 +115,13 @@ export interface BackgroundPage {
   pageSize: number;
 }
 
-/** 陶瓦联机安装状态。 */
+/** 陶瓦联机安装状态：bundled = 随安装包内嵌，downloaded = 用户单独下载。 */
 export interface TeraStatus {
   installed: boolean;
   version: string | null;
+  source?: "bundled" | "downloaded" | null;
+  license?: string | null;
+  homepage?: string | null;
 }
 
 /** 陶瓦联机运行状态（tera://state 事件与 start/join 的返回同形状）。 */
@@ -248,6 +255,19 @@ export interface Instance {
   playTimeSecs: number;
   createdAt: string;
   lastPlayedAt: string | null;
+  /** 整合包名（由 modpack_install 写入） */
+  packName?: string;
+  /** 整合包安装状态：incomplete 时实例卡上要提示可重试 */
+  packState?: "installed" | "incomplete";
+}
+
+/** modpack_install 的入参：整合包直接建实例，不需要先选实例。 */
+export interface ModpackInstallRequest {
+  provider: ContentProvider;
+  projectId: string;
+  versionId?: string;
+  instanceName?: string;
+  memoryMb?: number;
 }
 
 export interface InstanceCreate {
@@ -474,6 +494,34 @@ export interface ServerInstance {
   dir: string;
 }
 
+/** server_content_list 的元素：服务端里的一个 jar。 */
+export interface ServerContentItem {
+  fileName: string;
+  sizeBytes: number;
+  enabled: boolean;
+  provider?: ContentProvider | null;
+  projectId?: string | null;
+}
+
+/** server_saves_list 的元素：服务端世界目录。 */
+export interface ServerSaveItem {
+  name: string;
+  sizeBytes: number;
+  updatedAt: string;
+}
+
+/** server_config_read 的返回：原文 + 常用项。 */
+export interface ServerConfigResult {
+  text: string;
+  fields: Record<string, string>;
+}
+
+/** server_console_state 的返回：控制台能不能敲指令。 */
+export interface ServerConsoleState {
+  running: boolean;
+  stdinOpen: boolean;
+}
+
 /** server_create 的入参。 */
 export interface ServerCreateRequest {
   name: string;
@@ -482,6 +530,55 @@ export interface ServerCreateRequest {
   memoryMb: number;
   port: number;
   eula: boolean;
+}
+
+/** 模组/光影/资源包检查更新的结果。 */
+export interface ModUpdateItem {
+  fileName: string;
+  path: string;
+  kind: string;
+  currentVersion?: string | null;
+  latestVersion: string;
+  downloadUrl: string;
+  sha1?: string | null;
+}
+
+export interface ModCheckResult {
+  checked: number;
+  updates: ModUpdateItem[];
+  failed: Array<{ fileName: string; reason: string }>;
+}
+
+export interface ModApplyResult {
+  updated: number;
+  failed: Array<{ fileName: string; reason: string }>;
+}
+
+/** 外部启动器导入（HMCL / PCL2）。 */
+export interface ExternalCandidate {
+  id: string;
+  name: string;
+  mcVersion: string;
+  loader: string;
+  loaderVersion?: string | null;
+  path: string;
+  isolated: boolean;
+  hasMods: boolean;
+  modCount?: number | null;
+  sizeBytes: number;
+  javaMajor?: number | null;
+  broken?: string | null;
+}
+
+export interface ExternalScanResult {
+  launcher: "hmcl" | "pcl2" | "unknown";
+  minecraftDir: string;
+  candidates: ExternalCandidate[];
+}
+
+export interface ExternalImportResult {
+  instances: Instance[];
+  failed: Array<{ id: string; reason: string }>;
 }
 
 /** 存储页的分项 key。 */
@@ -510,6 +607,8 @@ export interface DataDirInfo {
 
 /** 实例的可编辑设置（实例详情页「设置」标签）。 */
 export interface InstanceSettings {
+  /** 后端给的可直接进入存档标记（= mcVersion >= 1.20） */
+  supportsQuickPlay?: boolean;
   name: string;
   note: string;
   memoryMb: number;
@@ -590,16 +689,35 @@ export interface SkinLookupResult {
   model?: SkinModel | null;
 }
 
-/** capes_list 的元素：本地 .mc\capes\ 下的一张披风。 */
-export interface CapeItem {
+/** capes_list 的元素：账号里可选的一张披风。 */
+export interface CapeListItem {
+  id: string;
   name: string;
-  path: string;
-  size: number;
-  dataUrl: string;
+  /** 同一张披风的另一种叫法（有就跟着名称一起显示） */
+  alias?: string | null;
+  /** 披风贴图（64×32 PNG）的地址 */
+  url: string;
+  state: "ACTIVE" | "INACTIVE";
+  /** 后端预生成的正面裁切图；没有就用 url 自己裁 */
+  previewDataUrl?: string | null;
+}
+
+/** capes_list 的结果：supported=false 时 items 为空，reason 是原样给用户看的一句话。 */
+export interface CapesListResult {
+  supported: boolean;
+  reason?: string | null;
+  active?: string | null;
+  items: CapeListItem[];
+}
+
+/** cape_set_active 的结果。 */
+export interface CapeState {
+  active: string | null;
 }
 
 /** 皮肤模型：default = 经典（Steve），slim = 纤细（Alex）。 */
-export type SkinModel = "default" | "slim";
+/** 皮肤模型：default/classic 都是经典（4×3 手臂），slim 是纤细（3×3 手臂）。 */
+export type SkinModel = "default" | "classic" | "slim";
 
 // ================================================================ M3-2 账号
 
@@ -609,6 +727,8 @@ export interface Account {
   id: string;
   name: string;
   type: AccountType;
+  /** 后端新字段（"ms" / "offline"）；前端统一折成 type，兼容两种写法 */
+  kind?: string;
   /** 游戏内 UUID（离线账号是 name 的离线 UUID） */
   uuid: string;
   /** 优先使用账号自带皮肤，没有就用当前皮肤 */
@@ -631,8 +751,20 @@ export interface MsLoginStart {
   configured: boolean;
   userCode: string | null;
   verifyUrl: string | null;
+  /** 新契约的名字（和 verifyUrl 同值，两个都认） */
+  verificationUri?: string | null;
   deviceCode: string | null;
   expiresIn: number | null;
+}
+
+/** ms_profile 的返回：微软账号当前正在使用的外观。 */
+export interface MsProfile {
+  name: string;
+  uuid: string;
+  /** textures.minecraft.net 的贴图地址；空表示账号用的是默认皮肤 */
+  skinUrl?: string | null;
+  capeUrl?: string | null;
+  variant?: "classic" | "slim" | null;
 }
 
 /** ms_login_poll 的返回。 */
@@ -650,8 +782,8 @@ export type ContentProvider = "modrinth" | "curseforge" | "mcim";
 /** 内容类型胶囊：模组 / 整合包 / 光影 / 资源包。 */
 export type ContentType = "mod" | "modpack" | "shader" | "resourcepack";
 
-/** 内容类型（含数据包）。 */
-export type ContentKindTab = ContentType | "datapack";
+/** 内容类型（含数据包 / 插件）。 */
+export type ContentKindTab = ContentType | "datapack" | "plugin";
 
 /** 排序方式：下载量 / 最近更新 / 相关度。 */
 export type ContentSort = "downloads" | "updated" | "relevance";
@@ -727,6 +859,19 @@ export interface VersionDependency {
   kind: string;
 }
 
+/** 版本通道：正式版 / 测试版 / 先行版。 */
+export type VersionChannel = "release" | "beta" | "alpha";
+
+/** 前置依赖条目（content_dependencies 的返回）。 */
+export interface ContentDependency {
+  projectId: string;
+  name: string;
+  /** required / optional */
+  kind: "required" | "optional";
+  /** 提供方 */
+  provider?: ContentProvider;
+}
+
 export interface VersionItem {
   /** 安装时传给 mod_install 的 versionId */
   versionId: string;
@@ -738,6 +883,10 @@ export interface VersionItem {
   fileSize: number;
   publishedAt: string;
   dependencies: VersionDependency[];
+  /** 版本通道，缺省按 release 处理 */
+  channel?: VersionChannel;
+  /** 服务端侧标识，形如 "Server, 1.21.4" */
+  serverLabel?: string;
 }
 
 /** translate_texts 的返回：results 与入参一一对应，翻不出来是 null。 */
