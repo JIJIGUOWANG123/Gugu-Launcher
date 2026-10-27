@@ -50,6 +50,8 @@ export interface Settings {
   closeAction: CloseAction;
   /** 需要 Java 时是否自动下载（默认 true） */
   autoDownloadJava: boolean;
+  /** 启动时把实例 options.txt 的 lang 写成 zh_cn（默认 true） */
+  forceChinese: boolean;
   /** 服务端核心下载镜像根地址；留空=官方源 */
   serverMirrorUrl: string;
   /** 每日一言接口地址；留空=内置默认 */
@@ -113,6 +115,8 @@ export interface BackgroundPage {
   total: number;
   page: number;
   pageSize: number;
+  /** 这类背景所在目录（本地图 / 壁纸引擎各一个）；界面提示目录时一律用它，别自己拼数据根 */
+  dir?: string;
 }
 
 /** 陶瓦联机安装状态：bundled = 随安装包内嵌，downloaded = 用户单独下载。 */
@@ -277,6 +281,14 @@ export interface InstanceCreate {
   loaderVersion?: string;
   /** 实例内存上限（MB），新建实例悬浮窗里的滑块 */
   memoryMb?: number;
+}
+
+/** loader_versions 的元素：某加载器在某 MC 版本下可用的构建。 */
+export interface LoaderVersion {
+  id: string;
+  version: string;
+  /** 该加载器官方推荐的构建（新建实例默认选它） */
+  recommended?: boolean;
 }
 
 /** 每日一言（fun_saying 的返回）。 */
@@ -460,6 +472,8 @@ export interface JavaVersion {
   lts: boolean;
   sizeBytes: number;
   url: string;
+  /** 来源徽标文案，后端给（如「清华 TUNA 镜像 · Temurin」）；缺省用源名 */
+  sourceLabel?: string;
 }
 
 /** 服务端状态：已停止 / 启动中 / 运行中 / 停止中。 */
@@ -677,6 +691,8 @@ export interface SkinItem {
   source?: SkinSource;
   /** 正版 / 皮肤站玩家的 UUID */
   uuid?: string;
+  /** skin_import_from_url 用：true = 本地已有同一张，直接复用（没有新增文件） */
+  reused?: boolean;
 }
 
 /** skin_lookup_thirdparty 的返回：皮肤站上某个玩家的皮肤（只用于预览）。 */
@@ -721,20 +737,31 @@ export type SkinModel = "default" | "classic" | "slim";
 
 // ================================================================ M3-2 账号
 
-export type AccountType = "microsoft" | "offline";
+export type AccountType = "microsoft" | "offline" | "thirdparty";
 
 export interface Account {
   id: string;
   name: string;
   type: AccountType;
-  /** 后端新字段（"ms" / "offline"）；前端统一折成 type，兼容两种写法 */
+  /** 后端新字段（"ms" / "offline" / "thirdparty"）；前端统一折成 type，兼容两种写法 */
   kind?: string;
+  /** 第三方账号的皮肤站地址（只用于显示域名） */
+  server?: string;
   /** 游戏内 UUID（离线账号是 name 的离线 UUID） */
   uuid: string;
   /** 优先使用账号自带皮肤，没有就用当前皮肤 */
   skinDataUrl: string | null;
   /** 是否当前正在使用 */
   current: boolean;
+}
+
+/** authlib_status() 的返回：authlib-injector 是否已就绪（第三方 Yggdrasil 登录必需）。 */
+export interface AuthlibStatus {
+  installed: boolean;
+  /** 已安装时的 jar 绝对路径；未安装是空串 */
+  path: string;
+  /** 已安装的版本号（后端给不出就省略） */
+  version?: string | null;
 }
 
 /** ms_login_start 的返回；configured=false 表示这个构建没内置 client id。 */
@@ -757,6 +784,17 @@ export interface MsLoginStart {
   expiresIn: number | null;
 }
 
+/** thirdparty_skin 的返回：第三方账号在皮肤站正在使用的外观（只读预览）。 */
+export interface ThirdpartySkin {
+  server: string;
+  name: string;
+  uuid: string;
+  skinUrl?: string | null;
+  capeUrl?: string | null;
+  variant?: "classic" | "slim" | null;
+  previewDataUrl?: string | null;
+}
+
 /** ms_profile 的返回：微软账号当前正在使用的外观。 */
 export interface MsProfile {
   name: string;
@@ -765,6 +803,14 @@ export interface MsProfile {
   skinUrl?: string | null;
   capeUrl?: string | null;
   variant?: "classic" | "slim" | null;
+  /** 账号当前皮肤的预览图（后端缓存过就直接给，省一次外网请求） */
+  previewDataUrl?: string | null;
+  /** true = 这次是缓存结果，没有真的打 Microsoft 接口 */
+  fromCache?: boolean;
+  /** 缓存时间（ISO），fromCache 时给 */
+  cachedAt?: string | null;
+  /** true = force 过频，后端拒绝这次请求 */
+  throttled?: boolean;
 }
 
 /** ms_login_poll 的返回。 */

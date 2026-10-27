@@ -565,11 +565,17 @@ pub async fn list_page(
     let started = std::time::Instant::now();
     let page = page.unwrap_or(1).max(1);
     let page_size = clamp_page_size(page_size);
+    // 本地背景目录是启动器自己的目录：不存在就建出来，别把用户挡在报错页
     if !dir.is_dir() {
-        return Err(crate::error::AppError::Invalid(format!(
-            "目录不存在或不可读：{}",
-            dir.display()
-        )));
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => tracing::info!(dir = %dir.display(), "背景目录不存在，已自动创建"),
+            Err(err) => {
+                return Err(crate::error::AppError::Invalid(format!(
+                    "背景目录不可用：{}（{err}）",
+                    dir.display()
+                )))
+            }
+        }
     }
     let key = cache_key(kind, &dir, page, page_size);
     if let Some(hit) = cached_page(&key) {
@@ -981,6 +987,14 @@ mod tests {
         assert!(dir.ends_with("steamapps/workshop/content/431960") || dir.ends_with("steamapps\\workshop\\content\\431960"));
     }
 
+    /// 列表缓存是全局的：这些测试必须串行跑。
+    fn cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
     fn temp_dir_with(tag: &str, count: usize) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gugu-bg-{tag}-{}", util::unique_suffix()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1060,21 +1074,50 @@ mod tests {
     }
 
     #[test]
-    fn missing_directory_is_a_readable_error() {
-        let missing = std::env::temp_dir().join("gugu-bg-missing-dir-xyz");
+    fn missing_directory_is_created_then_listed() {
+        let missing = std::env::temp_dir().join(format!(
+            "gugu-bg-missing-dir-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = runtime
+            .block_on(list_page("local", missing.clone(), Some(1), Some(20)))
+            .unwrap();
+        assert!(missing.is_dir(), "目录不存在时要自动建出来");
+        assert!(page.items.is_empty());
+        let _ = std::fs::remove_dir_all(&missing);
+    }
+
+    #[test]
+    fn blocked_directory_path_gives_readable_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "gugu-bg-blocked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        // 同名位置是文件：create_dir_all 必然失败
+        std::fs::write(&dir, b"file not dir").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let err = runtime
-            .block_on(list_page("local", missing, Some(1), Some(20)))
+            .block_on(list_page("local", dir.clone(), Some(1), Some(20)))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("目录不存在"), "{err}");
+        assert!(err.contains("背景目录不可用"), "{err}");
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]
     fn cache_hit_avoids_rescanning() {
+        // 缓存与扫描计数都是进程级全局的：和并发测试互斥，否则 clear_list_cache 会串台
+        let _serial = cache_test_lock();
         let dir = temp_dir_with("cache", 5);
         clear_list_cache();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1084,11 +1127,12 @@ mod tests {
         let first = runtime
             .block_on(list_page("local", dir.clone(), Some(1), Some(20)))
             .unwrap();
-        assert_eq!(scan_count(&dir), 1, "第一次要真的扫");
+        let baseline = scan_count(&dir);
+        assert!(baseline >= 1, "第一次要真的扫");
         let second = runtime
             .block_on(list_page("local", dir.clone(), Some(1), Some(20)))
             .unwrap();
-        assert_eq!(scan_count(&dir), 1, "第二次命中缓存不再扫");
+        assert_eq!(scan_count(&dir), baseline, "第二次命中缓存不再扫");
         assert_eq!(first.items.len(), second.items.len());
         assert_eq!(first.total, second.total);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1096,6 +1140,7 @@ mod tests {
 
     #[test]
     fn concurrent_requests_share_one_scan() {
+        let _serial = cache_test_lock();
         let dir = temp_dir_with("merge", 12);
         clear_list_cache();
         let runtime = tokio::runtime::Builder::new_multi_thread()

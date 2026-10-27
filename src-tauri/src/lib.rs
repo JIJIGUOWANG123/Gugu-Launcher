@@ -49,6 +49,7 @@ pub mod update;
 pub mod updates;
 pub mod util;
 pub mod version;
+pub mod yggdrasil;
 
 use tauri::Manager;
 
@@ -317,6 +318,8 @@ pub fn run() {
             commands::settings_get,
             commands::settings_set,
             commands::versions_list,
+            commands::loader_versions,
+            commands::loaders_list,
             commands::instances_list,
             commands::instance_create,
             commands::instance_delete,
@@ -414,6 +417,11 @@ pub fn run() {
             commands::account_add_offline,
             commands::account_apply,
             commands::account_delete,
+            commands::account_add_thirdparty,
+            commands::account_refresh_thirdparty,
+            commands::authlib_status,
+            commands::authlib_ensure,
+            commands::thirdparty_skin,
             commands::ms_login_start,
             commands::ms_login_poll,
             commands::content_search,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { icons } from "../assets/icons";
 import { formatBytes } from "../lib/format";
 import { useT } from "../lib/i18n";
@@ -39,7 +39,8 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
   const [probes, setProbes] = useState<JavaSourceProbe[]>([]);
   const [source, setSource] = useState("auto");
   const [major, setMajor] = useState(0);
-  const [versions, setVersions] = useState<JavaVersion[] | null>(null);
+  // 一次拿该源的全部 major，major 筛选在本地做：条数和筛选结果永远一致
+  const [allVersions, setAllVersions] = useState<JavaVersion[] | null>(null);
   const [installs, setInstalls] = useState<Record<string, InstallState>>({});
 
   const loadInstalled = useCallback(async () => {
@@ -67,18 +68,40 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
 
   useEffect(() => {
     let alive = true;
+    setAllVersions(null);
     void api
-      .javaVersions({ source: source === "auto" ? undefined : source, major: major || undefined })
+      .javaVersions({ source: source === "auto" ? undefined : source })
       .then((list) => {
-        if (alive) setVersions(list);
+        if (alive) setAllVersions(list);
       })
       .catch(() => {
-        if (alive) setVersions([]);
+        if (alive) setAllVersions([]);
       });
     return () => {
       alive = false;
     };
-  }, [source, major]);
+  }, [source]);
+
+  const versions = useMemo(
+    () => (allVersions ?? []).filter((item) => !major || item.major === major),
+    [allVersions, major],
+  );
+  // 每个 major 的条数（给筛选按钮上的数字用）
+  const majorCounts = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const item of allVersions ?? []) map.set(item.major, (map.get(item.major) ?? 0) + 1);
+    return map;
+  }, [allVersions]);
+  // 按 major 分组展示：组头写条数，组内是具体版本
+  const groups = useMemo(() => {
+    const map = new Map<number, JavaVersion[]>();
+    for (const item of versions) {
+      const bucket = map.get(item.major);
+      if (bucket) bucket.push(item);
+      else map.set(item.major, [item]);
+    }
+    return [...map.entries()].sort((a, b) => b[0] - a[0]);
+  }, [versions]);
 
   // mock 安装进度：真后端会由 downloads_list / install://progress 推
   useEffect(() => {
@@ -198,18 +221,29 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
       <section className="card settings-card" data-java-download>
         <div className="settings-card__title">{t("settings.java.downloadTitle")}</div>
         <div className="java-sources">
-          {sources.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={"chip chip--button" + (source === item.id ? " is-active" : "")}
-              data-java-source={item.id}
-              title={item.description}
-              onClick={() => setSource(item.id)}
-            >
-              {item.name}
-            </button>
-          ))}
+          <button
+            type="button"
+            className={"chip chip--button" + (source === "auto" ? " is-active" : "")}
+            data-java-source="auto"
+            title={sources.find((item) => item.id === "auto")?.description}
+            onClick={() => setSource("auto")}
+          >
+            {t("settings.java.sourceAll")}
+          </button>
+          {sources
+            .filter((item) => item.id !== "auto")
+            .map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={"chip chip--button" + (source === item.id ? " is-active" : "")}
+                data-java-source={item.id}
+                title={item.description}
+                onClick={() => setSource(item.id)}
+              >
+                {item.name}
+              </button>
+            ))}
         </div>
         <div className="row__hint" data-java-probe>
           {probeLine}
@@ -226,17 +260,29 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
               onClick={() => setMajor(item)}
             >
               {item === 0 ? t("settings.java.majorAll") : "Java " + item}
+              <span className="chip__count" data-java-major-count={item}>
+                {item === 0 ? allVersions?.length ?? 0 : majorCounts.get(item) ?? 0}
+              </span>
             </button>
           ))}
         </div>
 
-        {versions === null ? (
+        {allVersions === null ? (
           <div className="row__hint">{t("common.loading")}</div>
         ) : versions.length === 0 ? (
           <div className="empty-hint">{t("settings.java.noVersions")}</div>
         ) : (
-          <div className="java-list">
-            {versions.map((item) => {
+          <div className="java-groups" data-java-groups>
+            {groups.map(([groupMajor, items]) => (
+              <div className="java-group" key={groupMajor} data-java-group={groupMajor}>
+                <div className="java-group__head">
+                  <span className="java-group__title">Java {groupMajor}</span>
+                  <span className="chip chip--tiny" data-java-group-count={groupMajor}>
+                    {t("settings.java.groupCount", { count: items.length })}
+                  </span>
+                </div>
+                <div className="java-list">
+            {items.map((item) => {
               const key = item.source + ":" + item.version;
               const state = installs[key];
               const sourceMeta = sources.find((entry) => entry.id === item.source);
@@ -249,10 +295,17 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
                       <span className="java-row__name">Java {item.major}</span>
                       <span className="row__hint">{item.version}</span>
                       {item.lts ? <span className="chip chip--tiny">{t("settings.java.lts")}</span> : null}
-                      <span className="chip chip--tiny">{sourceMeta?.name ?? item.source}</span>
                     </div>
                     <div className="java-row__path">{formatBytes(item.sizeBytes)}</div>
                   </div>
+                  <div className="java-row__side">
+                    <span
+                      className="chip chip--tiny chip--source"
+                      data-java-source-badge={item.source}
+                      title={item.sourceLabel ?? sourceMeta?.name ?? item.source}
+                    >
+                      {item.sourceLabel ?? sourceMeta?.name ?? item.source}
+                    </span>
                   {sourceMeta?.requiresLicense ? (
                     <button
                       type="button"
@@ -278,9 +331,13 @@ export function JavaPanel({ settings, onChange, notify }: Props) {
                           : t("settings.java.install")}
                     </button>
                   )}
+                  </div>
                 </div>
               );
             })}
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>

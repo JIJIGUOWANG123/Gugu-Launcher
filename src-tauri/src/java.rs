@@ -130,6 +130,8 @@ pub struct JavaSourceProbe {
 #[serde(rename_all = "camelCase")]
 pub struct JavaVersionInfo {
     pub source: String,
+    /// 给界面显示的来源名（例如「清华 TUNA（Adoptium）」）
+    pub source_label: String,
     pub version: String,
     pub major: u32,
     pub lts: bool,
@@ -903,6 +905,7 @@ pub fn parse_caddy_listing(
             .unwrap_or(0);
         out.push(JavaVersionInfo {
             source: source.to_string(),
+            source_label: source_label(source).to_string(),
             version,
             major,
             lts: LTS_MAJORS.contains(&major),
@@ -973,6 +976,7 @@ pub async fn fetch_microsoft_version(
     let version = microsoft_version_from_name(&final_name).unwrap_or_else(|| major.to_string());
     vec![JavaVersionInfo {
         source: "microsoft".to_string(),
+        source_label: source_label("microsoft").to_string(),
         version,
         major,
         lts: LTS_MAJORS.contains(&major),
@@ -1017,6 +1021,7 @@ pub fn parse_azul(json: &str, major: u32) -> Vec<JavaVersionInfo> {
             .unwrap_or_else(|| name.to_string());
         out.push(JavaVersionInfo {
             source: "azul".to_string(),
+            source_label: source_label("azul").to_string(),
             version,
             major,
             lts: LTS_MAJORS.contains(&major),
@@ -1086,6 +1091,7 @@ pub fn parse_mirror_listing(
             .unwrap_or_else(|| stem.to_string());
         out.push(JavaVersionInfo {
             source: source.to_string(),
+            source_label: source_label(source).to_string(),
             version,
             major,
             lts: LTS_MAJORS.contains(&major),
@@ -1203,42 +1209,159 @@ async fn fetch_versions(
     Ok(parse_versions(source, &body, major))
 }
 
-/// java_versions()：source 为空时并发问所有可下载源。
+/// 来源 id → 给界面看的名字。
+pub fn source_label(source: &str) -> &'static str {
+    match source {
+        "tuna" => "清华 TUNA（Adoptium）",
+        "lzu" => "兰州大学（Adoptium）",
+        "zulu-injdk" => "Azul Zulu（INJDK 镜像）",
+        "oracle-injdk" => "Oracle JDK（INJDK 镜像）",
+        "microsoft" => "Microsoft OpenJDK",
+        "azul" => "Azul Zulu",
+        "oracle" => "Oracle JDK（手动）",
+        other => {
+            let _ = other;
+            "未知来源"
+        }
+    }
+}
+
+/// 一个来源支持哪些 major（microsoft 只给自家 LTS 清单）。
+pub fn majors_for(source: &str) -> Vec<u32> {
+    match source {
+        "microsoft" => MICROSOFT_MAJORS.to_vec(),
+        "oracle" => Vec::new(),
+        _ => LTS_MAJORS.to_vec(),
+    }
+}
+
+/// 版本号比较：按数字段比（21.0.12.1 > 21.0.9，8 > "8u"）。
+pub fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    fn parts(value: &str) -> Vec<u64> {
+        value
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|chunk| !chunk.is_empty())
+            .filter_map(|chunk| chunk.parse::<u64>().ok())
+            .collect()
+    }
+    let (a, b) = (parts(left), parts(right));
+    for index in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(index).copied().unwrap_or(0),
+            b.get(index).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// 排序：major 降序 → 版本降序 → 来源名。
+pub fn sort_versions(items: &mut Vec<JavaVersionInfo>) {
+    items.sort_by(|left, right| {
+        right
+            .major
+            .cmp(&left.major)
+            .then_with(|| compare_versions(&right.version, &left.version))
+            .then_with(|| left.source.cmp(&right.source))
+    });
+}
+
+/// 多源合并：同 (source, 版本, url) 去重；同一版本多个来源时保留延迟最低的。
+pub fn merge_versions(entries: Vec<(String, u64, JavaVersionInfo)>) -> Vec<JavaVersionInfo> {
+    use std::collections::HashMap;
+    let mut best: HashMap<(u32, String), (u64, JavaVersionInfo)> = HashMap::new();
+    for (source, latency, item) in entries {
+        let key = (item.major, item.version.clone());
+        let replace = match best.get(&key) {
+            None => true,
+            Some((existing_latency, existing)) => {
+                latency < *existing_latency
+                    || (latency == *existing_latency && source < existing.source)
+            }
+        };
+        if replace {
+            best.insert(key, (latency, item));
+        }
+    }
+    let mut out: Vec<JavaVersionInfo> = best.into_values().map(|(_, item)| item).collect();
+    sort_versions(&mut out);
+    out
+}
+
+/// java_versions()：source 为空时并发问所有可下载源（每个源的每个 major 都问）。
 pub async fn versions(
     client: &reqwest::Client,
     source: Option<&str>,
     major: Option<u32>,
 ) -> Vec<JavaVersionInfo> {
-    let major = major.filter(|value| *value >= 8 && *value <= 64).unwrap_or(21);
-    match source.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(source) => match fetch_versions(client, source, major).await {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(%err, source, "获取 Java 版本列表失败");
-                Vec::new()
+    let requested = major.filter(|value| *value >= 8 && *value <= 64);
+    // 指定了 source：把这个源所有 major 都拉一遍（不是只给第一个 major）
+    if let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) {
+        let majors = match requested {
+            Some(major) => vec![major],
+            None => majors_for(source),
+        };
+        let mut out: Vec<JavaVersionInfo> = Vec::new();
+        for major in majors {
+            match fetch_versions(client, source, major).await {
+                Ok(mut items) => out.append(&mut items),
+                Err(err) => tracing::warn!(%err, source, major, "获取 Java 版本列表失败"),
             }
-        },
-        None => {
-            let mut handles = Vec::new();
-            for source in INSTALLABLE_SOURCES {
-                let client = client.clone();
-                handles.push(tokio::spawn(async move {
-                    (source, fetch_versions(&client, source, major).await)
-                }));
-            }
-            let mut out = Vec::new();
-            for handle in handles {
-                match handle.await {
-                    Ok((_source, Ok(mut items))) => out.append(&mut items),
-                    Ok((source, Err(err))) => {
-                        tracing::warn!(%err, source, "获取 Java 版本列表失败")
-                    }
-                    Err(err) => tracing::warn!(%err, "获取 Java 版本列表任务失败"),
-                }
-            }
-            out
+        }
+        sort_versions(&mut out);
+        tracing::info!(
+            source,
+            count = out.len(),
+            "指定来源的 Java 版本列表已汇总"
+        );
+        return out;
+    }
+    // 没指定 source：所有源 × 所有 major 并发，合并后按延迟挑来源
+    let mut handles = Vec::new();
+    for source in INSTALLABLE_SOURCES {
+        if source == "oracle" {
+            continue;
+        }
+        let majors = match requested {
+            Some(major) => vec![major],
+            None => majors_for(source),
+        };
+        for major in majors {
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let result = fetch_versions(&client, source, major).await;
+                (source, started.elapsed().as_millis() as u64, result)
+            }));
         }
     }
+    let mut collected: Vec<(String, u64, JavaVersionInfo)> = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok((_source, latency, Ok(items))) => {
+                for item in items {
+                    collected.push((item.source.clone(), latency, item));
+                }
+            }
+            Ok((source, _latency, Err(err))) => {
+                tracing::warn!(%err, source, "获取 Java 版本列表失败")
+            }
+            Err(err) => tracing::warn!(%err, "获取 Java 版本列表任务失败"),
+        }
+    }
+    let merged = merge_versions(collected);
+    tracing::info!(
+        count = merged.len(),
+        sources = merged
+            .iter()
+            .map(|item| item.source.as_str())
+            .collect::<Vec<_>>()
+            .len(),
+        "全部来源的 Java 版本列表已合并"
+    );
+    merged
 }
 
 /// 源 → 运行时目录里的 vendor 段。
@@ -1550,6 +1673,78 @@ fn common_root(names: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn majors_cover_every_lts_for_directory_sources() {
+        assert_eq!(majors_for("tuna"), vec![8, 11, 17, 21, 25]);
+        assert_eq!(majors_for("zulu-injdk"), vec![8, 11, 17, 21, 25]);
+        assert_eq!(majors_for("microsoft"), vec![11, 17, 21, 25]);
+        assert!(majors_for("oracle").is_empty());
+    }
+
+    #[test]
+    fn merge_keeps_the_fastest_source_per_version() {
+        let make = |source: &str, version: &str, major: u32, url: &str| JavaVersionInfo {
+            source: source.to_string(),
+            source_label: source_label(source).to_string(),
+            version: version.to_string(),
+            major,
+            lts: true,
+            size_bytes: 100,
+            url: url.to_string(),
+        };
+        let merged = merge_versions(vec![
+            ("lzu".to_string(), 900, make("lzu", "21.0.12.1", 21, "https://lzu/21.zip")),
+            ("tuna".to_string(), 120, make("tuna", "21.0.12.1", 21, "https://tuna/21.zip")),
+            ("tuna".to_string(), 300, make("tuna", "8u442", 8, "https://tuna/8.zip")),
+        ]);
+        assert_eq!(merged.len(), 2, "同版本只留一条");
+        assert_eq!(merged[0].major, 21);
+        assert_eq!(merged[0].source, "tuna", "同版本保留延迟最低的来源");
+        assert_eq!(merged[1].major, 8);
+        assert_eq!(
+            merge_versions(vec![("tuna".to_string(), 10, make("tuna", "21.0.12.1", 21, "u"))]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn versions_sort_by_major_then_version_then_source() {
+        let make = |source: &str, version: &str, major: u32| JavaVersionInfo {
+            source: source.to_string(),
+            source_label: source_label(source).to_string(),
+            version: version.to_string(),
+            major,
+            lts: true,
+            size_bytes: 0,
+            url: String::new(),
+        };
+        let mut items = vec![
+            make("tuna", "21.0.9", 21),
+            make("lzu", "21.0.12.1", 21),
+            make("azul", "17.0.15", 17),
+            make("tuna", "21.0.12.1", 21),
+        ];
+        sort_versions(&mut items);
+        assert_eq!(items[0].major, 21);
+        assert_eq!(items[0].source, "lzu");
+        assert_eq!(items[1].source, "tuna");
+        assert_eq!(items[2].version, "21.0.9");
+        assert_eq!(items[3].major, 17);
+        assert_eq!(
+            compare_versions("21.0.12.1", "21.0.9"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(compare_versions("8u442", "8"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("21", "21"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn source_labels_are_readable() {
+        assert_eq!(source_label("tuna"), "清华 TUNA（Adoptium）");
+        assert_eq!(source_label("microsoft"), "Microsoft OpenJDK");
+        assert_eq!(source_label("unknown-source"), "未知来源");
+    }
 
     #[test]
     fn parse_version_handles_modern_and_legacy() {

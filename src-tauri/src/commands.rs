@@ -385,13 +385,76 @@ async fn launch_instance(
     // 2) 选 Java：实例指定 → 设置指定 → 扫描 → 自动下载
     let java_path = pick_java(&paths, &target, &settings, required_java, &client, origins, task).await?;
 
-    // 3) 账号：accounts.json 里的当前账号，没有就用默认离线名
-    let (username, uuid, access_token) = crate::accounts::current_credentials(&paths)
-        .unwrap_or_else(|| {
+    // 3) 账号：accounts.json 里的当前账号，三方账号要校验令牌并挂 authlib-injector
+    let account = crate::accounts::current_stored(&paths);
+    let (username, uuid, access_token, user_type, extra_jvm_args) = match account {
+        Some(account) if account.kind == "thirdparty" => {
+            task.progress(
+                crate::events::Phase::Verifying,
+                "正在校验第三方账号令牌",
+                0,
+                0,
+            );
+            let server = crate::yggdrasil::normalize_server(&account.server)?;
+            // token 只从这里（磁盘上最新的 account）取：validate → 需要就 refresh 并立刻持久化 → 再 validate
+            let (token, refreshed) = crate::yggdrasil::prepare_launch_token(
+                &client,
+                &server,
+                &account.access_token,
+                &account.refresh_token,
+                |session| crate::accounts::upsert_thirdparty(&paths, &server, session).map(|_| ()),
+            )
+            .await?;
+            tracing::info!(
+                account = %account.name,
+                refreshed,
+                token = %util::mask_secret(&token),
+                "启动前 validate=ok"
+            );
+            let authlib = crate::yggdrasil::ensure_authlib(&client, &paths).await?;
+            let agent = crate::yggdrasil::javaagent_arg(
+                std::path::Path::new(&authlib.path),
+                &server,
+            );
+            tracing::info!(
+                server = %server,
+                player = %account.name,
+                javaagent = %agent,
+                "第三方账号启动：已挂 authlib-injector"
+            );
+            (
+                account.name.clone(),
+                account.uuid.clone(),
+                token,
+                "legacy".to_string(),
+                vec![agent],
+            )
+        }
+        Some(account) => {
+            let uuid = if account.uuid.trim().is_empty() {
+                crate::accounts::offline_uuid(&account.name)
+            } else {
+                account.uuid.clone()
+            };
+            let user_type = if account.kind == "ms" {
+                String::new()
+            } else {
+                "legacy".to_string()
+            };
+            (
+                account.name,
+                uuid,
+                account.access_token,
+                user_type,
+                Vec::new(),
+            )
+        }
+        None => {
             let name = launch::DEFAULT_USERNAME.to_string();
             let uuid = crate::accounts::offline_uuid(&name);
-            (name, uuid, String::new())
-        });
+            (name, uuid, String::new(), "legacy".to_string(), Vec::new())
+        }
+    };
 
     let memory_mb = if target.memory_mb > 0 {
         target.memory_mb
@@ -411,9 +474,18 @@ async fn launch_instance(
         uuid,
         access_token,
         quick_play,
+        user_type,
+        extra_jvm_args,
     };
 
-    // 4) 拼参数 → 起进程
+    // 4) 强制游戏内语言（默认开；关掉时完全不碰 options.txt）
+    if settings.force_chinese {
+        if let Err(err) = launch::ensure_game_language(&options.game_dir) {
+            tracing::warn!(%err, "强制游戏语言失败（不影响启动）");
+        }
+    }
+
+    // 5) 拼参数 → 起进程
     let command = launch::build_command(&paths, &merged, &options)?;
     tracing::info!(command = %command.to_display(), "即将启动游戏");
     let session = launch::start(events, paths, &options, &command).await?;
@@ -482,6 +554,25 @@ pub async fn sources_probe(state: State<'_, AppState>) -> Result<Vec<SourceProbe
     let settings = state.settings();
     let candidates = sources::auto_candidates(&settings.custom_mirror_url);
     Ok(sources::probe_all(&state.client, &candidates).await)
+}
+
+/// loader_versions({loader, mcVersion})：加载器可用版本（Fabric/Forge/NeoForge）。
+#[tauri::command]
+pub async fn loader_versions(
+    state: State<'_, AppState>,
+    loader: String,
+    mc_version: String,
+) -> Result<Vec<meta::LoaderVersion>> {
+    meta::loader_versions(&state.client, &loader, &mc_version).await
+}
+
+/// loaders_list({mcVersion})：三个加载器一次问完，失败的带中文原因但不影响其它。
+#[tauri::command]
+pub async fn loaders_list(
+    state: State<'_, AppState>,
+    mc_version: String,
+) -> Result<Vec<meta::LoaderGroup>> {
+    Ok(meta::loaders_list(&state.client, &mc_version).await)
 }
 
 // ------------------------------------------------------------------ Java
@@ -1893,7 +1984,7 @@ pub async fn skin_import_from_url(
     state: State<'_, AppState>,
     url: String,
     name: Option<String>,
-) -> Result<crate::skins::SkinItem> {
+) -> Result<crate::skins::SkinImportResult> {
     crate::skins::import_from_url(&state.client, &state.paths, &url, name.as_deref()).await
 }
 
@@ -1936,13 +2027,97 @@ pub async fn ms_skin_upload(
     .await
 }
 
+// ------------------------------------------------------------------ 第三方账号（Yggdrasil）
+
+/// account_add_thirdparty({server, username, password})：Yggdrasil 登录并保存账号。
+#[tauri::command]
+pub async fn account_add_thirdparty(
+    state: State<'_, AppState>,
+    server: String,
+    username: String,
+    password: String,
+) -> Result<crate::accounts::AccountItem> {
+    let server = crate::yggdrasil::normalize_server(&server)?;
+    let session =
+        crate::yggdrasil::authenticate(&state.client, &server, &username, &password).await?;
+    crate::accounts::upsert_thirdparty(&state.paths, &server, &session)
+}
+
+/// account_refresh_thirdparty({id})：令牌失效时重新拿一份。
+#[tauri::command]
+pub async fn account_refresh_thirdparty(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<crate::accounts::AccountItem> {
+    let account = crate::accounts::stored_by_id(&state.paths, Some(id))
+        .ok_or_else(|| AppError::Invalid(format!("账号不存在：{id}")))?;
+    if account.kind != "thirdparty" {
+        return Err(AppError::Invalid("这不是第三方账号".to_string()));
+    }
+    let server = crate::yggdrasil::normalize_server(&account.server)?;
+    let session = crate::yggdrasil::refresh(
+        &state.client,
+        &server,
+        &account.access_token,
+        &account.refresh_token,
+    )
+    .await?;
+    crate::accounts::upsert_thirdparty(&state.paths, &server, &session)
+}
+
+/// authlib_status()：本地有没有 authlib-injector。
+#[tauri::command]
+pub fn authlib_status(state: State<'_, AppState>) -> crate::yggdrasil::AuthlibInfo {
+    crate::yggdrasil::authlib_status(&state.paths)
+}
+
+/// authlib_ensure()：没有就下载一份（已有直接复用）。
+#[tauri::command]
+pub async fn authlib_ensure(
+    state: State<'_, AppState>,
+) -> Result<crate::yggdrasil::AuthlibInfo> {
+    crate::yggdrasil::ensure_authlib(&state.client, &state.paths).await
+}
+
+/// thirdparty_skin({accountId?})：只看该账号在站点上正在使用的皮肤。
+#[tauri::command]
+pub async fn thirdparty_skin(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+) -> Result<crate::yggdrasil::ThirdPartySkinView> {
+    let account = crate::accounts::stored_by_id(&state.paths, account_id)
+        .ok_or_else(|| AppError::Invalid("当前没有第三方账号".to_string()))?;
+    if account.kind != "thirdparty" {
+        return Err(AppError::Invalid("当前没有第三方账号".to_string()));
+    }
+    if account.server.trim().is_empty() {
+        return Err(AppError::Invalid("这个账号没有记录皮肤站地址".to_string()));
+    }
+    let server = crate::yggdrasil::normalize_server(&account.server)?;
+    crate::yggdrasil::thirdparty_skin(
+        &state.client,
+        &state.paths,
+        &server,
+        &account.name,
+        &account.uuid,
+    )
+    .await
+}
+
 /// ms_profile：当前微软账号的真实资料（名字 / uuid / 皮肤 / 披风 / 模型）。
 #[tauri::command]
 pub async fn ms_profile(
     state: State<'_, AppState>,
-) -> Result<crate::capes::AccountProfile> {
+    force: Option<bool>,
+) -> Result<crate::capes::MsProfileView> {
     let settings = state.settings();
-    crate::capes::ms_profile(&state.client, &state.paths, &settings).await
+    crate::capes::ms_profile_cached(
+        &state.client,
+        &state.paths,
+        &settings,
+        force.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2419,10 +2594,19 @@ pub async fn background_list(
 pub fn background_apply(
     state: State<'_, AppState>,
     kind: String,
-    file: String,
+    file: Option<String>,
+    file_name: Option<String>,
 ) -> Result<crate::appearance::Appearance> {
     let mut settings = state.settings();
     let kind = crate::appearance::normalize_kind(&kind)?;
+    // 契约是 file；老前端传 fileName 也认，缺了就明确说是哪个参数
+    let file = file
+        .or(file_name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::Invalid("缺少参数 file（背景文件名或壁纸绝对路径）".to_string())
+        })?;
     match kind {
         "local" => {
             settings.appearance.scheme = "local".to_string();

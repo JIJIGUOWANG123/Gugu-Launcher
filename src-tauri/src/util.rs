@@ -241,6 +241,11 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// 文件 SHA-256（十六进制小写）。
+/// 内存里字节的 sha256（导入去重用）。
+pub fn sha256_file_of_bytes(bytes: &[u8]) -> String {
+    hex(&sha256(bytes))
+}
+
 pub fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
     let bytes = std::fs::read(path)?;
     Ok(hex(&sha256(&bytes)))

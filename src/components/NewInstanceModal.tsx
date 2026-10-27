@@ -1,14 +1,17 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Modal } from "./Modal";
 import { useT } from "../lib/i18n";
 import { classifyVersions, type VersionKind } from "../lib/versions";
-import type { VersionManifest } from "../lib/types";
+import { api } from "../lib/tauri-api";
+import type { LoaderVersion, VersionManifest } from "../lib/types";
 
-/** 新建实例悬浮窗提交出去的载荷（loader 目前只可能是 Vanilla）。 */
+/** 新建实例悬浮窗提交出去的载荷（loader 是 Vanilla / Fabric / Forge / NeoForge）。 */
 export interface NewInstancePayload {
   name: string;
   mcVersion: string;
   loader: string;
+  /** 选中加载器的具体构建；原版留空 */
+  loaderVersion?: string;
   memoryMb: number;
 }
 
@@ -18,13 +21,26 @@ interface Props {
   onSubmit: (payload: NewInstancePayload) => Promise<void>;
 }
 
-/** 加载器：M2 只做原版，其它置灰并标「即将支持」。labelKey 为空表示直接显示 id。 */
-const LOADERS: Array<{ id: string; labelKey: string | null; ready: boolean }> = [
-  { id: "Vanilla", labelKey: "instances.loaderVanilla", ready: true },
-  { id: "Forge", labelKey: null, ready: false },
-  { id: "Fabric", labelKey: null, ready: false },
-  { id: "NeoForge", labelKey: null, ready: false },
+/** 加载器：原版不需要后端数据，其余三种并行查 loader_versions。labelKey 为空表示直接显示 id。 */
+const LOADERS: Array<{ id: string; labelKey: string | null }> = [
+  { id: "Vanilla", labelKey: "instances.loaderVanilla" },
+  { id: "Fabric", labelKey: null },
+  { id: "Forge", labelKey: null },
+  { id: "NeoForge", labelKey: null },
 ];
+
+const LOADER_API_ID: Record<string, "fabric" | "forge" | "neoforge"> = {
+  Fabric: "fabric",
+  Forge: "forge",
+  NeoForge: "neoforge",
+};
+
+/** 每个加载器的查询结果：加载中 / 可用构建 / 后端原因。 */
+interface LoaderSlot {
+  loading: boolean;
+  versions: LoaderVersion[];
+  error: string;
+}
 
 const KINDS = ["release", "snapshot", "april", "old"] as const;
 
@@ -47,10 +63,52 @@ export function NewInstanceModal({ versions, onClose, onSubmit }: Props) {
     () => versions?.latestRelease ?? classifyVersions(versions?.versions ?? []).release[0]?.id ?? "1.21.4",
   );
   const [loader, setLoader] = useState("Vanilla");
+  const [loaderVersion, setLoaderVersion] = useState("");
+  const [loaderSlots, setLoaderSlots] = useState<Record<string, LoaderSlot>>({});
   const [name, setName] = useState("");
   const [memoryMb, setMemoryMb] = useState(DEFAULT_MEMORY);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // 选定 MC 版本后并行查三个加载器的构建（互不牵连：一个失败不影响其它）
+  useEffect(() => {
+    let alive = true;
+    const pending: Record<string, LoaderSlot> = {};
+    for (const id of ["fabric", "forge", "neoforge"]) pending[id] = { loading: true, versions: [], error: "" };
+    setLoaderSlots(pending);
+    void Promise.all(
+      (["fabric", "forge", "neoforge"] as const).map(async (id) => {
+        try {
+          const versions = await api.loaderVersions({ loader: id, mcVersion });
+          return { id, versions, error: "" };
+        } catch (error) {
+          return { id, versions: [] as LoaderVersion[], error: String(error instanceof Error ? error.message : error) };
+        }
+      }),
+    ).then((rows) => {
+      if (!alive) return;
+      const next: Record<string, LoaderSlot> = {};
+      for (const row of rows) next[row.id] = { loading: false, versions: row.versions, error: row.error };
+      setLoaderSlots(next);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [mcVersion]);
+
+  const activeApiId = LOADER_API_ID[loader];
+  const activeSlot = activeApiId ? loaderSlots[activeApiId] : undefined;
+
+  // 选中加载器后自动挑一个具体版本：后端推荐的优先，否则最新（列表第一条）
+  useEffect(() => {
+    if (!activeSlot || activeSlot.loading) return;
+    if (activeSlot.versions.length === 0) {
+      setLoaderVersion("");
+      return;
+    }
+    const preferred = activeSlot.versions.find((item) => item.recommended) ?? activeSlot.versions[0];
+    setLoaderVersion(preferred.version);
+  }, [activeApiId, activeSlot]);
 
   const filtered = visible.filter((entry) => entry.version.id.toLowerCase().includes(query.trim().toLowerCase()));
   const shownName = name.trim().length > 0 ? name : mcVersion;
@@ -59,7 +117,13 @@ export function NewInstanceModal({ versions, onClose, onSubmit }: Props) {
     setBusy(true);
     setError(null);
     try {
-      await onSubmit({ name: shownName, mcVersion, loader, memoryMb });
+      await onSubmit({
+        name: shownName,
+        mcVersion,
+        loader,
+        loaderVersion: activeApiId ? loaderVersion : "",
+        memoryMb,
+      });
       onClose();
     } catch (caught) {
       setError(String(caught));
@@ -163,20 +227,58 @@ export function NewInstanceModal({ versions, onClose, onSubmit }: Props) {
       <div className="field">
         <label>{t("instances.loader")}</label>
         <div className="loader-picker">
-          {LOADERS.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={"loader-option" + (loader === item.id ? " is-active" : "")}
-              disabled={!item.ready}
-              aria-disabled={!item.ready}
-              onClick={() => setLoader(item.id)}
-            >
-              <span>{item.labelKey ? t(item.labelKey) : item.id}</span>
-              {item.ready ? null : <span className="loader-option__tag">{t("instances.loaderNeedVersion")}</span>}
-            </button>
-          ))}
+          {LOADERS.map((item) => {
+            const apiId = LOADER_API_ID[item.id];
+            const slot = apiId ? loaderSlots[apiId] : undefined;
+            const loading = Boolean(slot?.loading);
+            const unavailable = Boolean(slot && !slot.loading && slot.versions.length === 0);
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={"loader-option" + (loader === item.id ? " is-active" : "")}
+                data-loader={item.id}
+                data-loader-available={unavailable ? "0" : "1"}
+                aria-disabled={unavailable}
+                onClick={() => setLoader(item.id)}
+              >
+                <span>{item.labelKey ? t(item.labelKey) : item.id}</span>
+                {loading ? <span className="loader-option__tag">{t("common.loading")}</span> : null}
+                {unavailable ? (
+                  <span className="loader-option__tag" data-loader-unavailable>
+                    {t("instances.loaderUnavailable")}
+                  </span>
+                ) : null}
+              </button>
+            );
+          })}
         </div>
+
+        {activeSlot && !activeSlot.loading && activeSlot.versions.length > 0 ? (
+          <div className="field-pair loader-version">
+            <label htmlFor="new-instance-loader-version">{t("instances.loaderVersion")}</label>
+            <select
+              id="new-instance-loader-version"
+              data-loader-version
+              value={loaderVersion}
+              onChange={(event) => setLoaderVersion(event.target.value)}
+            >
+              {activeSlot.versions.map((item) => (
+                <option key={item.id} value={item.version}>
+                  {item.version}
+                  {item.recommended ? t("instances.loaderRecommended") : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        ) : null}
+
+        {activeSlot && !activeSlot.loading && activeSlot.error ? (
+          <div className="field-error" data-loader-error>
+            {activeSlot.error}
+          </div>
+        ) : null}
+        {!activeApiId ? <div className="row__hint">{t("instances.loaderVanillaHint")}</div> : null}
       </div>
 
       <div className="field">

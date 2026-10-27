@@ -188,6 +188,7 @@ export default function App() {
         name: payload.name,
         mcVersion: payload.mcVersion,
         loader: payload.loader,
+        loaderVersion: payload.loaderVersion,
         memoryMb: payload.memoryMb,
       });
       await refreshInstances();

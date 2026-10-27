@@ -56,15 +56,17 @@ pub struct AccountItem {
     /// 正版贴图地址（只给后端用，不进 JSON）
     #[serde(skip)]
     pub skin_url: Option<String>,
+    /// 第三方站点根（离线/微软账号为空）
+    pub server: Option<String>,
 }
 
 impl AccountItem {
     /// kind → 前端 type：只有 ms 算微软账号，其余都是离线。
     pub fn type_of(kind: &str) -> &'static str {
-        if kind == "ms" {
-            "microsoft"
-        } else {
-            "offline"
+        match kind {
+            "ms" => "microsoft",
+            "thirdparty" => "thirdparty",
+            _ => "offline",
         }
     }
 }
@@ -87,6 +89,9 @@ pub struct StoredAccount {
     /// 登录后下载到 .mc/skins 的皮肤文件绝对路径（空串表示没有）
     #[serde(default)]
     pub local_skin: String,
+    /// 第三方（Yggdrasil）站点根地址；官方/离线账号为空串
+    #[serde(default)]
+    pub server: String,
     pub created_at: String,
 }
 
@@ -116,6 +121,11 @@ impl StoredAccount {
                 None
             } else {
                 Some(self.skin_url.clone())
+            },
+            server: if self.server.trim().is_empty() {
+                None
+            } else {
+                Some(self.server.trim().to_string())
             },
         }
     }
@@ -263,6 +273,7 @@ pub fn add_offline(paths: &Paths, name: &str) -> Result<AccountItem> {
         refresh_token: String::new(),
         skin_url: String::new(),
         local_skin: String::new(),
+        server: String::new(),
         created_at: util::iso8601(util::now_unix()),
     };
     file.accounts.push(account);
@@ -284,6 +295,7 @@ pub fn add_offline(paths: &Paths, name: &str) -> Result<AccountItem> {
             is_current: true,
             skin_data_url: None,
             skin_url: None,
+            server: None,
         }))
 }
 
@@ -321,6 +333,7 @@ pub fn upsert_ms(
                 refresh_token: String::new(),
                 skin_url: String::new(),
                 local_skin: String::new(),
+                server: String::new(),
                 created_at: util::iso8601(util::now_unix()),
             });
             id
@@ -350,7 +363,100 @@ pub fn upsert_ms(
             is_current: true,
             skin_data_url: None,
             skin_url: None,
+            server: None,
         }))
+}
+
+/// 写入（或更新）第三方（Yggdrasil）账号，成功后设为当前账号。
+pub fn upsert_thirdparty(
+    paths: &Paths,
+    server: &str,
+    session: &crate::yggdrasil::YggdrasilSession,
+) -> Result<AccountItem> {
+    if session.profile_id.trim().is_empty() {
+        return Err(AppError::Invalid(
+            "这个账号没有角色 id，无法保存（请先在皮肤站创建角色）".to_string(),
+        ));
+    }
+    let name = if session.profile_name.trim().is_empty() {
+        session.profile_id.clone()
+    } else {
+        session.profile_name.clone()
+    };
+    let mut file = load(paths);
+    let id = match file
+        .accounts
+        .iter()
+        .position(|account| account.uuid == session.profile_id && account.kind == "thirdparty")
+    {
+        Some(index) => file.accounts[index].id,
+        None => {
+            let id = file.next_id.max(1);
+            file.next_id = id + 1;
+            file.accounts.push(StoredAccount {
+                id,
+                name: name.clone(),
+                kind: "thirdparty".to_string(),
+                uuid: session.profile_id.clone(),
+                access_token: String::new(),
+                refresh_token: String::new(),
+                skin_url: String::new(),
+                local_skin: String::new(),
+                server: server.to_string(),
+                created_at: util::iso8601(util::now_unix()),
+            });
+            id
+        }
+    };
+    if let Some(account) = file.accounts.iter_mut().find(|account| account.id == id) {
+        account.name = name;
+        account.kind = "thirdparty".to_string();
+        account.uuid = session.profile_id.clone();
+        account.access_token = session.access_token.clone();
+        account.refresh_token = session.client_token.clone();
+        account.server = server.trim().to_string();
+    }
+    file.current = Some(id);
+    save(paths, &file)?;
+    tracing::info!(
+        server = %server,
+        account = %session.profile_name,
+        token = %util::mask_secret(&session.access_token),
+        "第三方账号已保存"
+    );
+    Ok(list(paths)
+        .into_iter()
+        .find(|item| item.id == id)
+        .unwrap_or_else(|| AccountItem {
+            id,
+            name: session.profile_name.clone(),
+            account_type: AccountItem::type_of("thirdparty").to_string(),
+            kind: "thirdparty".to_string(),
+            uuid: session.profile_id.clone(),
+            is_current: true,
+            skin_data_url: None,
+            skin_url: None,
+            server: Some(server.trim().to_string()),
+        }))
+}
+
+/// 当前账号（含令牌，给启动链路用）。
+pub fn current_stored(paths: &Paths) -> Option<StoredAccount> {
+    let file = load(paths);
+    let current = file.current?;
+    file.accounts.into_iter().find(|account| account.id == current)
+}
+
+/// 按 id 取账号；id=None 时取当前账号。
+pub fn stored_by_id(paths: &Paths, id: Option<i64>) -> Option<StoredAccount> {
+    let file = load(paths);
+    match id {
+        Some(id) => file.accounts.into_iter().find(|account| account.id == id),
+        None => {
+            let current = file.current?;
+            file.accounts.into_iter().find(|account| account.id == current)
+        }
+    }
 }
 
 /// 刷新后回写令牌：只动令牌字段，不动当前账号。
@@ -432,6 +538,40 @@ mod tests {
         paths
     }
 
+    #[test]
+    fn upsert_thirdparty_persists_refreshed_token_and_overwrites_old() {
+        let paths = temp_paths("thirdparty-refresh");
+        let session = crate::yggdrasil::YggdrasilSession {
+            access_token: "old-token".to_string(),
+            client_token: "client-1".to_string(),
+            profile_id: "964b99c006e24f67bbc78cc74e71a5d4".to_string(),
+            profile_name: "JiJi_GuoWang".to_string(),
+            available: Vec::new(),
+        };
+        let server = "https://littleskin.cn/api/yggdrasil";
+        let item = upsert_thirdparty(&paths, server, &session).unwrap();
+        assert_eq!(item.kind, "thirdparty");
+        assert_eq!(item.account_type, "thirdparty");
+        assert_eq!(item.server.as_deref(), Some(server));
+        assert_eq!(stored_by_id(&paths, None).unwrap().access_token, "old-token");
+
+        let refreshed = crate::yggdrasil::YggdrasilSession {
+            access_token: "new-token".to_string(),
+            client_token: "client-2".to_string(),
+            profile_id: session.profile_id.clone(),
+            profile_name: session.profile_name.clone(),
+            available: Vec::new(),
+        };
+        upsert_thirdparty(&paths, server, &refreshed).unwrap();
+        let stored = stored_by_id(&paths, None).unwrap();
+        assert_eq!(stored.access_token, "new-token", "启动只认最新 token");
+        assert_eq!(stored.refresh_token, "client-2");
+        assert_eq!(list(&paths).len(), 1, "同一个角色只有一条账号记录");
+        let text = std::fs::read_to_string(accounts_path(&paths)).unwrap();
+        assert!(!text.contains("password"), "accounts.json 不应有密码字段");
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
 #[test]
     fn ms_account_serializes_as_microsoft_even_without_uuid() {
         let paths = temp_paths("ms-kind");
@@ -466,7 +606,7 @@ mod tests {
         assert!(value.get("skinDataUrl").is_some());
         assert!(value.get("isCurrent").is_none(), "前端只认 current");
         assert!(value.get("accessToken").is_none(), "令牌不能出后端");
-        let ms = upsert_ms(&paths, "Notch", "069a79f444e94726a5befca90e38aaf5", "t", "r").unwrap();
+        let ms = upsert_ms(&paths, "Notch", "0123456789abcdef0123456789abcdef", "t", "r").unwrap();
         let value = serde_json::to_value(&ms).unwrap();
         assert_eq!(value["type"], "microsoft");
         assert_eq!(value["kind"], "ms");
@@ -477,7 +617,7 @@ mod tests {
     #[test]
     fn deleting_account_removes_downloaded_skin_file() {
         let paths = temp_paths("account-skin-clean");
-        let item = upsert_ms(&paths, "Notch", "069a79f444e94726a5befca90e38aaf5", "t", "r").unwrap();
+        let item = upsert_ms(&paths, "Notch", "0123456789abcdef0123456789abcdef", "t", "r").unwrap();
         std::fs::create_dir_all(&paths.skins).unwrap();
         let skin = paths.skins.join("Notch.png");
         std::fs::write(

@@ -1,6 +1,6 @@
 [package]
 name = "gugu-launcher"
-version = "1.0.0"
+version = "1.0.1"
 description = "咕咕启动器 · Gugu Launcher — Minecraft 开源无广告启动器"
 authors = ["JIJIGUOWANG123"]
 repository = "https://github.com/JIJIGUOWANG123/Gugu-Launcher"

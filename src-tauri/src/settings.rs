@@ -41,7 +41,7 @@ pub const MEMORY_MB_MAX: u32 = 65536;
 pub const DEFAULT_ACCENT: &str = "#f5c845";
 /// 关闭窗口的行为：询问 / 最小化到后台 / 退出程序。
 pub const CLOSE_ACTIONS: [&str; 3] = ["ask", "minimize", "exit"];
-pub const DEFAULT_CLOSE_ACTION: &str = "minimize";
+pub const DEFAULT_CLOSE_ACTION: &str = "ask";
 
 /// 设置结构：字段名与前端 `Settings` 一一对应（camelCase）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +58,8 @@ pub struct Settings {
     pub content_download_via_mcim: bool,
     /// 内容搜索是否翻译标题/简介
     pub translate_enabled: bool,
+    /// 启动前把游戏内语言强制成简体中文（默认开）
+    pub force_chinese: bool,
     pub update_mode: String,
     pub download_source: String,
     pub resource_source: String,
@@ -121,8 +123,9 @@ impl Default for Settings {
             theme_color: String::new(),
             content_download_via_mcim: true,
             translate_enabled: true,
-            // 1.0.0 为首个正式版本：默认关闭自更新（解析/测速代码保留，运行期不调用）
-            update_mode: "off".to_string(),
+            force_chinese: true,
+            // 首次安装默认「手动」：不自动下载更新（用户可在设置里改）
+            update_mode: "manual".to_string(),
             download_source: "auto".to_string(),
             resource_source: "auto".to_string(),
             java_path: String::new(),
@@ -684,8 +687,9 @@ mod tests {
     }
 
     #[test]
-    fn close_action_defaults_to_minimize_and_rejects_garbage() {
-        assert_eq!(Settings::default().close_action, "minimize");
+    fn close_action_defaults_to_ask_and_rejects_garbage() {
+        assert_eq!(Settings::default().close_action, "ask");
+        assert_eq!(Settings::default().update_mode, "manual");
         assert_eq!(CLOSE_ACTIONS, ["ask", "minimize", "exit"]);
 
         for value in CLOSE_ACTIONS {
@@ -697,7 +701,7 @@ mod tests {
         let mut broken = Settings::default();
         broken.close_action = "tray".to_string();
         assert!(broken.validate().is_err());
-        assert_eq!(broken.normalize().close_action, "minimize");
+        assert_eq!(broken.normalize().close_action, "ask");
     }
 
     #[test]

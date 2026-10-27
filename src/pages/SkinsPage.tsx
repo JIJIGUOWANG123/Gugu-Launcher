@@ -35,6 +35,14 @@ const ACTIONS: Array<{ key: SkinAction; labelKey: string }> = [
   { key: "none", labelKey: "skin.action.none" },
 ];
 
+/** 后端缓存时间只用来提示，格式化失败就原样显示。 */
+function formatCacheTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return pad(date.getHours()) + ":" + pad(date.getMinutes());
+}
+
 /** 皮肤页：左边 3D 预览（左下按钮组里开披风设置），右边已保存 / 官方皮肤。 */
 export function SkinsPage({ notify, onOpenAccounts }: Props) {
   const t = useT();
@@ -51,6 +59,8 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   const [busy, setBusy] = useState(false);
   const [accountName, setAccountName] = useState("");
   const [isMicrosoft, setIsMicrosoft] = useState(false);
+  // 第三方（皮肤站）账号：皮肤页只读预览，改动一律禁用
+  const [isThirdparty, setIsThirdparty] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
@@ -68,6 +78,23 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   const [restoring, setRestoring] = useState(false);
   const [restoreError, setRestoreError] = useState("");
   const [restoreNeedsAccounts, setRestoreNeedsAccounts] = useState(false);
+  // 恢复正版皮肤 30 秒冷却 / 刷新 60 秒冷却（后端接口有频率限制，前端先自我约束）
+  const [restoreCooldown, setRestoreCooldown] = useState(0);
+  const [refreshCooldown, setRefreshCooldown] = useState(0);
+  // 正版账号当前正在使用的皮肤（来自 ms_profile，可能带后端缓存）
+  const [accountSkin, setAccountSkin] = useState<{
+    dataUrl: string;
+    name: string;
+    fromCache: boolean;
+    cachedAt: string | null;
+  } | null>(null);
+  const [accountSkinError, setAccountSkinError] = useState("");
+  const [accountSkinLoading, setAccountSkinLoading] = useState(false);
+  const [refreshingProfile, setRefreshingProfile] = useState(false);
+  // 账号列表回来之前不渲染 Steve，否则看起来像「皮肤被重置了」
+  const [accountsLoaded, setAccountsLoaded] = useState(false);
+  // 第三方账号的只读预览（和本地选择分开存，互不覆盖）
+  const [thirdpartyPreview, setThirdpartyPreview] = useState<SkinItem | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   // 内置 Steve / Alex（列表前两项，不落盘、不可删）
@@ -79,16 +106,95 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   const [mojangError, setMojangError] = useState("");
   const [mojangResult, setMojangResult] = useState<SkinItem | null>(null);
 
+  /**
+   * 正版账号：拉「账号当前正在使用的皮肤」（ms_profile，命中后端缓存就带 fromCache）。
+   * 拿不到时不清空本地值，只把原因写在界面上，绝不静默回落 Steve。
+   */
+  const loadAccountSkin = useCallback(
+    async (force: boolean, activeName?: string) => {
+      setAccountSkinError("");
+      if (force) {
+        setRefreshingProfile(true);
+      } else {
+        setAccountSkinLoading(true);
+      }
+      try {
+        const profile = await api.msProfile(force ? { force: true } : {});
+        if (profile.throttled) {
+          notify(t("skin.throttled"));
+          return;
+        }
+        const url = profile.previewDataUrl || profile.skinUrl || "";
+        if (!url) {
+          // 账号用的是默认皮肤：交给内置 Steve / Alex，不覆盖本地选择
+          setAccountSkin(null);
+          setModel(profile.variant === "slim" ? "slim" : "default");
+          return;
+        }
+        setAccountSkin({
+          dataUrl: url,
+          name: t("skin.msSkinName", { name: activeName || accountName || profile.name }),
+          fromCache: profile.fromCache === true,
+          cachedAt: profile.cachedAt ?? null,
+        });
+        setModel(profile.variant === "slim" ? "slim" : "default");
+        if (force) setRefreshCooldown(60);
+      } catch (error) {
+        setAccountSkinError(String(error instanceof Error ? error.message : error));
+      } finally {
+        setAccountSkinLoading(false);
+        setRefreshingProfile(false);
+      }
+    },
+    [accountName, notify, t],
+  );
+
   useEffect(() => {
-    void api
-      .accountsList()
-      .then((accounts) => {
+    let alive = true;
+    void (async () => {
+      try {
+        const accounts = await api.accountsList();
+        if (!alive) return;
         const active = accounts.find((item) => item.current) ?? null;
         setAccountName(active?.name ?? "");
         setIsMicrosoft(active?.type === "microsoft");
-      })
-      .catch(() => undefined);
+        setIsThirdparty(active?.type === "thirdparty");
+        if (active?.type === "microsoft") {
+          await loadAccountSkin(false, active.name);
+        } else if (active?.type === "thirdparty") {
+          // 只读预览：拿皮肤站上正在用的那张
+          try {
+            const skin = await api.thirdpartySkin({ accountId: active.id });
+            const url = skin.previewDataUrl || skin.skinUrl || null;
+            if (url) {
+              setThirdpartyPreview({ name: active.name + "（皮肤站）", path: "thirdparty://" + skin.uuid, dataUrl: url, size: 0 });
+              setModel(skin.variant === "slim" ? "slim" : "default");
+            }
+          } catch {
+            /* 取不到就留在占位，不打扰用户 */
+          }
+        }
+      } catch {
+        /* 账号拿不到就按未登录处理，本地皮肤照常显示 */
+      } finally {
+        if (alive) setAccountsLoaded(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // 只在挂载时跑一次：切账号会重新挂载本页，按新账号重新还原
   }, []);
+
+  // 冷却倒计时（恢复正版皮肤 30s / 刷新 60s）
+  useEffect(() => {
+    if (restoreCooldown <= 0 && refreshCooldown <= 0) return;
+    const id = window.setInterval(() => {
+      setRestoreCooldown((value) => (value > 0 ? value - 1 : 0));
+      setRefreshCooldown((value) => (value > 0 ? value - 1 : 0));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [restoreCooldown > 0, refreshCooldown > 0]);
 
   const load = useCallback(async () => {
     // 三个命令互不牵连：披风失败不该把「已保存皮肤」清空，内置 Steve / Alex 更是永远要在
@@ -103,12 +209,12 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
     setSkins(list);
     setCapes(capeList);
     setCurrentPath(current);
-    // 没选皮肤（或选的那张已经不在了）→ 直接用内置 Steve，不留空白
-    const active = list.find((item) => item.path === current) ?? BUILTIN.classic;
+    // 不预设 Steve：当前皮肤由 skin_current / 账号皮肤推导，preview 只放「本页显式选择」。
+    // 选中的那张文件没了也保留上一次的选择（配合下面的「找不到该皮肤文件」提示）。
     setPreview((prev) => {
-      if (!prev) return active;
+      if (!prev) return null;
       if (prev.builtin) return prev;
-      return list.find((item) => item.path === prev.path) ?? active;
+      return list.find((item) => item.path === prev.path) ?? prev;
     });
     const activeCape = capeList?.items.find((cape) => cape.id === capeList.active) ?? null;
     setPreviewCape(activeCape ? { name: activeCape.name, dataUrl: activeCape.url } : null);
@@ -120,7 +226,21 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
     void load();
   }, [load]);
 
-  const currentSkin = useMemo(() => (skins ?? []).find((item) => item.path === currentPath) ?? null, [skins, currentPath]);
+  /** 当前皮肤：skin_current 可能给绝对路径、文件名或内置名，三种都要还原（真机曾因名字对不上而回落 Steve）。 */
+  const currentSkin = useMemo(() => {
+    const raw = (currentPath ?? "").trim();
+    const list = skins ?? [];
+    if (!raw) return null;
+    if (/^steve$/i.test(raw)) return BUILTIN.classic;
+    if (/^alex$/i.test(raw)) return BUILTIN.slim;
+    const direct = list.find((item) => item.path === raw);
+    if (direct) return direct;
+    const bare = (value: string) => value.replace(/^.*[\\/]/, "").replace(/\.png$/i, "").toLowerCase();
+    const target = bare(raw);
+    return list.find((item) => bare(item.name) === target || bare(item.path) === target) ?? null;
+  }, [skins, currentPath]);
+  // 后端说在用某张皮肤，但本地找不到这个文件：保留上一次的选择并提示，不静默回 Steve
+  const currentMissing = currentPath.trim().length > 0 && skins !== null && currentSkin === null;
   // 列表 = 内置 Steve / Alex（前端常量，唯一来源）+ 后端返回的本地皮肤。
   // 后端若也返回了内置项（builtin 标记或 builtin:// 路径），这里过滤掉，避免同一个 Steve 出现两次。
   // 「本地皮肤」只放用户自己导入/保存的（.mc\skins 里的文件，含按玩家名获取后保存的）。
@@ -142,8 +262,20 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   // 官方皮肤 tab 只放「按正版玩家名拉取」的皮肤，与「本地皮肤」分工明确
   const officialSkins = useMemo(() => (skins ?? []).filter((item) => item.source === "mojang"), [skins]);
   const [officialId, setOfficialId] = useState<string | null>(null);
-  const previewDataUrl = preview?.dataUrl ?? currentSkin?.dataUrl ?? builtin?.classic.dataUrl ?? null;
+  // 账号当前皮肤和本地当前皮肤是同一张图时，名字沿用本地那张（用户认的是文件名，不是「XX 的皮肤」）
+  const accountSkinName =
+    accountSkin && currentSkin && currentSkin.dataUrl === accountSkin.dataUrl ? currentSkin.name : accountSkin?.name ?? "";
+  const accountSkinItem: SkinItem | null = accountSkin
+    ? { name: accountSkinName, path: "ms://account", dataUrl: accountSkin.dataUrl, size: 0, source: "mojang" }
+    : null;
+  // 显示优先级：本页显式选择 > 正版账号当前皮肤 > 第三方只读预览 > 本地当前皮肤 > 内置 Steve
+  const shownSkin: SkinItem = preview ?? accountSkinItem ?? thirdpartyPreview ?? currentSkin ?? BUILTIN.classic;
+  const previewDataUrl = shownSkin.dataUrl;
+  // 账号列表 / 正版皮肤回来之前先显示骨架，别先画 Steve（看起来像皮肤被重置）
+  const previewPending = !accountsLoaded || (isMicrosoft && accountSkinLoading && !accountSkin);
   // 披风只属于正版账号：supported=false 时 items 恒为空，界面换成提示块而不是空网格
+  // 第三方账号：只读预览，上传/保存/披风/按名获取全部禁用
+  const readOnly = isThirdparty;
   const capeSupported = capes?.supported !== false;
   const capeItems = capes?.items ?? [];
   const activeCapeItem = capeItems.find((cape) => cape.id === capes?.active) ?? null;
@@ -253,7 +385,8 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   };
 
   const resetDraft = () => {
-    setPreview(currentSkin);
+    // 清掉本页显式选择，回到「后端说在用的那张 / 账号当前皮肤」
+    setPreview(null);
     setPreviewCape(activeCapeItem ? { name: activeCapeItem.name, dataUrl: activeCapeItem.url } : null);
   };
 
@@ -300,11 +433,17 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
    * 没有任何上传动作，只做本地恢复。
    */
   const restoreOfficialSkin = async () => {
+    if (restoreCooldown > 0) return;
     setRestoring(true);
     setRestoreError("");
     setRestoreNeedsAccounts(false);
     try {
+      // 不传 force：命中后端缓存，避免打爆 Microsoft 接口（force 太多会被节流）
       const profile = await api.msProfile();
+      if (profile.throttled) {
+        notify(t("skin.throttled"));
+        return;
+      }
       const nextModel: SkinModel = profile.variant === "slim" ? "slim" : "default";
       if (!profile.skinUrl) {
         // 账号用的是默认皮肤：按 variant 应用内置 Steve / Alex
@@ -315,12 +454,16 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
       }
       const displayName = (profile.name || accountName || "微软账号") + "-正版";
       // 预览层允许直接吃远程 URL，不必先落盘
-      setPreview({ name: displayName, path: profile.skinUrl, dataUrl: profile.skinUrl, size: 0 });
+      setPreview({ name: displayName, path: profile.skinUrl, dataUrl: profile.previewDataUrl || profile.skinUrl, size: 0 });
       setModel(nextModel);
       const saved = await api.skinImportFromUrl({ url: profile.skinUrl, name: displayName });
+      // 恢复 = 把账号上的这张设成当前皮肤（不再只是预览）
+      await api.skinApply(saved.path);
       await load();
       setPreview(saved);
-      notify(t("skin.restored", { name: profile.name || accountName }));
+      // 本地已有同一张（reused）：不报「保存成功」，只说已经直接应用，列表条数不变
+      notify(saved.reused ? t("skin.restoreReused") : t("skin.restored", { name: profile.name || accountName }));
+      setRestoreCooldown(30);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/过期|expired/i.test(message)) {
@@ -349,7 +492,9 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
       await api.skinsDelete({ name: target.name });
       await load();
       if (wasCurrent) {
-        setPreview(BUILTIN.classic);
+        setPreview(null);
+        // 删的是正版账号在用的那张：重新问一次账号当前皮肤（拿不到就回落到内置 Steve）
+        void loadAccountSkin(false);
         notify(t("skin.switchedToSteve"));
       } else {
         notify(t("skin.deleted", { name: target.name }));
@@ -400,22 +545,40 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
           void acceptFile(event.dataTransfer.files?.[0]);
         }}
       >
-        <SkinViewer3D
-          skin={previewDataUrl}
-          model={model}
-          action={action}
-          autoRotate={autoRotate}
-          dark={dark}
-          cape={capeSupported ? (previewCape?.dataUrl ?? null) : null}
-          capeNote={capeSupported ? null : t("cape.needOfficial")}
-          resetToken={resetToken}
-        />
+        {previewPending ? (
+          <div className="skin-preview__skeleton" data-skin-preview-loading>
+            <span className="skel skel--block" />
+          </div>
+        ) : (
+          <div className="skin-preview" data-skin-preview-src={previewDataUrl}>
+          <SkinViewer3D
+            skin={previewDataUrl}
+            model={model}
+            action={action}
+            autoRotate={autoRotate}
+            dark={dark}
+            cape={capeSupported ? (previewCape?.dataUrl ?? null) : null}
+            capeNote={capeSupported ? null : t("cape.needOfficial")}
+            resetToken={resetToken}
+          />
+          </div>
+        )}
+
+        {readOnly ? (
+          <div className="row__hint" data-skin-readonly-note>
+            {t("skin.tpNote")}
+          </div>
+        ) : null}
 
         <div className="skin-panel__row" data-skin-account>
           <span className="skin-panel__label">{t("skin.account")}</span>
           <span className="skin-panel__value">
             {accountName || "—"}
-            {isMicrosoft ? (
+            {isThirdparty ? (
+              <span className="chip chip--tiny" data-skin-account-badge>
+                {t("skin.tpBadge")}
+              </span>
+            ) : isMicrosoft ? (
               <span className="chip chip--tiny" data-skin-account-badge>
                 {t("skin.accountBadge")}
               </span>
@@ -426,9 +589,49 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
         <div className="skin-panel__row">
           <span className="skin-panel__label">{t("skin.current")}</span>
           <span className="skin-panel__value" data-skin-current>
-            {preview?.name ?? t("skin.none")}
+            {accountsLoaded ? shownSkin.name : t("common.loading")}
           </span>
         </div>
+
+        {isMicrosoft && accountSkin ? (
+          <div className="skin-panel__row" data-skin-ms-row>
+            <span className="skin-panel__label">{t("skin.source")}</span>
+            <span className="skin-panel__value">
+              <span data-skin-ms-source>{t("skin.msSource")}</span>
+              {accountSkin.fromCache && accountSkin.cachedAt ? (
+                <span className="row__hint" data-skin-ms-cache>
+                  {t("skin.msCachedAt", { time: formatCacheTime(accountSkin.cachedAt) })}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                className="link-button"
+                data-action="skin-ms-refresh"
+                disabled={refreshingProfile || refreshCooldown > 0}
+                title={t("skin.refresh")}
+                onClick={() => void loadAccountSkin(true)}
+              >
+                {refreshCooldown > 0
+                  ? t("skin.restoreCooldown", { secs: refreshCooldown })
+                  : refreshingProfile
+                    ? t("common.loading")
+                    : t("skin.refresh")}
+              </button>
+            </span>
+          </div>
+        ) : null}
+
+        {accountSkinError ? (
+          <div className="field-error" data-skin-ms-error>
+            {t("skin.msProfileFailed", { reason: accountSkinError })}
+          </div>
+        ) : null}
+
+        {currentMissing ? (
+          <div className="row__hint" data-skin-current-missing>
+            {t("skin.currentMissing", { name: currentPath })}
+          </div>
+        ) : null}
 
         <div className="skin-panel__row">
           <span className="skin-panel__label">{t("skin.action")}</span>
@@ -479,26 +682,51 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
             <img src={icons.refresh} alt="" />
             {t("skin.resetView")}
           </button>
-          <button type="button" className="pill-outline" data-action="cape-open-2" onClick={openCapeSettings}>
+          <button
+            type="button"
+            className="pill-outline"
+            data-action="cape-open-2"
+            disabled={readOnly}
+            title={readOnly ? t("skin.tpOnlyPreview") : undefined}
+            onClick={openCapeSettings}
+          >
             {t("cape.title")}
           </button>
-          {isMicrosoft ? (
+          {isMicrosoft || isThirdparty ? (
             <button
               type="button"
               className="pill-outline"
               data-action="skin-restore-ms"
-              disabled={restoring}
-              title={t("skin.restore")}
+              data-skin-restore-cooldown={restoreCooldown > 0 || isThirdparty ? "1" : "0"}
+              disabled={restoring || restoreCooldown > 0 || isThirdparty}
+              title={
+                isThirdparty
+                  ? t("skin.tpOnlyPreview")
+                  : restoreCooldown > 0
+                    ? t("skin.restoreCooldownTip")
+                    : t("skin.restore")
+              }
               onClick={() => void restoreOfficialSkin()}
             >
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <path d="M7 17.5h9.5a3.5 3.5 0 0 0 .4-6.98A5 5 0 0 0 7.6 9.2 3.7 3.7 0 0 0 7 17.5z" />
                 <path d="M12 11.5v5.2M9.9 14.6 12 16.7l2.1-2.1" />
               </svg>
-              {restoring ? t("skin.restoring") : t("skin.restore")}
+              {restoring
+                ? t("skin.restoring")
+                : restoreCooldown > 0
+                  ? t("skin.restoreCooldown", { secs: restoreCooldown })
+                  : t("skin.restore")}
             </button>
           ) : null}
-          <button type="button" className="pill-outline" disabled={busy} onClick={() => void saveOnly()}>
+          <button
+            type="button"
+            className="pill-outline"
+            data-action="skin-save-local"
+            disabled={busy || readOnly}
+            title={readOnly ? t("skin.tpOnlyPreview") : undefined}
+            onClick={() => void saveOnly()}
+          >
             <img src={icons.download} alt="" />
             {t("skin.saveLocal")}
           </button>
@@ -544,7 +772,14 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
             <button type="button" className="pill-outline" onClick={resetDraft}>
               {t("skin.reset")}
             </button>
-            <button type="button" className="pill-button" data-action="skin-apply" disabled={busy} onClick={() => void saveAndApply()}>
+            <button
+              type="button"
+              className="pill-button"
+              data-action="skin-apply"
+              disabled={busy || readOnly}
+              title={readOnly ? t("skin.tpOnlyPreview") : undefined}
+              onClick={() => void saveAndApply()}
+            >
               {isMicrosoft ? t("skin.apply") : t("skin.applyLocal")}
             </button>
           </div>
@@ -618,6 +853,8 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
               type="button"
               className="pill-outline"
               data-action="skin-mojang-open-2"
+              disabled={readOnly}
+              title={readOnly ? t("skin.tpOnlyPreview") : undefined}
               onClick={() => {
                 setMojangError("");
                 setMojangOpen(true);
@@ -647,13 +884,27 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
           allSkins.length === 0 && !isStaged ? (
             <div className="empty-hint skin-empty" data-skin-local-empty>
               {t("skin.localEmpty")}
-              <button type="button" className="pill-outline" data-action="skin-upload-empty" onClick={() => fileRef.current?.click()}>
+              <button
+                type="button"
+                className="pill-outline"
+                data-action="skin-upload-empty"
+                disabled={readOnly}
+                title={readOnly ? t("skin.tpOnlyPreview") : undefined}
+                onClick={() => fileRef.current?.click()}
+              >
                 {t("skin.upload")}
               </button>
             </div>
           ) : (
           <div className="skin-grid">
-            <button type="button" className="skin-tile skin-tile--upload" onClick={() => fileRef.current?.click()}>
+            <button
+              type="button"
+              className="skin-tile skin-tile--upload"
+              data-action="skin-upload"
+              disabled={readOnly}
+              title={readOnly ? t("skin.tpOnlyPreview") : undefined}
+              onClick={() => fileRef.current?.click()}
+            >
               <span className="skin-tile__plus" aria-hidden="true">
                 +
               </span>
@@ -687,6 +938,7 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
                   <span className="skin-tile__name">{item.name}</span>
                   <span className="skin-tile__meta">{formatBytes(item.size)}</span>
                 </button>
+                {readOnly ? null : (
                 <button
                   type="button"
                   className="skin-tile__delete"
@@ -702,6 +954,7 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
                 >
                   <img src={icons.trash} alt={t("common.delete")} />
                 </button>
+                )}
                 {deletingName === item.name ? <span className="skin-tile__deleting">{t("skin.deleting")}</span> : null}
               </div>
             ))}
@@ -751,6 +1004,36 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
                 >
                   {/* 头像要和账号页一致：先裁头部（8,8）再叠帽子层（40,8），别把整张 64×64 贴图塞进来 */}
                   <HeadAvatar className="official-skin__img" skin={entry.url} size={56} />
+                  {isMicrosoft && !readOnly ? (
+                    <span
+                      className="official-skin__upload"
+                      role="button"
+                      tabIndex={0}
+                      data-action="official-skin-upload"
+                      data-official-upload={entry.id}
+                      title={t("skin.uploadToAccount")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setOfficialId(entry.id);
+                        setPreview({
+                          name: entry.name,
+                          path: "official://" + entry.id,
+                          dataUrl: entry.url,
+                          size: 0,
+                          builtin: false,
+                          source: "mojang",
+                        });
+                        setModel(entry.model === "classic" ? "default" : "slim");
+                        setUploadError("");
+                        setUploadOpen(true);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") event.preventDefault();
+                      }}
+                    >
+                      {t("skin.uploadToAccount")}
+                    </span>
+                  ) : null}
                   <span className="official-skin__name">{entry.name}</span>
                   <span className="official-skin__model">
                     {entry.model === "classic" ? t("skin.model.classic") : t("skin.model.slim")}
@@ -777,7 +1060,7 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
             event.target.value = "";
           }}
         />
-        <div className="row__hint">{t("skin.dragHint")}</div>
+
       </section>
 
       {capeOpen ? (

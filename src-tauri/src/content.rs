@@ -764,6 +764,20 @@ pub struct ProjectDetail {
     pub icon_url: Option<String>,
     pub downloads: u64,
     pub provider: String,
+    /// mod / modpack / resourcepack / shader / plugin / datapack（前端按它切按钮文案）
+    pub kind: String,
+}
+
+/// classId → kind（详情里的 kind 反查用）。
+pub fn kind_of_class_id(class_id: u32) -> &'static str {
+    match class_id {
+        6 => "mod",
+        12 => "resourcepack",
+        6552 => "shader",
+        4471 => "modpack",
+        5 => "plugin",
+        _ => "",
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -931,6 +945,11 @@ pub fn parse_detail(provider: Provider, json: &str) -> Result<ProjectDetail> {
             icon_url: as_string(entry.pointer("/logo/thumbnailUrl")),
             downloads: as_u64(entry.get("downloadCount")),
             provider: provider_id,
+            kind: entry
+                .get("classId")
+                .and_then(|item| item.as_u64())
+                .map(|id| kind_of_class_id(id as u32).to_string())
+                .unwrap_or_default(),
         });
     }
     Ok(ProjectDetail {
@@ -941,6 +960,7 @@ pub fn parse_detail(provider: Provider, json: &str) -> Result<ProjectDetail> {
         icon_url: as_string(value.get("icon_url")),
         downloads: as_u64(value.get("downloads")),
         provider: provider_id,
+        kind: as_string(value.get("project_type")).unwrap_or_default(),
     })
 }
 
@@ -1589,6 +1609,19 @@ mod tests {
         assert!(mirror_versions.starts_with("https://mod.mcimirror.top/curseforge/v1/mods/238222/files"));
         let official_versions = versions_url_for(Provider::Curseforge, true, "238222", None, None).unwrap();
         assert!(official_versions.starts_with("https://api.curseforge.com/v1/mods/238222/files"));
+    }
+
+    #[test]
+    fn detail_carries_kind_for_the_frontend_button() {
+        let modrinth = r#"{"id":"abc","title":"Fabulously Optimized","project_type":"modpack","downloads":10}"#;
+        let detail = parse_detail(Provider::Modrinth, modrinth).unwrap();
+        assert_eq!(detail.kind, "modpack");
+        let curse = r#"{"data":{"id":4471,"name":"Pack","classId":4471,"downloadCount":5}}"#;
+        let detail = parse_detail(Provider::Curseforge, curse).unwrap();
+        assert_eq!(detail.kind, "modpack");
+        assert_eq!(kind_of_class_id(6), "mod");
+        assert_eq!(kind_of_class_id(5), "plugin");
+        assert_eq!(kind_of_class_id(9999), "");
     }
 
     #[test]

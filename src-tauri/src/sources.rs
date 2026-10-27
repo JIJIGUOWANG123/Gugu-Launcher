@@ -17,6 +17,46 @@ use crate::settings::Settings;
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// 每个源测几次取中位数。
 pub const PROBE_SAMPLES: usize = 3;
+/// 探测结果缓存 10 分钟（设置页反复打开不必重复打）。
+pub const PROBE_CACHE_TTL: Duration = Duration::from_secs(600);
+
+type ProbeCache = std::sync::Mutex<
+    std::collections::HashMap<String, (Instant, SourceProbe)>,
+>;
+
+fn probe_cache() -> &'static ProbeCache {
+    static CACHE: std::sync::OnceLock<ProbeCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 取缓存里的探测结果（过期就丢掉）。
+pub fn cached_probe(source_id: &str) -> Option<SourceProbe> {
+    let guard = probe_cache().lock().ok()?;
+    let (at, probe) = guard.get(source_id)?;
+    if at.elapsed() < PROBE_CACHE_TTL {
+        Some(probe.clone())
+    } else {
+        None
+    }
+}
+
+fn store_probe(probe: &SourceProbe) {
+    if let Ok(mut guard) = probe_cache().lock() {
+        guard.insert(probe.source_id.clone(), (Instant::now(), probe.clone()));
+    }
+}
+
+/// 清空探测缓存（设置里换了自定义镜像、或手动重测）。
+pub fn clear_probe_cache() {
+    if let Ok(mut guard) = probe_cache().lock() {
+        guard.clear();
+    }
+}
+
+/// 探测时只看这些状态码算可用：200/206 直接好，3xx（跟随重定向后）也算好。
+pub fn probe_status_usable(status: u16) -> bool {
+    (200..400).contains(&status)
+}
 
 /// 运行期的一个下载源：内置四种之一，或用户自定义镜像根。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,43 +232,99 @@ pub fn order_by_probes(candidates: Vec<Origin>, probes: &[SourceProbe]) -> Vec<O
     sorted
 }
 
-/// 单源测速：连发 PROBE_SAMPLES 次 HEAD，取中位数。
+/// 单源测速：对**已知存在的真实文件**发 GET Range(0-0)，只读 1 字节。
+///
+/// HEAD 在 CDN 上经常被 405/403 挡掉，所以不用 HEAD。
 pub async fn probe_one(client: &reqwest::Client, origin: &Origin) -> SourceProbe {
+    if let Some(hit) = cached_probe(origin.id()) {
+        tracing::debug!(source = %origin.id(), latency_ms = hit.latency_ms, "下载源探测命中缓存");
+        return hit;
+    }
     let url = map_origin(origin, OFFICIAL_MANIFEST);
     let mut samples: Vec<u64> = Vec::new();
     let mut last_error: Option<String> = None;
+    let mut last_status: Option<u16> = None;
     for _ in 0..PROBE_SAMPLES {
         let started = Instant::now();
-        let attempt = tokio::time::timeout(PROBE_TIMEOUT, client.head(&url).send()).await;
+        let attempt = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            client
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-0")
+                .send(),
+        )
+        .await;
+        let elapsed = started.elapsed().as_millis() as u64;
         match attempt {
-            Ok(Ok(response)) if response.status().is_success() => {
-                samples.push(started.elapsed().as_millis() as u64);
-            }
             Ok(Ok(response)) => {
-                last_error = Some(format!("HTTP {}", response.status().as_u16()));
+                let status = response.status().as_u16();
+                last_status = Some(status);
+                if probe_status_usable(status) {
+                    samples.push(elapsed);
+                    tracing::info!(
+                        source = %origin.id(),
+                        url = %url,
+                        status,
+                        elapsed_ms = elapsed,
+                        "下载源探测成功"
+                    );
+                    continue;
+                }
+                last_error = Some(format!("HTTP {status}"));
+                tracing::warn!(
+                    source = %origin.id(),
+                    url = %url,
+                    status,
+                    elapsed_ms = elapsed,
+                    "下载源探测状态码不可用"
+                );
             }
             Ok(Err(err)) => {
                 last_error = Some(format!("{err}"));
+                tracing::warn!(
+                    source = %origin.id(),
+                    url = %url,
+                    elapsed_ms = elapsed,
+                    error = %err,
+                    "下载源探测连接失败"
+                );
             }
             Err(_) => {
                 last_error = Some(format!("超时（{} 秒）", PROBE_TIMEOUT.as_secs()));
+                tracing::warn!(
+                    source = %origin.id(),
+                    url = %url,
+                    elapsed_ms = elapsed,
+                    "下载源探测超时"
+                );
             }
         }
     }
-    if samples.is_empty() {
-        return SourceProbe {
+    let probe = if samples.is_empty() {
+        SourceProbe {
             source_id: origin.id().to_string(),
             ok: false,
             latency_ms: 0,
             error: Some(last_error.unwrap_or_else(|| "没有响应".to_string())),
-        };
-    }
-    SourceProbe {
-        source_id: origin.id().to_string(),
-        ok: true,
-        latency_ms: median_of(samples),
-        error: None,
-    }
+        }
+    } else {
+        SourceProbe {
+            source_id: origin.id().to_string(),
+            ok: true,
+            latency_ms: median_of(samples),
+            error: None,
+        }
+    };
+    tracing::info!(
+        source = %probe.source_id,
+        ok = probe.ok,
+        latency_ms = probe.latency_ms,
+        status = ?last_status,
+        error = ?probe.error,
+        "下载源判定结果"
+    );
+    store_probe(&probe);
+    probe
 }
 
 /// 并发测一组源。

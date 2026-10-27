@@ -27,6 +27,13 @@ const PLAYS: Array<{ id: BackgroundPlay; labelKey: string }> = [
 
 const PAGE_SIZE = 20;
 
+/** 预览对象的稳定标识：文件名 + 地址（换文件或换方案都要重置错误态）。 */
+function previewItemKey(page: BackgroundPage | null, activeName: string): string {
+  const items = page?.items ?? [];
+  const item = items.find((entry) => entry.file === activeName) ?? items[0] ?? null;
+  return item ? item.file + "|" + item.url : "";
+}
+
 /**
  * 设置 → 外观 → 背景：四方案互斥，选中哪个就只有哪个生效（其余三个自动关闭），
  * 改动立刻写进 settings.appearance，背景层马上跟着换。
@@ -40,6 +47,7 @@ export function BackgroundPanel({ settings, onChange, notify }: Props) {
   const [loading, setLoading] = useState(false);
   const [defaultDir, setDefaultDir] = useState("");
   const [urlTick, setUrlTick] = useState(0);
+  const [previewError, setPreviewError] = useState("");
 
   const patch = useCallback(
     (next: Partial<AppearanceSettings>) => {
@@ -108,7 +116,8 @@ export function BackgroundPanel({ settings, onChange, notify }: Props) {
     const next: Partial<AppearanceSettings> = appearance.mode === "wallpaper" ? { wallpaperFile: file } : { localFile: file };
     const previous = appearance.mode;
     try {
-      await api.backgroundApply(listKind, file);
+      // 键名必须是 file（真机报过 missing required key file）
+      await api.backgroundApply({ kind: listKind, file });
       patch(next);
       notify(t("settings.bg.applied", { name: file }));
     } catch (error) {
@@ -117,8 +126,16 @@ export function BackgroundPanel({ settings, onChange, notify }: Props) {
     }
   };
 
+  // 换预览对象（换文件 / 换方案）时清掉上一条的错误，否则会一直挂着旧原因
+  const previewKey = previewItemKey(browsed, appearance.mode === "wallpaper" ? appearance.wallpaperFile : appearance.localFile);
+  useEffect(() => {
+    setPreviewError("");
+  }, [previewKey]);
+
   const pages = browsed ? Math.max(1, Math.ceil(browsed.total / browsed.pageSize)) : 1;
   const activeName = appearance.mode === "wallpaper" ? appearance.wallpaperFile : appearance.localFile;
+  // 预览框：优先显示正在用的那张，没有就用列表第一张；视频走 <video muted loop>
+  const previewItem = browsed?.items.find((item) => item.file === activeName) ?? browsed?.items[0] ?? null;
 
   return (
     <div className="settings-card bg-panel" data-bg-panel>
@@ -221,10 +238,58 @@ export function BackgroundPanel({ settings, onChange, notify }: Props) {
             </div>
           ) : null}
 
+          {previewItem ? (
+            <div className="bg-preview" data-bg-preview={previewItem.isVideo ? "video" : "image"}>
+              {previewItem.isVideo ? (
+                <>
+                  {/* 视频项始终保留 <video>：加载/解码失败只在上面叠一层错误提示，不把元素换掉 */}
+                  <video
+                    className="bg-preview__media"
+                    data-bg-preview-video
+                    key={previewItem.url}
+                    src={previewItem.url}
+                    poster={previewItem.previewUrl}
+                    autoPlay
+                    muted
+                    loop
+                    playsInline
+                    onError={() => setPreviewError("无法播放该视频（编码不支持或文件损坏）")}
+                  />
+                  {previewError ? (
+                    <div className="bg-preview__error" data-bg-preview-error>
+                      {t("settings.bg.previewFailed", { reason: previewError })}
+                    </div>
+                  ) : null}
+                </>
+              ) : previewError ? (
+                <div className="bg-preview__error" data-bg-preview-error>
+                  {t("settings.bg.previewFailed", { reason: previewError })}
+                </div>
+              ) : (
+                <img
+                  className="bg-preview__media"
+                  data-bg-preview-img
+                  key={previewItem.url}
+                  src={previewItem.previewUrl || previewItem.url}
+                  alt=""
+                  onError={() => setPreviewError("无法加载该图片")}
+                />
+              )}
+              <span className="bg-preview__name">{previewItem.file}</span>
+            </div>
+          ) : null}
+
           {loading ? (
             <div className="row__hint">{t("settings.bg.loading")}</div>
           ) : browsed === null || browsed.items.length === 0 ? (
-            <div className="empty-hint">{t("settings.bg.empty")}</div>
+            <div className="empty-hint" data-bg-empty>
+              {t("settings.bg.empty")}
+              {browsed?.dir ? (
+                <div className="row__hint" data-bg-empty-dir>
+                  {t("settings.bg.emptyDir", { dir: browsed.dir })}
+                </div>
+              ) : null}
+            </div>
           ) : (
             <div className="bg-grid" data-bg-grid>
               {browsed.items.map((item) => (

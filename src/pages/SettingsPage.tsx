@@ -1062,6 +1062,32 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
         </div>
       </div>
       <div className="row__hint">{t("settings.updateHint")}</div>
+      <div className="field" data-force-chinese>
+        <label htmlFor="setting-force-chinese">{t("settings.forceChinese")}</label>
+        <div className="settings-switch-row" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <label className="switch">
+            <input
+              id="setting-force-chinese"
+              type="checkbox"
+              checked={settings.forceChinese}
+              data-setting="forceChinese"
+              aria-label={t("settings.forceChinese")}
+              onChange={(event) => onChange({ forceChinese: event.target.checked })}
+            />
+            <span className="switch__track" aria-hidden="true">
+              <span className="switch__dot" />
+            </span>
+          </label>
+          <span
+            className="settings-switch-row__state"
+            style={{ fontSize: 12, fontWeight: 600, color: "var(--accent-strong)" }}
+            data-force-chinese-state
+          >
+            {settings.forceChinese ? t("settings.forceChineseOn") : t("settings.forceChineseOff")}
+          </span>
+        </div>
+        <div className="row__hint">{t("settings.forceChineseHint")}</div>
+      </div>
       <div className="row__hint">{t("settings.behaviorHint")}</div>
     </section>
   );

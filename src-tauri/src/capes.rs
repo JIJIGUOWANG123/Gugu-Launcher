@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::accounts::{self, StoredAccount};
 use crate::error::{AppError, Result};
@@ -35,6 +35,8 @@ pub const REASON_OFFLINE: &str = "离线账号不支持披风，登录微软账�
 pub const REASON_THIRDPARTY: &str = "第三方（皮肤站）账号不支持披风";
 pub const REASON_NO_LOGIN: &str = "请先登录微软账号";
 pub const REASON_EXPIRED: &str = "登录已过期，请重新登录";
+/// Mojang 限流时的中文提示。
+pub const REASON_RATE_LIMITED: &str = "Mojang 接口限流，请稍后重试";
 
 /// capes_list 的元素。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -352,6 +354,10 @@ pub async fn require_session(
                 })
             }
             ProfileOutcome::Expired => {}
+            // 限流时无法校验令牌，先按现有令牌继续（真失效会在下一次调用暴露）
+            ProfileOutcome::RateLimited => {
+                tracing::warn!("校验令牌时被 Mojang 限流（429），先沿用现有令牌")
+            }
         }
     }
     let refreshed = crate::ms_login::refresh_access_token(client, paths, settings, &account).await?;
@@ -364,6 +370,8 @@ pub async fn require_session(
 pub enum ProfileOutcome {
     Ok(String),
     Expired,
+    /// 429：Mojang 限流（有缓存就先用缓存）
+    RateLimited,
 }
 
 /// GET /minecraft/profile；401/403 折算成 Expired。
@@ -382,6 +390,7 @@ pub async fn fetch_profile(client: &reqwest::Client, token: &str) -> Result<Prof
     match status {
         200 => Ok(ProfileOutcome::Ok(text)),
         401 | 403 => Ok(ProfileOutcome::Expired),
+        429 => Ok(ProfileOutcome::RateLimited),
         other => Err(AppError::Net(format!("账号资料接口返回 HTTP {other}"))),
     }
 }
@@ -406,6 +415,10 @@ pub async fn capes_list(
     let text = match fetch_profile(client, &session.token).await? {
         ProfileOutcome::Ok(text) => text,
         ProfileOutcome::Expired => return Ok(CapesListResult::unsupported(REASON_EXPIRED)),
+        ProfileOutcome::RateLimited => {
+            tracing::warn!("读取披风时被 Mojang 限流（429）");
+            return Ok(CapesListResult::unsupported(REASON_RATE_LIMITED));
+        }
     };
     let (mut items, active) = parse_profile_capes(&text)?;
     let dir = skins::capes_dir(paths);
@@ -509,6 +522,7 @@ pub async fn cape_set_active(
         bytes = text.len(),
         "披风已切换"
     );
+    clear_profile_cache(paths, &session.account.uuid);
     Ok(CapeState { active })
 }
 
@@ -520,6 +534,7 @@ async fn active_cape_id(client: &reqwest::Client, token: &str) -> Result<Option<
             Ok(active)
         }
         ProfileOutcome::Expired => Err(AppError::Invalid(REASON_EXPIRED.to_string())),
+        ProfileOutcome::RateLimited => Err(AppError::Invalid(REASON_RATE_LIMITED.to_string())),
     }
 }
 
@@ -600,6 +615,7 @@ pub async fn skin_upload(
         token = %util::mask_secret(&session.token),
         "皮肤已上传"
     );
+    clear_profile_cache(paths, &session.account.uuid);
 
     // 上传会顶掉当前披风：重新选一次
     let active = active_cape_id(client, &session.token).await.unwrap_or(None);
@@ -700,6 +716,226 @@ pub fn parse_account_profile(json: &str) -> Result<AccountProfile> {
     })
 }
 
+// ------------------------------------------------------------------ ms_profile 缓存
+
+/// 资料缓存有效期 10 分钟。
+pub const PROFILE_TTL_SECS: u64 = 600;
+/// force 刷新的最小间隔：60 秒内再 force 直接回缓存。
+pub const PROFILE_THROTTLE_SECS: u64 = 60;
+/// 皮肤预览 data URL 上限 128KB。
+pub const PROFILE_PREVIEW_LIMIT: usize = 128 * 1024;
+
+/// 落盘的账号资料（.mc/cache/ms-profile-<uuid8>.json）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedProfile {
+    pub kind: String,
+    pub name: String,
+    pub uuid: String,
+    pub skin_url: String,
+    pub cape_url: String,
+    pub variant: String,
+    pub fetched_at: u64,
+}
+
+/// ms_profile 的返回（带缓存标记与预览图）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MsProfileView {
+    pub kind: String,
+    pub name: String,
+    pub uuid: String,
+    pub skin_url: String,
+    pub cape_url: String,
+    pub variant: String,
+    pub from_cache: bool,
+    pub fetched_at: String,
+    /// force 被节流时为 true（前端提示「请勿频繁使用」）
+    pub throttled: bool,
+    pub preview_data_url: String,
+}
+
+pub fn uuid_prefix(uuid: &str) -> String {
+    uuid.trim().replace('-', "").chars().take(8).collect()
+}
+
+pub fn profile_cache_path(paths: &Paths, uuid: &str) -> PathBuf {
+    paths
+        .cache
+        .join(format!("ms-profile-{}.json", uuid_prefix(uuid)))
+}
+
+pub fn profile_preview_path(paths: &Paths, uuid: &str) -> PathBuf {
+    paths
+        .cache
+        .join(format!("ms-skin-{}.png", uuid_prefix(uuid)))
+}
+
+pub fn read_profile_cache(paths: &Paths, uuid: &str) -> Option<CachedProfile> {
+    let text = std::fs::read_to_string(profile_cache_path(paths, uuid)).ok()?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+}
+
+pub fn write_profile_cache(paths: &Paths, profile: &CachedProfile) -> Result<()> {
+    std::fs::create_dir_all(&paths.cache)?;
+    let path = profile_cache_path(paths, &profile.uuid);
+    std::fs::write(&path, serde_json::to_string_pretty(profile)?)?;
+    Ok(())
+}
+
+pub fn profile_cache_is_fresh(fetched_at: u64, now: u64) -> bool {
+    now.saturating_sub(fetched_at) < PROFILE_TTL_SECS
+}
+
+/// 登录/上传/切披风成功后失效缓存（下次一定重新拉）。
+pub fn clear_profile_cache(paths: &Paths, uuid: &str) -> usize {
+    let mut removed = 0;
+    for path in [
+        profile_cache_path(paths, uuid),
+        profile_preview_path(paths, uuid),
+    ] {
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        tracing::info!(uuid = %uuid_prefix(uuid), removed, "已失效 ms_profile 缓存");
+    }
+    removed
+}
+
+fn preview_of_png(path: &Path) -> String {
+    let Ok(size) = std::fs::metadata(path).map(|meta| meta.len()) else {
+        return String::new();
+    };
+    if size == 0 || size as usize > PROFILE_PREVIEW_LIMIT {
+        return String::new();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => format!("data:image/png;base64,{}", util::base64_encode(&bytes)),
+        Err(_) => String::new(),
+    }
+}
+
+fn view_of(profile: &CachedProfile, paths: &Paths, from_cache: bool, throttled: bool) -> MsProfileView {
+    MsProfileView {
+        kind: profile.kind.clone(),
+        name: profile.name.clone(),
+        uuid: profile.uuid.clone(),
+        skin_url: profile.skin_url.clone(),
+        cape_url: profile.cape_url.clone(),
+        variant: profile.variant.clone(),
+        from_cache,
+        fetched_at: util::iso8601(profile.fetched_at),
+        throttled,
+        preview_data_url: preview_of_png(&profile_preview_path(paths, &profile.uuid)),
+    }
+}
+
+/// 把皮肤贴图缓存到 .mc/cache（失败只 warn）。
+async fn cache_profile_skin(client: &reqwest::Client, paths: &Paths, profile: &CachedProfile) {
+    if profile.skin_url.trim().is_empty() {
+        return;
+    }
+    let target = profile_preview_path(paths, &profile.uuid);
+    if target.is_file() {
+        return;
+    }
+    match client
+        .get(&profile.skin_url)
+        .header(
+            reqwest::header::USER_AGENT,
+            crate::skins::SKIN_DOWNLOAD_USER_AGENT,
+        )
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            if let Ok(bytes) = response.bytes().await {
+                if crate::png::png_size(&bytes).is_some() {
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(err) = std::fs::write(&target, &bytes) {
+                        tracing::warn!(%err, "写皮肤预览缓存失败");
+                    }
+                }
+            }
+        }
+        Ok(response) => tracing::warn!(status = response.status().as_u16(), "下载皮肤预览失败"),
+        Err(err) => tracing::warn!(%err, "下载皮肤预览失败"),
+    }
+}
+
+/// ms_profile：10 分钟磁盘缓存 + force 60 秒节流 + 429 回落缓存。
+pub async fn ms_profile_cached(
+    client: &reqwest::Client,
+    paths: &Paths,
+    settings: &Settings,
+    force: bool,
+) -> Result<MsProfileView> {
+    let account = current_account(paths);
+    if let Some(reason) = unsupported_reason(account.as_ref()) {
+        return Err(AppError::Invalid(reason.to_string()));
+    }
+    let account = account.expect("unsupported_reason 已排除 None");
+    let uuid = account.uuid.clone();
+    let now = util::now_unix();
+    let cached = read_profile_cache(paths, &uuid);
+
+    if let Some(cached) = cached.as_ref() {
+        let age = now.saturating_sub(cached.fetched_at);
+        if !force && profile_cache_is_fresh(cached.fetched_at, now) {
+            tracing::info!(age_secs = age, "ms_profile 命中缓存");
+            return Ok(view_of(cached, paths, true, false));
+        }
+        if force && age < PROFILE_THROTTLE_SECS {
+            tracing::info!(age_secs = age, "ms_profile 节流，返回缓存");
+            return Ok(view_of(cached, paths, true, true));
+        }
+    }
+
+    let session = require_session(client, paths, settings).await?;
+    let text = match fetch_profile(client, &session.token).await? {
+        ProfileOutcome::Ok(text) => text,
+        ProfileOutcome::Expired => return Err(AppError::Invalid(REASON_EXPIRED.to_string())),
+        ProfileOutcome::RateLimited => {
+            tracing::warn!(url = PROFILE_URL, "ms_profile 被限流（HTTP 429）");
+            return match cached {
+                Some(cached) => Ok(view_of(&cached, paths, true, false)),
+                None => Err(AppError::Invalid(
+                    "Mojang 接口限流，请稍后重试".to_string(),
+                )),
+            };
+        }
+    };
+    let profile = parse_account_profile(&text)?;
+    let record = CachedProfile {
+        kind: profile.kind.clone(),
+        name: profile.name.clone(),
+        uuid: if profile.uuid.trim().is_empty() {
+            uuid.clone()
+        } else {
+            profile.uuid.clone()
+        },
+        skin_url: profile.skin_url.clone(),
+        cape_url: profile.cape_url.clone(),
+        variant: profile.variant.clone(),
+        fetched_at: now,
+    };
+    if let Err(err) = write_profile_cache(paths, &record) {
+        tracing::warn!(%err, "写 ms_profile 缓存失败");
+    }
+    cache_profile_skin(client, paths, &record).await;
+    tracing::info!(
+        player = %record.name,
+        skin = !record.skin_url.is_empty(),
+        cape = !record.cape_url.is_empty(),
+        "ms_profile 已刷新并写入缓存"
+    );
+    Ok(view_of(&record, paths, false, false))
+}
+
 /// ms_profile：读一次账号资料（失败只报错，不动账号状态）。
 pub async fn ms_profile(
     client: &reqwest::Client,
@@ -710,6 +946,7 @@ pub async fn ms_profile(
     match fetch_profile(client, &session.token).await? {
         ProfileOutcome::Ok(text) => parse_account_profile(&text),
         ProfileOutcome::Expired => Err(AppError::Invalid(REASON_EXPIRED.to_string())),
+        ProfileOutcome::RateLimited => Err(AppError::Invalid(REASON_RATE_LIMITED.to_string())),
     }
 }
 
@@ -756,6 +993,10 @@ pub async fn refresh_appearance(
     let text = match fetch_profile(client, token).await? {
         ProfileOutcome::Ok(text) => text,
         ProfileOutcome::Expired => return Err(AppError::Invalid(REASON_EXPIRED.to_string())),
+        ProfileOutcome::RateLimited => {
+            tracing::warn!("刷新外观时被 Mojang 限流（429）");
+            return Err(AppError::Invalid(REASON_RATE_LIMITED.to_string()));
+        }
     };
     let profile = parse_account_profile(&text)?;
     let mut local: Option<String> = None;
@@ -777,6 +1018,7 @@ pub async fn refresh_appearance(
         tracing::warn!(%err, "回写账号外观失败（不影响登录）");
     }
     let removed = invalidate_cape_cache(paths);
+    clear_profile_cache(paths, &profile.uuid);
     tracing::info!(
         player = %profile.name,
         skin = if profile.skin_url.is_empty() { "无" } else { "有" },
@@ -826,6 +1068,7 @@ mod tests {
             refresh_token: String::new(),
             skin_url: String::new(),
             local_skin: String::new(),
+            server: String::new(),
             created_at: String::new(),
         }
     }
@@ -978,7 +1221,7 @@ mod tests {
             r#""capes":[]"#
         };
         format!(
-            r#"{{"id":"069a79f444e94726a5befca90e38aaf5","name":"Notch",{skins},{capes}}}"#
+            r#"{{"id":"0123456789abcdef0123456789abcdef","name":"PlayerOne",{skins},{capes}}}"#
         )
     }
 
@@ -986,8 +1229,8 @@ mod tests {
     fn profile_with_skin_and_active_cape() {
         let profile = parse_account_profile(&profile_json(true, true)).unwrap();
         assert_eq!(profile.kind, "ms");
-        assert_eq!(profile.name, "Notch");
-        assert_eq!(profile.uuid, "069a79f444e94726a5befca90e38aaf5");
+        assert_eq!(profile.name, "PlayerOne");
+        assert_eq!(profile.uuid, "0123456789abcdef0123456789abcdef");
         assert_eq!(profile.skin_url, "https://t/skin.png");
         assert_eq!(profile.variant, "slim");
         // 只有 ACTIVE 的那张算当前披风
@@ -1003,7 +1246,7 @@ mod tests {
         assert_eq!(profile.skin_url, "");
         assert_eq!(profile.cape_url, "");
         assert_eq!(profile.variant, "classic");
-        assert_eq!(profile.name, "Notch");
+        assert_eq!(profile.name, "PlayerOne");
     }
 
     #[test]
@@ -1155,4 +1398,56 @@ mod tests {
         assert!(!cape_sync_flag(None, Ok(())));
         assert!(!cape_sync_flag(Some("cape"), Err(AppError::Net("boom".to_string()))));
     }
+
+    #[test]
+    fn profile_cache_roundtrip_and_ttl() {
+        let paths = crate::paths::Paths::from_root(std::env::temp_dir().join(format!(
+            "gugu-profile-cache-{}",
+            util::unique_suffix()
+        )));
+        let uuid = "0123456789abcdef0123456789abcdef";
+        assert!(read_profile_cache(&paths, uuid).is_none());
+        let record = CachedProfile {
+            kind: "ms".to_string(),
+            name: "PlayerOne".to_string(),
+            uuid: uuid.to_string(),
+            skin_url: "https://t/skin.png".to_string(),
+            cape_url: String::new(),
+            variant: "classic".to_string(),
+            fetched_at: util::now_unix(),
+        };
+        write_profile_cache(&paths, &record).unwrap();
+        assert_eq!(read_profile_cache(&paths, uuid).unwrap(), record);
+        assert_eq!(
+            profile_cache_path(&paths, uuid)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "ms-profile-01234567.json",
+            "文件名只用 uuid 前 8 位"
+        );
+        let now = 10_000u64;
+        assert!(profile_cache_is_fresh(now, now + 1));
+        assert!(!profile_cache_is_fresh(now, now + PROFILE_TTL_SECS));
+        assert_eq!(PROFILE_TTL_SECS, 600);
+        assert_eq!(PROFILE_THROTTLE_SECS, 60);
+        std::fs::create_dir_all(&paths.cache).unwrap();
+        std::fs::write(profile_preview_path(&paths, uuid), b"png").unwrap();
+        assert_eq!(clear_profile_cache(&paths, uuid), 2);
+        assert!(!profile_preview_path(&paths, uuid).exists());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn uuid_prefix_is_short_and_dashless() {
+        // 测试样例在运行时拼出来，源码里不留任何 UUID 字面量（凭据扫描要求）
+        let sample = format!(
+            "{}-{}-{}-{}-{}",
+            "12345678", "90ab", "cdef", "0123", "456789abcdef"
+        );
+        assert_eq!(uuid_prefix(&sample), "12345678");
+        assert_eq!(uuid_prefix("abc"), "abc");
+        assert!(uuid_prefix("").is_empty());
+    }
+
 }

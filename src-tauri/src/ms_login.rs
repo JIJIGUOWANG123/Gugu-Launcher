@@ -577,10 +577,10 @@ mod tests {
         );
         assert!(parse_mc_token(r#"{"error":"x"}"#).is_err());
 
-        let profile = r#"{"id":"069a79f444e94726a5befca90e38aaf5","name":"Steve","skins":[{"id":"x","state":"ACTIVE","url":"https://textures.minecraft.net/texture/abc"}]}"#;
+        let profile = r#"{"id":"0123456789abcdef0123456789abcdef","name":"Steve","skins":[{"id":"x","state":"ACTIVE","url":"https://textures.minecraft.net/texture/abc"}]}"#;
         let (name, uuid, skin) = parse_profile(profile).unwrap();
         assert_eq!(name, "Steve");
-        assert_eq!(uuid, "069a79f444e94726a5befca90e38aaf5");
+        assert_eq!(uuid, "0123456789abcdef0123456789abcdef");
         assert_eq!(skin.as_deref(), Some("https://textures.minecraft.net/texture/abc"));
 
         let error = parse_profile(r#"{"error":"NOT_FOUND","errorMessage":"not purchased"}"#).unwrap_err();

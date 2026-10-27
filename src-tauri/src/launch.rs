@@ -45,6 +45,10 @@ pub struct LaunchOptions {
     pub access_token: String,
     /// 直接进存档的存档名（1.20+ 才支持），None 表示正常启动到标题界面
     pub quick_play: Option<String>,
+    /// --userType 的值：空 = 按令牌自动判断（msa/legacy）
+    pub user_type: String,
+    /// 额外 JVM 参数（第三方账号的 -javaagent:authlib-injector）
+    pub extra_jvm_args: Vec<String>,
 }
 
 impl LaunchOptions {
@@ -185,10 +189,12 @@ pub fn build_command(
     vars.insert("auth_session", "0".to_string());
     vars.insert("auth_xuid", "0".to_string());
     vars.insert("clientid", "0".to_string());
-    vars.insert(
-        "user_type",
-        if online { "msa" } else { "legacy" }.to_string(),
-    );
+    let user_type = if options.user_type.trim().is_empty() {
+        if online { "msa" } else { "legacy" }.to_string()
+    } else {
+        options.user_type.trim().to_string()
+    };
+    vars.insert("user_type", user_type);
     vars.insert("user_properties", "{}".to_string());
     vars.insert("version_name", options.version_id.clone());
     vars.insert("version_type", merged.version_type.clone());
@@ -199,6 +205,8 @@ pub fn build_command(
 
     // JVM 参数：-Xmx 放在最前面，其余按 json 顺序
     let mut jvm_args: Vec<String> = Vec::new();
+    // 第三方账号：-javaagent:authlib-injector.jar=<站点>，必须排在 -jar 之前
+    jvm_args.extend(options.extra_jvm_args.iter().cloned());
     jvm_args.push(format!("-Xmx{}M", options.clamped_memory()));
     jvm_args.push(format!("-Xms{}M", (options.clamped_memory() / 2).max(MEMORY_MIN_MB)));
     jvm_args.push("-Dfile.encoding=UTF-8".to_string());
@@ -289,6 +297,47 @@ pub fn build_command(
         natives,
         game_dir: options.game_dir.clone(),
     })
+}
+
+/// options.txt 的备份名（只在内容真的变了才写）。
+pub const OPTIONS_BACKUP: &str = "options.txt.bak";
+/// 强制写入的语言。
+pub const FORCE_LANG: &str = "zh_cn";
+
+/// 强制游戏内语言为简体中文：改 lang: 行，其它行顺序不动。
+///
+/// 返回 true 表示文件被改过（false = 本来就是 zh_cn 或不需要改）。
+pub fn ensure_game_language(game_dir: &Path) -> Result<bool> {
+    std::fs::create_dir_all(game_dir)?;
+    let path = game_dir.join("options.txt");
+    let original = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = original.lines().map(str::to_string).collect();
+    let mut found = false;
+    for line in lines.iter_mut() {
+        if line.starts_with("lang:") && !found {
+            found = true;
+            *line = format!("lang:{FORCE_LANG}");
+        }
+    }
+    if !found {
+        lines.push(format!("lang:{FORCE_LANG}"));
+    }
+    let mut updated = lines.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    if updated == original {
+        tracing::debug!(path = %path.display(), "游戏语言已是 zh_cn，未改动");
+        return Ok(false);
+    }
+    if !original.is_empty() {
+        if let Err(err) = std::fs::write(game_dir.join(OPTIONS_BACKUP), &original) {
+            tracing::warn!(%err, "写 options.txt.bak 失败");
+        }
+    }
+    std::fs::write(&path, &updated)?;
+    tracing::info!(path = %path.display(), "已强制游戏语言 zh_cn");
+    Ok(true)
 }
 
 /// 游戏日志文件：.mc\logs\game-<实例>-<时间>.log
@@ -456,6 +505,81 @@ mod tests {
     use super::*;
     use crate::version::merge_chain;
 
+    #[test]
+    fn ensure_game_language_creates_options() {
+        let dir = std::env::temp_dir().join(format!(
+            "gugu-lang-new-{}",
+            crate::util::unique_suffix()
+        ));
+        let changed = ensure_game_language(&dir).unwrap();
+        assert!(changed);
+        let text = std::fs::read_to_string(dir.join("options.txt")).unwrap();
+        assert_eq!(text.trim(), "lang:zh_cn");
+        assert!(!ensure_game_language(&dir).unwrap());
+        assert!(!dir.join(OPTIONS_BACKUP).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_game_language_keeps_other_lines_in_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "gugu-lang-order-{}",
+            crate::util::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "version:3465\nlang:en_us\nfov:0.0\nrenderDistance:12\n";
+        std::fs::write(dir.join("options.txt"), original).unwrap();
+        assert!(ensure_game_language(&dir).unwrap());
+        let text = std::fs::read_to_string(dir.join("options.txt")).unwrap();
+        assert_eq!(
+            text,
+            "version:3465\nlang:zh_cn\nfov:0.0\nrenderDistance:12\n",
+            "只改 lang 行，其余顺序不变"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(OPTIONS_BACKUP)).unwrap(),
+            original,
+            "改动前要留 options.txt.bak"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_game_language_appends_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "gugu-lang-append-{}",
+            crate::util::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("options.txt"), "fov:0.0\nrenderDistance:8\n").unwrap();
+        assert!(ensure_game_language(&dir).unwrap());
+        let text = std::fs::read_to_string(dir.join("options.txt")).unwrap();
+        assert!(text.ends_with("lang:zh_cn\n"), "{text}");
+        assert!(text.starts_with("fov:0.0\nrenderDistance:8\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_game_language_is_idempotent_for_zh_cn() {
+        let dir = std::env::temp_dir().join(format!(
+            "gugu-lang-idem-{}",
+            crate::util::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("options.txt"), "lang:zh_cn\nfov:0.0\n").unwrap();
+        assert!(!ensure_game_language(&dir).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("options.txt")).unwrap(),
+            "lang:zh_cn\nfov:0.0\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn force_chinese_defaults_to_true() {
+        assert!(crate::settings::Settings::default().force_chinese);
+    }
+
     fn temp_paths(tag: &str) -> Paths {
         let root = std::env::temp_dir().join(format!("gugu-launch-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -514,6 +638,8 @@ mod tests {
             uuid: String::new(),
             access_token: String::new(),
             quick_play: None,
+            user_type: String::new(),
+            extra_jvm_args: Vec::new(),
         }
     }
 

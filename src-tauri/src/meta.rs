@@ -82,6 +82,237 @@ impl VersionManifestView {
     }
 }
 
+// ------------------------------------------------------------------ 加载器版本（M12）
+
+/// 加载器版本的请求超时（每个源独立 8 秒，互不影响）。
+pub const LOADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 客户端能装的加载器。
+pub const CLIENT_LOADERS: [&str; 3] = ["fabric", "forge", "neoforge"];
+
+/// loader_versions 的元素。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoaderVersion {
+    /// 装实例时要写进 versions 目录的版本号
+    pub id: String,
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<bool>,
+}
+
+/// loaders_list 的一组：某个加载器到底能不能用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoaderGroup {
+    pub loader: String,
+    pub ok: bool,
+    pub versions: Vec<LoaderVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn fabric_loader_url(mc_version: &str) -> String {
+    format!("https://meta.fabricmc.net/v2/versions/loader/{mc_version}")
+}
+
+pub fn forge_promotions_url() -> String {
+    "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json".to_string()
+}
+
+pub fn neoforge_metadata_url() -> String {
+    "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml".to_string()
+}
+
+/// Fabric：数组里每项有 loader.version / loader.stable，stable 的标成推荐。
+pub fn parse_fabric_loaders(json: &str) -> Vec<LoaderVersion> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let loader = item.get("loader").unwrap_or(item);
+        let Some(version) = loader.get("version").and_then(|entry| entry.as_str()) else {
+            continue;
+        };
+        let stable = loader
+            .get("stable")
+            .and_then(|entry| entry.as_bool())
+            .unwrap_or(false);
+        out.push(LoaderVersion {
+            id: version.to_string(),
+            version: version.to_string(),
+            recommended: Some(stable),
+        });
+    }
+    out
+}
+
+/// Forge：promotions_slim.json 里的  mc-recommended 与 mc-latest。
+pub fn parse_forge_promotions(json: &str, mc_version: &str) -> Vec<LoaderVersion> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(promos) = value.get("promos").and_then(|entry| entry.as_object()) else {
+        return Vec::new();
+    };
+    let pick = |key: &str| {
+        promos
+            .get(&format!("{mc_version}-{key}"))
+            .and_then(|entry| entry.as_str())
+            .map(str::to_string)
+    };
+    let recommended = pick("recommended");
+    let latest = pick("latest");
+    let mut out = Vec::new();
+    if let Some(version) = recommended.clone() {
+        out.push(LoaderVersion {
+            // Forge 的实例版本号要求 mc-loader
+            id: format!("{mc_version}-{version}"),
+            version,
+            recommended: Some(true),
+        });
+    }
+    if let Some(version) = latest {
+        if Some(&version) != recommended.as_ref() {
+            out.push(LoaderVersion {
+                id: format!("{mc_version}-{version}"),
+                version,
+                recommended: Some(false),
+            });
+        }
+    }
+    out
+}
+
+/// NeoForge：maven-metadata.xml 里按 mc 去掉 1. 的前缀匹配（1.20.1 走 47.1.x 老编号）。
+pub fn parse_neoforge_versions(xml: &str, mc_version: &str) -> Vec<LoaderVersion> {
+    let mut prefixes: Vec<String> = Vec::new();
+    if let Some(rest) = mc_version.strip_prefix("1.") {
+        prefixes.push(rest.to_string());
+    }
+    prefixes.push(mc_version.to_string());
+    if mc_version == "1.20.1" {
+        prefixes.insert(0, "47.1".to_string());
+    }
+    let mut out: Vec<LoaderVersion> = Vec::new();
+    for chunk in xml.split("<version>").skip(1) {
+        let Some(end) = chunk.find("</version>") else {
+            continue;
+        };
+        let version = chunk[..end].trim();
+        if version.is_empty() || version.contains("-beta") {
+            continue;
+        }
+        if !prefixes
+            .iter()
+            .any(|prefix| !prefix.is_empty() && version.starts_with(prefix))
+        {
+            continue;
+        }
+        out.push(LoaderVersion {
+            id: version.to_string(),
+            version: version.to_string(),
+            recommended: None,
+        });
+    }
+    out.sort_by(|left, right| right.version.cmp(&left.version));
+    out.dedup_by(|left, right| left.version == right.version);
+    out
+}
+
+async fn fetch_loader_text(client: &reqwest::Client, url: &str, loader: &str) -> Result<String> {
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(LOADER_TIMEOUT, client.get(url).send())
+        .await
+        .map_err(|_| {
+            tracing::warn!(loader, url, "加载器元数据请求超时");
+            AppError::Net(format!(
+                "{loader} 元数据请求超时（{} 秒）",
+                LOADER_TIMEOUT.as_secs()
+            ))
+        })??
+        .error_for_status()
+        .map_err(|err| {
+            tracing::warn!(loader, url, %err, "加载器元数据返回错误状态");
+            AppError::Net(format!("{loader} 元数据不可用：{err}"))
+        })?;
+    let text = response
+        .text()
+        .await
+        .map_err(|err| AppError::Net(format!("{loader} 元数据读取失败：{err}")))?;
+    tracing::info!(
+        loader,
+        url,
+        bytes = text.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "加载器元数据已取到"
+    );
+    Ok(text)
+}
+
+/// 单个加载器的可用版本列表。
+pub async fn loader_versions(
+    client: &reqwest::Client,
+    loader: &str,
+    mc_version: &str,
+) -> Result<Vec<LoaderVersion>> {
+    let loader = loader.trim().to_lowercase();
+    let mc = mc_version.trim();
+    if mc.is_empty() {
+        return Err(AppError::Invalid("请先选择 Minecraft 版本".to_string()));
+    }
+    match loader.as_str() {
+        "fabric" | "quilt" => {
+            let text = fetch_loader_text(client, &fabric_loader_url(mc), "Fabric").await?;
+            Ok(parse_fabric_loaders(&text))
+        }
+        "forge" => {
+            let text = fetch_loader_text(client, &forge_promotions_url(), "Forge").await?;
+            Ok(parse_forge_promotions(&text, mc))
+        }
+        "neoforge" => {
+            let text = fetch_loader_text(client, &neoforge_metadata_url(), "NeoForge").await?;
+            Ok(parse_neoforge_versions(&text, mc))
+        }
+        "" | "vanilla" => Ok(Vec::new()),
+        other => Err(AppError::Invalid(format!("不支持的加载器：{other}"))),
+    }
+}
+
+/// 三种加载器一次问完：任何一个失败都不影响其它。
+pub async fn loaders_list(client: &reqwest::Client, mc_version: &str) -> Vec<LoaderGroup> {
+    let mut handles = Vec::new();
+    for loader in CLIENT_LOADERS {
+        let client = client.clone();
+        let mc = mc_version.to_string();
+        handles.push(tokio::spawn(async move {
+            (loader, loader_versions(&client, loader, &mc).await)
+        }));
+    }
+    let mut out = Vec::new();
+    for handle in handles {
+        match handle.await {
+            Ok((loader, Ok(versions))) => out.push(LoaderGroup {
+                loader: loader.to_string(),
+                ok: !versions.is_empty(),
+                versions,
+                reason: None,
+            }),
+            Ok((loader, Err(err))) => out.push(LoaderGroup {
+                loader: loader.to_string(),
+                ok: false,
+                versions: Vec::new(),
+                reason: Some(err.to_string()),
+            }),
+            Err(err) => tracing::warn!(%err, "加载器版本查询任务失败"),
+        }
+    }
+    out
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -155,6 +386,81 @@ pub async fn load_with_origins(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fabric_loader_versions_are_parsed() {
+        let json = r#"[
+            {"loader":{"version":"0.15.11","stable":true},"intermediary":{"version":"1.20.1"}},
+            {"loader":{"version":"0.16.0-beta.1","stable":false}}
+        ]"#;
+        let items = parse_fabric_loaders(json);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].version, "0.15.11");
+        assert_eq!(items[0].recommended, Some(true));
+        assert_eq!(items[1].recommended, Some(false));
+        assert!(parse_fabric_loaders("{}").is_empty(), "不是数组就当空");
+        assert!(parse_fabric_loaders("not json").is_empty());
+        assert_eq!(
+            fabric_loader_url("1.20.1"),
+            "https://meta.fabricmc.net/v2/versions/loader/1.20.1"
+        );
+    }
+
+    #[test]
+    fn forge_promotions_give_recommended_and_latest() {
+        let json = r#"{"promos":{"1.20.1-recommended":"47.2.0","1.20.1-latest":"47.3.12","1.19.2-recommended":"43.2.0"}}"#;
+        let items = parse_forge_promotions(json, "1.20.1");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, "1.20.1-47.2.0");
+        assert_eq!(items[0].recommended, Some(true));
+        assert_eq!(items[1].version, "47.3.12");
+        let same = parse_forge_promotions(
+            r#"{"promos":{"1.20.1-recommended":"47.2.0","1.20.1-latest":"47.2.0"}}"#,
+            "1.20.1",
+        );
+        assert_eq!(same.len(), 1);
+        assert!(parse_forge_promotions(json, "1.21.9").is_empty());
+        assert!(forge_promotions_url().ends_with("promotions_slim.json"));
+    }
+
+    #[test]
+    fn neoforge_versions_match_the_mc_prefix() {
+        let xml = r#"<metadata><versioning><versions>
+            <version>47.1.106</version>
+            <version>20.4.237</version>
+            <version>21.0.167</version>
+            <version>21.1.9-beta</version>
+        </versions></versioning></metadata>"#;
+        let items = parse_neoforge_versions(xml, "1.20.1");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].version, "47.1.106");
+        let new = parse_neoforge_versions(xml, "1.20.4");
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].version, "20.4.237");
+        let latest = parse_neoforge_versions(xml, "1.21");
+        assert_eq!(latest[0].version, "21.0.167");
+        assert!(parse_neoforge_versions(xml, "1.19.4").is_empty());
+        assert!(neoforge_metadata_url().contains("maven-metadata.xml"));
+    }
+
+    #[test]
+    fn empty_mc_version_is_rejected_before_network() {
+        let client = reqwest::Client::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(loader_versions(&client, "fabric", "  "))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("请先选择 Minecraft 版本"), "{error}");
+        let error = runtime
+            .block_on(loader_versions(&client, "不支持", "1.20.1"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不支持的加载器"), "{error}");
+    }
 
     #[test]
     fn cache_roundtrip_keeps_versions() {

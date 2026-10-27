@@ -116,7 +116,7 @@ export function InstancesPage({ instances, versions, onCreate, onDelete, onLaunc
         <button className="pill-outline" data-action="import-external" onClick={() => setImporting(true)}>
           + {t("import.entry")}
         </button>
-        <button className="pill-outline pill-outline--primary" onClick={() => setCreating(true)}>
+        <button className="pill-outline pill-outline--primary" data-action="instance-new" onClick={() => setCreating(true)}>
           + {t("instances.create")}
         </button>
       </div>

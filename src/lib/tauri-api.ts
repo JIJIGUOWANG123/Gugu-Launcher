@@ -8,6 +8,7 @@ import { normalizeManifest } from "./versions";
 import type {
   Account,
   AppInfo,
+  AuthlibStatus,
   BackgroundItem,
   BackgroundPage,
   CapesListResult,
@@ -34,6 +35,7 @@ import type {
   JavaSource,
   JavaSourceProbe,
   JavaVersion,
+  LoaderVersion,
   DataDirInfo,
   LauncherEvent,
   LogFile,
@@ -45,6 +47,7 @@ import type {
   MsAuthStatus,
   MsLoginPoll,
   MsProfile,
+  ThirdpartySkin,
   NewsItem,
   MsLoginStart,
   PathsLayout,
@@ -151,7 +154,7 @@ const MOCK_SETTINGS: Settings = {
   language: "zh-CN",
   theme: "light",
   accent: "#f5c845",
-  updateMode: "auto",
+  updateMode: "manual",
   downloadSource: "auto",
   concurrentDownloads: 8,
   perFileConnections: 4,
@@ -167,8 +170,9 @@ const MOCK_SETTINGS: Settings = {
   curseforgeApiKey: "",
   msClientId: "",
   thirdpartyAuthServer: "",
-  closeAction: "minimize",
+  closeAction: "ask",
   autoDownloadJava: true,
+  forceChinese: true,
   serverMirrorUrl: "",
   sayingApiUrl: "",
   githubDownloadDir: "",
@@ -311,8 +315,18 @@ function mockSourceProbe(target: SourceProbeTarget): Promise<SourceProbe> {
         resolve({ id: target.id, ok: false, latencyMs: null, message: "请先填写自定义镜像地址" });
         return;
       }
+      // 自检用：打开这个开关后每个源都返回不可用，文案带真后端那种原因（状态码 / 超时）
+      if (window.localStorage.getItem("gugu.mock.probe") === "fail") {
+        resolve({
+          id: target.id,
+          ok: false,
+          latencyMs: null,
+          message: target.id === "official" ? "HTTP 502（Bad Gateway）" : "连接超时（3000ms）",
+        });
+        return;
+      }
       if (base.includes("example.com") || base.includes("invalid")) {
-        resolve({ id: target.id, ok: false, latencyMs: null, message: "镜像不可用" });
+        resolve({ id: target.id, ok: false, latencyMs: null, message: "HTTP 404（Not Found）：镜像地址不存在" });
         return;
       }
       const baseMs = target.id === "bmclapi" ? 34 : target.id === "custom" ? 76 : 148;
@@ -633,7 +647,7 @@ const MOCK_JAVA: JavaRuntime[] = [
 ];
 
 const MOCK_JAVA_SOURCES: JavaSource[] = [
-  { id: "auto", name: "自动（测速最快）", description: "按下面几个源的实际延迟挑最快的" },
+  { id: "auto", name: "全部（合并全部源）", description: "并发查所有源，同版本保留延迟最低的那条" },
   { id: "bellsoft", name: "BellSoft Liberica", description: "覆盖面广，含 JRE 与全量 JDK" },
   { id: "adoptium", name: "Adoptium (Temurin)", description: "社区维护的 OpenJDK 构建" },
   { id: "tuna", name: "清华 TUNA 镜像", description: "国内镜像，下载稳定" },
@@ -641,18 +655,60 @@ const MOCK_JAVA_SOURCES: JavaSource[] = [
   { id: "oracle", name: "Oracle JDK", description: "官网下载，需要接受 Oracle 许可", requiresLicense: true },
 ];
 
-const MOCK_JAVA_VERSIONS: JavaVersion[] = [
-  { source: "bellsoft", version: "25.0.2", major: 25, lts: true, sizeBytes: 214_958_080, url: "https://bell-sw.com/pages/downloads/" },
-  { source: "adoptium", version: "25.0.2+10", major: 25, lts: true, sizeBytes: 208_666_624, url: "https://adoptium.net/" },
-  { source: "tuna", version: "21.0.10+7", major: 21, lts: true, sizeBytes: 190_840_832, url: "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/" },
-  { source: "zulu", version: "21.0.10", major: 21, lts: true, sizeBytes: 199_229_440, url: "https://www.azul.com/downloads/" },
-  { source: "adoptium", version: "17.0.18+8", major: 17, lts: true, sizeBytes: 181_403_648, url: "https://adoptium.net/" },
-  { source: "bellsoft", version: "17.0.18", major: 17, lts: true, sizeBytes: 185_597_952, url: "https://bell-sw.com/pages/downloads/" },
-  { source: "oracle", version: "17.0.18", major: 17, lts: true, sizeBytes: 190_000_000, url: "https://www.oracle.com/java/technologies/downloads/" },
-  { source: "adoptium", version: "8.0.482+8", major: 8, lts: true, sizeBytes: 109_051_904, url: "https://adoptium.net/" },
-  { source: "bellsoft", version: "8.0.482", major: 8, lts: true, sizeBytes: 106_954_752, url: "https://bell-sw.com/pages/downloads/" },
-  { source: "zulu", version: "26.0.0-ea", major: 26, lts: false, sizeBytes: 205_520_896, url: "https://www.azul.com/downloads/" },
+/** 各源的实测延迟（和 java_probe_sources 一致）：合并列表按它挑同版本里最快的那个。 */
+const MOCK_JAVA_LATENCY: Record<string, number> = { oracle: 72, bellsoft: 171, tuna: 177, zulu: 300, adoptium: 355 };
+
+const MOCK_JAVA_SOURCE_LABEL: Record<string, string> = {
+  bellsoft: "BellSoft Liberica",
+  adoptium: "Adoptium · Temurin",
+  tuna: "清华 TUNA 镜像 · Temurin",
+  zulu: "Azul Zulu",
+  oracle: "Oracle JDK",
+};
+
+/** 每个源 × 5 个 major（25/21/17/11/8）；tuna 是 Adoptium 镜像，版本号与 adoptium 相同，用来验证去重。 */
+const MOCK_JAVA_MATRIX: Array<{ source: string; versions: Array<[string, number]> }> = [
+  {
+    source: "adoptium",
+    versions: [["25.0.2+10", 25], ["21.0.10+7", 21], ["17.0.18+8", 17], ["11.0.29+8", 11], ["8.0.482+8", 8]],
+  },
+  {
+    source: "tuna",
+    versions: [["25.0.2+10", 25], ["21.0.10+7", 21], ["17.0.18+8", 17], ["11.0.29+8", 11], ["8.0.482+8", 8]],
+  },
+  {
+    source: "bellsoft",
+    versions: [["25.0.2", 25], ["21.0.10", 21], ["17.0.18", 17], ["11.0.29", 11], ["8.0.482", 8]],
+  },
+  {
+    source: "zulu",
+    versions: [["25.0.2", 25], ["21.0.10", 21], ["17.0.18", 17], ["11.0.29", 11], ["8.0.482", 8]],
+  },
+  {
+    source: "oracle",
+    versions: [["25.0.2", 25], ["17.0.18", 17], ["8.0.482", 8]],
+  },
 ];
+
+const MOCK_JAVA_URL: Record<string, string> = {
+  bellsoft: "https://bell-sw.com/pages/downloads/",
+  adoptium: "https://adoptium.net/",
+  tuna: "https://mirrors.tuna.tsinghua.edu.cn/Adoptium/",
+  zulu: "https://www.azul.com/downloads/",
+  oracle: "https://www.oracle.com/java/technologies/downloads/",
+};
+
+const MOCK_JAVA_VERSIONS: JavaVersion[] = MOCK_JAVA_MATRIX.flatMap((row) =>
+  row.versions.map(([version, major], index) => ({
+    source: row.source,
+    version,
+    major,
+    lts: major !== 26,
+    sizeBytes: 90_000_000 + major * 4_317_000 + index * 1_900_000,
+    url: MOCK_JAVA_URL[row.source],
+    sourceLabel: MOCK_JAVA_SOURCE_LABEL[row.source],
+  })),
+);
 
 const MOCK_DATA_DIR = { path: mockRoot, sizeBytes: 12_884_901_888, fileCount: 48_213 };
 
@@ -669,6 +725,46 @@ const mockStorageBytes: Record<StorageKey, number> = {
 
 /** 已安装的 java 版本（java_install 之后加进来）。 */
 const mockInstalledJava: JavaVersion[] = [];
+
+/** Forge / NeoForge 只在这些 MC 版本上有构建，其余版本后端会回「没有构建」。 */
+const MOCK_FORGE_SUPPORT = ["1.21.4", "1.20.1", "1.19.2", "1.18.2", "1.16.5", "1.12.2"];
+const MOCK_NEOFORGE_SUPPORT = ["1.21.4", "1.21.1", "1.20.4", "1.20.2"];
+
+/** loader_versions 的假实现：不支持的组合直接抛后端原文，界面把原因显示出来。 */
+function mockLoaderVersions(loader: string, mcVersion: string): LoaderVersion[] {
+  const mc = mcVersion.trim();
+  if (!mc) throw new Error("先选一个 Minecraft 版本");
+  if (loader === "forge") {
+    if (!MOCK_FORGE_SUPPORT.includes(mc)) throw new Error("该版本没有 Forge 构建（" + mc + "）");
+    const builds: Record<string, string> = {
+      "1.21.4": "52.0.4",
+      "1.20.1": "47.3.0",
+      "1.19.2": "43.4.0",
+      "1.18.2": "40.2.10",
+      "1.16.5": "36.2.42",
+      "1.12.2": "14.23.5.2860",
+    };
+    return [
+      { id: "forge-" + mc + "-" + builds[mc], version: builds[mc], recommended: true },
+      { id: "forge-" + mc + "-legacy", version: builds[mc] + "-beta" },
+    ];
+  }
+  if (loader === "neoforge") {
+    if (!MOCK_NEOFORGE_SUPPORT.includes(mc)) throw new Error("NeoForge 只支持 1.20.2 及以后（当前 " + mc + "）");
+    const builds: Record<string, string> = { "1.21.4": "21.4.56", "1.21.1": "21.1.80", "1.20.4": "20.4.237", "1.20.2": "20.2.88" };
+    return [
+      { id: "neoforge-" + mc + "-" + builds[mc], version: builds[mc], recommended: true },
+      { id: "neoforge-" + mc + "-old", version: builds[mc].split(".")[0] + ".0.1" },
+    ];
+  }
+  // Fabric：正式版都有，快照/preview 没有
+  if (/-(pre|rc)\d*/i.test(mc)) throw new Error("Fabric 还没有适配 " + mc + " 的构建");
+  return [
+    { id: "fabric-" + mc + "-0.16.9", version: "0.16.9", recommended: true },
+    { id: "fabric-" + mc + "-0.16.5", version: "0.16.5" },
+    { id: "fabric-" + mc + "-0.15.11", version: "0.15.11" },
+  ];
+}
 
 const MOCK_LOG_FILES: LogFile[] = [
   { name: "latest.log", path: mockRoot + "\\logs\\latest.log", size: 48_213, modifiedAt: secondsAgo(600) },
@@ -941,6 +1037,15 @@ let mockAccounts: Account[] = [
     current: true,
   },
   {
+    id: "acc-tp-1",
+    name: "littleskin_user",
+    type: "thirdparty",
+    uuid: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    server: "https://littleskin.cn/api/yggdrasil",
+    skinDataUrl: mockSkinDataUrl(2),
+    current: false,
+  },
+  {
     id: "acc-off-1",
     name: "asdas2w4r1q",
     type: "offline",
@@ -975,10 +1080,54 @@ function mockApplyAccount(id: string): void {
   mockAccounts = mockAccounts.map((account) => ({ ...account, current: account.id === id }));
 }
 
+/** 第三方（Yggdrasil 皮肤站）登录的假实现：地址 / 密码 / 角色 / 可达性各走一条错误分支。 */
+const MOCK_AUTHLIB_KEY = "gugu.mock.authlib";
+
+function mockThirdpartyLogin(request: { server: string; username: string; password: string }): Account {
+  const server = request.server.trim();
+  if (!server) throw new Error("请先填写皮肤站服务器地址");
+  if (!/^https?:\/\/[^\s]+$/i.test(server)) throw new Error("服务器地址格式不对，应为 https://…/api/yggdrasil");
+  if (!/\/api\/yggdrasil\/?$/i.test(server)) throw new Error("地址要填到 /api/yggdrasil 这一级");
+  const username = request.username.trim();
+  if (!username) throw new Error("请填写用户名或邮箱");
+  if (!request.password) throw new Error("请填写密码");
+  if (/down|timeout|unreachable/i.test(server)) throw new Error("服务器不可达（连接超时 8000ms）");
+  if (/norole/i.test(username)) throw new Error("这个账号没有可用的角色，请先在皮肤站创建角色");
+  if (/wrong|bad|401/i.test(request.password)) throw new Error("用户名或密码错误（HTTP 401）");
+  if (mockAccounts.some((account) => account.name.toLowerCase() === username.toLowerCase())) {
+    throw new Error("已经有同名账号了");
+  }
+  const created: Account = {
+    id: "acc-tp-" + Date.now().toString(36),
+    name: username,
+    type: "thirdparty",
+    server: server,
+    uuid: mockOfflineUuid(server + username),
+    skinDataUrl: mockSkinDataUrl(2),
+    current: false,
+  };
+  mockAccounts = [...mockAccounts, created];
+  return { ...created };
+}
+
+function mockAuthlibInstalled(): boolean {
+  return window.localStorage.getItem(MOCK_AUTHLIB_KEY) === "installed";
+}
+
+function mockAuthlibStatus(): AuthlibStatus {
+  if (!mockAuthlibInstalled()) return { installed: false, path: "", version: null };
+  return {
+    installed: true,
+    path: mockRoot + "\\authlib-injector\\authlib-injector-1.2.7.jar",
+    version: "1.2.7",
+  };
+}
+
 /** 后端可能用 kind（"ms" / "microsoft" / "offline"）描述账号类型，前端统一折成 type。 */
 function normalizeAccount(raw: Account): Account {
   const kind = String(raw.type ?? raw.kind ?? "").toLowerCase();
-  const type: Account["type"] = kind === "microsoft" || kind === "ms" ? "microsoft" : "offline";
+  const type: Account["type"] =
+    kind === "microsoft" || kind === "ms" ? "microsoft" : kind === "thirdparty" || kind === "tp" ? "thirdparty" : "offline";
   return { ...raw, type };
 }
 
@@ -988,6 +1137,68 @@ const MOCK_MS_STATE = { deviceCode: "", userCode: "", polls: 0 };
 
 /** Client ID 只接受 8-4-4-4-12 的 UUID（大小写都行）。 */
 const MS_CLIENT_ID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * ms_profile 的假实现：账号当前皮肤 = 本地正在应用的那张（上传/取回后后端会把结果缓存回来）。
+ * force 太频繁时返回 throttled，和真后端的节流语义一致。
+ */
+let mockMsProfileCache: {
+  skinUrl: string;
+  previewDataUrl: string;
+  variant: "classic" | "slim";
+  cachedAt: string;
+  /** 缓存时本地正在用的那张皮肤：本地换了就不再复用缓存 */
+  path: string;
+} | null = null;
+let mockMsProfileForcedAt = 0;
+const MOCK_MS_PROFILE_FORCE_MS = 60_000;
+
+function mockMsProfile(request: { force?: boolean }): MsProfile {
+  // 自检用：记录 force 次数与最近一次返回的皮肤图（window.__guguMsSkin / window.__guguMsProfileForce）
+  if (typeof window !== "undefined" && request.force) {
+    const host = window as unknown as Record<string, unknown>;
+    host.__guguMsProfileForce = (typeof host.__guguMsProfileForce === "number" ? host.__guguMsProfileForce : 0) + 1;
+  }
+  const profile = mockMsProfileInner(request);
+  if (typeof window !== "undefined") {
+    (window as unknown as Record<string, unknown>).__guguMsSkin = {
+      url: profile.previewDataUrl ?? profile.skinUrl ?? "",
+      fromCache: profile.fromCache === true,
+      throttled: profile.throttled === true,
+      force: request.force === true,
+    };
+  }
+  return profile;
+}
+
+function mockMsProfileInner(request: { force?: boolean }): MsProfile {
+  const account = mockAccounts.find((item) => item.current);
+  if (!account || account.type !== "microsoft") throw new Error("请先登录微软账号");
+  if (window.localStorage.getItem("gugu.mock.msToken") === "expired") throw new Error("登录已过期，请重新登录");
+  const base = { name: account.name, uuid: account.uuid, capeUrl: null };
+  if (window.localStorage.getItem("gugu.mock.msProfile") === "nocache") {
+    throw new Error("Microsoft 接口返回 429，且本地没有缓存");
+  }
+  const useDefault = window.localStorage.getItem("gugu.mock.msSkin") === "default";
+  if (request.force) {
+    if (Date.now() - mockMsProfileForcedAt < MOCK_MS_PROFILE_FORCE_MS) {
+      return { ...base, variant: "classic", skinUrl: null, throttled: true, fromCache: true, cachedAt: mockMsProfileCache?.cachedAt ?? null };
+    }
+    mockMsProfileForcedAt = Date.now();
+  } else if (mockMsProfileCache && !useDefault && mockMsProfileCache.path === mockCurrentSkin) {
+    return { ...base, ...mockMsProfileCache, fromCache: true };
+  }
+  const current = useDefault ? null : (mockSkins.find((skin) => skin.path === mockCurrentSkin) ?? null);
+  const url = current?.dataUrl ?? "";
+  mockMsProfileCache = {
+    skinUrl: url,
+    previewDataUrl: url,
+    variant: "classic",
+    cachedAt: new Date().toISOString(),
+    path: mockCurrentSkin,
+  };
+  return { ...base, ...mockMsProfileCache, fromCache: false };
+}
 
 function mockMsAuthStatus(): MsAuthStatus {
   const value = readMockSettings().msClientId.trim();
@@ -1367,17 +1578,22 @@ function mockBackgroundDataUrl(seed: number): string {
 
 const MOCK_WALLPAPER_DIR = "C:\\Program Files (x86)\\Steam\\steamapps\\workshop\\content\\431960";
 
+/** mock 的视频地址根：浏览器里必然加载失败（本地 9 端口没人监听），用来验证错误叠加层。 */
+const MOCK_BG_VIDEO_BASE = "http://127.0.0.1:9/mock-bg";
+
 /** 本地图 26 张、壁纸引擎 45 张：为了能看到 20 张一页的分页效果。 */
 const MOCK_BACKGROUNDS: Record<"local" | "wallpaper", BackgroundItem[]> = {
   local: Array.from({ length: 26 }, (_, index) => {
-    const file = "local-" + String(index + 1).padStart(2, "0") + (index % 5 === 4 ? ".mp4" : ".png");
+    const isVideo = index % 5 === 4;
+    const file = "local-" + String(index + 1).padStart(2, "0") + (isVideo ? ".mp4" : ".png");
     const url = mockBackgroundDataUrl(index);
     return {
       file,
       path: mockRoot + "\\backgrounds\\" + file,
-      url,
+      // 视频给一个带 .mp4 的地址（真后端给的是 asset 协议地址）；预览缩略图仍然是画的图
+      url: isVideo ? MOCK_BG_VIDEO_BASE + "/backgrounds/" + file : url,
       previewUrl: url,
-      isVideo: file.endsWith(".mp4"),
+      isVideo,
       size: 380_000 + index * 21_000,
     };
   }),
@@ -1388,7 +1604,7 @@ const MOCK_BACKGROUNDS: Record<"local" | "wallpaper", BackgroundItem[]> = {
     return {
       file,
       path: MOCK_WALLPAPER_DIR + "\\" + String(100000 + index),
-      url: isVideo ? "" : url,
+      url: isVideo ? MOCK_BG_VIDEO_BASE + "/workshop/431960/" + file : url,
       previewUrl: url,
       isVideo,
       size: isVideo ? 8_400_000 + index * 120_000 : 1_200_000 + index * 9_000,
@@ -1400,7 +1616,9 @@ function mockBackgroundPage(kind: "local" | "wallpaper", page: number, pageSize:
   const list = MOCK_BACKGROUNDS[kind];
   const size = pageSize > 0 ? pageSize : 20;
   const start = Math.max(0, page) * size;
-  return { items: list.slice(start, start + size), total: list.length, page: Math.max(0, page), pageSize: size };
+  // dir 由后端给：本地图在数据根下的 backgrounds，壁纸引擎是工坊目录
+  const dir = kind === "local" ? mockRoot + "\\backgrounds" : MOCK_WALLPAPER_DIR;
+  return { items: list.slice(start, start + size), total: list.length, page: Math.max(0, page), pageSize: size, dir };
 }
 
 const MOCK_TERA = {
@@ -2008,15 +2226,38 @@ export const api = {
     ]);
   },
 
-  /** 可下载的 Java 版本。TODO(M5): 后端 java_versions。 */
+  /**
+   * 某个加载器在某 MC 版本下可用的构建。TODO(M15): 后端 loader_versions。
+   * 不支持的组合后端抛错（如「该版本没有 Forge 构建」），界面显示后端原文。
+   */
+  loaderVersions(request: { loader: "fabric" | "forge" | "neoforge"; mcVersion: string }): Promise<LoaderVersion[]> {
+    return call("loader_versions", { ...request }, () => mockLoaderVersions(request.loader, request.mcVersion));
+  },
+
+  /**
+   * 可下载的 Java 版本。TODO(M15): 后端 java_versions ——
+   * source 为空：并发查全部源，同版本保留延迟最低的那条；指定 source：返回该源所有 major 的版本。
+   */
   javaVersions(request: { source?: string; major?: number }): Promise<JavaVersion[]> {
-    return call("java_versions", { ...request }, () =>
-      MOCK_JAVA_VERSIONS.filter((item) => {
-        if (request.major && item.major !== request.major) return false;
-        if (request.source && request.source !== "auto" && item.source !== request.source) return false;
-        return true;
-      }),
-    );
+    return call("java_versions", { ...request }, () => {
+      const source = request.source && request.source !== "auto" ? request.source : "";
+      const major = request.major ?? 0;
+      const byMajor = (item: JavaVersion) => !major || item.major === major;
+      if (source) {
+        // 单源：这个源下所有 major 的版本，按 major 倒序
+        return MOCK_JAVA_VERSIONS.filter((item) => item.source === source && byMajor(item)).sort((a, b) => b.major - a.major);
+      }
+      // 全部：同版本只留延迟最低的那条
+      const best = new Map<string, JavaVersion>();
+      for (const item of MOCK_JAVA_VERSIONS) {
+        if (!byMajor(item)) continue;
+        const prev = best.get(item.version);
+        if (!prev || (MOCK_JAVA_LATENCY[item.source] ?? 999) < (MOCK_JAVA_LATENCY[prev.source] ?? 999)) {
+          best.set(item.version, item);
+        }
+      }
+      return [...best.values()].sort((a, b) => b.major - a.major || a.version.localeCompare(b.version));
+    });
   },
 
   /** 下载并安装一个 Java。TODO(M5): 后端 java_install。 */
@@ -2509,6 +2750,38 @@ export const api = {
     });
   },
 
+  /**
+   * 第三方（Yggdrasil 皮肤站）账号登录：成功后返回新账号，由界面再 account_apply 设为当前。
+   * TODO(M15): 后端 account_add_thirdparty —— 走 authlib-injector，失败要回原文（401 / 不可达 / 无角色）。
+   */
+  accountAddThirdparty(request: { server: string; username: string; password: string }): Promise<Account> {
+    return call("account_add_thirdparty", { ...request }, () => mockThirdpartyLogin(request));
+  },
+
+  /** 刷新第三方账号的登录态（重新换 accessToken，顺带取一张最新皮肤）。TODO(M15): 后端 account_refresh_thirdparty。 */
+  accountRefreshThirdparty(request: { id: string }): Promise<Account> {
+    return call("account_refresh_thirdparty", { ...request }, () => {
+      const found = mockAccounts.find((account) => account.id === request.id);
+      if (!found || found.type !== "thirdparty") throw new Error("这不是第三方账号，无法刷新登录");
+      if (/down|timeout|unreachable/i.test(found.server ?? "")) throw new Error("服务器不可达（连接超时 8000ms）");
+      return { ...found, skinDataUrl: mockSkinDataUrl(2) };
+    });
+  },
+
+  /** authlib-injector 是否已就绪（第三方登录的前置）。TODO(M15): 后端 authlib_status。 */
+  authlibStatus(): Promise<AuthlibStatus> {
+    return call("authlib_status", undefined, () => mockAuthlibStatus());
+  },
+
+  /** 下载 authlib-injector（进度走下载中心）。TODO(M15): 后端 authlib_ensure。 */
+  authlibEnsure(): Promise<{ taskId: string }> {
+    return call("authlib_ensure", undefined, () => {
+      startMockInstall("authlib-injector 1.2.7", mockRoot + "\\authlib-injector", "mod");
+      window.localStorage.setItem(MOCK_AUTHLIB_KEY, "installed");
+      return { taskId: mockTasks[0].id };
+    });
+  },
+
   /** 微软登录是否可用（看 settings.msClientId）。TODO(M5): 后端 ms_auth_status。 */
   msAuthStatus(): Promise<MsAuthStatus> {
     return call("ms_auth_status", undefined, () => mockMsAuthStatus());
@@ -2523,24 +2796,41 @@ export const api = {
    * 微软账号当前正在使用的外观（皮肤 / 披风 / 模型）。
    * 「恢复正版皮肤」用它把账号上的皮肤取回本地。TODO(M14): 后端 ms_profile。
    */
-  msProfile(): Promise<MsProfile> {
+  msProfile(request: { force?: boolean } = {}): Promise<MsProfile> {
     // 自检用：记下调用次数（界面不显示）
     if (typeof window !== "undefined") {
       const host = window as unknown as Record<string, unknown>;
       host.__guguMsProfile = (typeof host.__guguMsProfile === "number" ? host.__guguMsProfile : 0) + 1;
     }
-    return call("ms_profile", undefined, () => {
-      const account = mockAccounts.find((item) => item.current);
-      if (!account || account.type !== "microsoft") throw new Error("请先登录微软账号");
-      if (window.localStorage.getItem("gugu.mock.msToken") === "expired") throw new Error("登录已过期，请重新登录");
-      const useDefault = window.localStorage.getItem("gugu.mock.msSkin") === "default";
-      return {
+    return call("ms_profile", { ...request }, () => mockMsProfile(request));
+  },
+
+  /**
+   * 第三方（皮肤站）账号正在使用的皮肤，皮肤页只读预览用。
+   * TODO(M15): 后端 thirdparty_skin。
+   */
+  thirdpartySkin(request: { accountId?: string } = {}): Promise<ThirdpartySkin> {
+    return call("thirdparty_skin", { ...request }, () => {
+      const account = mockAccounts.find((item) => (request.accountId ? item.id === request.accountId : item.current));
+      if (!account || account.type !== "thirdparty") throw new Error("当前不是第三方账号");
+      const result: ThirdpartySkin = {
+        server: account.server ?? "https://littleskin.cn/api/yggdrasil",
         name: account.name,
         uuid: account.uuid,
-        skinUrl: useDefault ? "" : mockSkinDataUrl(1),
+        skinUrl: mockSkinDataUrl(2),
+        previewDataUrl: mockSkinDataUrl(2),
         capeUrl: null,
         variant: "classic" as const,
       };
+      // 自检用：记下这次返回的皮肤图，界面上的 3D 预览要和它一致（window.__guguTpSkin）
+      if (typeof window !== "undefined") {
+        (window as unknown as Record<string, unknown>).__guguTpSkin = {
+          url: result.previewDataUrl,
+          accountId: account.id,
+          name: account.name,
+        };
+      }
+      return result;
     });
   },
 
@@ -2717,7 +3007,7 @@ export const api = {
 
   // ------------------------------------------------------ 背景外观（M4）
 
-  /** 一页 20 张的背景列表（本地图 / 壁纸引擎）。TODO(M4): 后端 background_list。 */
+  /** 一页 20 张的背景列表（本地图 / 壁纸引擎），顺带返回该类背景所在目录。TODO(M15): 后端 background_list 会带 dir。 */
   backgroundList(kind: "local" | "wallpaper", page: number, pageSize = 20): Promise<BackgroundPage> {
     // 自检用：记下每次请求的 kind，确认只会出现 local / wallpaper 两种（window.__guguBgKinds）
     if (typeof window !== "undefined") {
@@ -2731,8 +3021,16 @@ export const api = {
   },
 
   /** 应用某张背景（方案 B / D）。TODO(M4): 后端 background_apply。 */
-  backgroundApply(kind: "local" | "wallpaper", file: string): Promise<void> {
-    return call("background_apply", { kind, file }, () => {
+  backgroundApply(request: { kind: "local" | "wallpaper"; file: string }): Promise<void> {
+    // 自检用：记下这次调用的键名（window.__guguBgApply），确认是 { kind, file }
+    if (typeof window !== "undefined") {
+      const host = window as unknown as Record<string, unknown>;
+      const seen = Array.isArray(host.__guguBgApply) ? (host.__guguBgApply as unknown[]) : [];
+      host.__guguBgApply = [...seen, { kind: request.kind, file: request.file, keys: Object.keys(request) }].slice(-20);
+    }
+    return call("background_apply", { ...request }, () => {
+      // 真机曾报「missing required key file」：这里必须是 { kind, file } 两个键
+      if (!request.file) throw new Error("没有选中要应用的背景文件");
       /* mock 只记设置，背景层由前端按 settings.appearance 渲染 */
     });
   },
@@ -2833,6 +3131,9 @@ export const api = {
     return call("skin_import_from_url", { ...request }, () => {
       const raw = request.name?.trim() || "thirdparty-" + Date.now().toString(36).slice(-4);
       const name = raw.replace(/\.png$/i, "");
+      // 同名（同一张）已经在本地：不重复落盘，直接复用
+      const existing = mockSkins.find((skin) => skin.name === name);
+      if (existing) return { ...existing, reused: true };
       const item: SkinItem = {
         name: name,
         path: mockRoot + "\\skins\\" + name + ".png",

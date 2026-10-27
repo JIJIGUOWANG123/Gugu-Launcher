@@ -28,6 +28,8 @@ pub struct SkinItem {
     pub uuid: Option<String>,
     /// 来源：builtin / local / mojang / thirdparty
     pub source: Option<String>,
+    /// 文件是否真的在磁盘上（current.txt 指向的文件可能已被删）
+    pub exists: bool,
 }
 
 /// 随包内置的两张皮肤（编译期嵌入，安装包 resources 里也带一份）。
@@ -53,6 +55,7 @@ fn builtin_item(model: &str, is_current: bool) -> SkinItem {
         builtin: true,
         uuid: None,
         source: Some("builtin".to_string()),
+        exists: true,
     }
 }
 
@@ -157,6 +160,7 @@ pub fn builtin_skin_item(name: &str, model: &str, is_current: bool) -> Option<(S
         builtin: true,
         uuid: None,
         source: Some("builtin".to_string()),
+        exists: true,
     };
     Some((item, util::hex(&util::sha256(bytes))))
 }
@@ -293,6 +297,7 @@ fn local_skins(dir: &Path, current: Option<&str>) -> Vec<SkinItem> {
                 builtin: false,
                 uuid: None,
                 source: Some("local".to_string()),
+                exists: path.is_file(),
             }
         })
         .collect()
@@ -319,11 +324,26 @@ pub fn list_capes(paths: &Paths) -> Vec<CapeItem> {
 /// skin_current()：当前皮肤；离线账号没选过就是内置 Steve（永远不为 None）。
 pub fn current_skin(paths: &Paths) -> Option<SkinItem> {
     let items = list_skins(paths);
-    items
-        .iter()
-        .find(|item| item.is_current)
-        .cloned()
-        .or_else(|| items.first().cloned())
+    if let Some(item) = items.iter().find(|item| item.is_current) {
+        return Some(item.clone());
+    }
+    let dir = skins_dir(paths);
+    // current.txt 指向的文件没了：报 exists=false，别偷偷回落 Steve
+    if let Some(name) = read_current(&dir, CURRENT_SKIN) {
+        let path = dir.join(&name);
+        return Some(SkinItem {
+            exists: path.is_file(),
+            name,
+            path: path.display().to_string(),
+            is_current: true,
+            size: std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+            data_url: png_data_url(&path, MAX_DATA_URL_BYTES),
+            builtin: false,
+            uuid: None,
+            source: Some("local".to_string()),
+        });
+    }
+    items.first().cloned()
 }
 
 /// cape_current()：当前披风（没选就是 None）。
@@ -422,6 +442,7 @@ pub fn apply_skin(paths: &Paths, source: &str) -> Result<SkinItem> {
         builtin: false,
         uuid: None,
         source: Some("local".to_string()),
+        exists: true,
     })
 }
 
@@ -451,6 +472,7 @@ pub fn upload_skin(paths: &Paths, name: &str, png_base64: &str) -> Result<SkinIt
         builtin: false,
         uuid: None,
         source: Some("local".to_string()),
+        exists: true,
     })
 }
 
@@ -683,6 +705,30 @@ pub fn parse_thirdparty_profile(json: &str, server: &str) -> Result<ThirdPartySk
     })
 }
 
+/// 导入结果：既有条目 + 是否复用（不新建文件）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkinImportResult {
+    #[serde(flatten)]
+    pub item: SkinItem,
+    pub reused: bool,
+}
+
+/// 在 .mc/skins 里找 sha256 相同的文件（导入去重）。
+pub fn find_skin_by_sha256(dir: &Path, hash: &str) -> Option<(String, PathBuf)> {
+    if hash.trim().is_empty() {
+        return None;
+    }
+    for (name, path) in list_png(dir) {
+        if let Ok(current) = util::sha256_file(&path) {
+            if current.eq_ignore_ascii_case(hash.trim()) {
+                return Some((name, path));
+            }
+        }
+    }
+    None
+}
+
 /// 下载皮肤用的 UA（textures.minecraft.net 与各家皮肤站都认这个）。
 pub const SKIN_DOWNLOAD_USER_AGENT: &str = "Mozilla/5.0 GuguLauncher/1.0";
 
@@ -833,7 +879,7 @@ pub async fn import_from_url(
     paths: &Paths,
     url: &str,
     name: Option<&str>,
-) -> Result<SkinItem> {
+) -> Result<SkinImportResult> {
     if !crate::settings::is_http_url(url) {
         return Err(AppError::Invalid(format!(
             "皮肤地址必须是 http(s)：{url}"
@@ -861,6 +907,30 @@ pub async fn import_from_url(
     validate_skin_png(&bytes)?;
     let dir = skins_dir(paths);
     std::fs::create_dir_all(&dir)?;
+    // 同一张图重复导入：直接复用既有文件，别再攒新名字
+    let hash = util::sha256_file_of_bytes(&bytes);
+    if let Some((existing, path)) = find_skin_by_sha256(&dir, &hash) {
+        let (size, data_url) = size_and_data_url(&path);
+        tracing::info!(
+            name = %existing,
+            sha256 = %&hash[..12.min(hash.len())],
+            "皮肤已存在，复用"
+        );
+        return Ok(SkinImportResult {
+            item: SkinItem {
+                name: existing,
+                path: path.display().to_string(),
+                is_current: false,
+                size,
+                data_url,
+                builtin: false,
+                uuid: None,
+                source: Some("thirdparty".to_string()),
+                exists: true,
+            },
+            reused: true,
+        });
+    }
     let file_name = skin_file_name_for(name);
     let target = unique_skin_target(&dir, &file_name);
     std::fs::write(&target, &bytes)?;
@@ -869,15 +939,24 @@ pub async fn import_from_url(
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or(file_name);
-    Ok(SkinItem {
-        name,
-        path: target.display().to_string(),
-        is_current: false,
-        size,
-        data_url,
-        builtin: false,
-        uuid: None,
-        source: Some("thirdparty".to_string()),
+    tracing::info!(
+        name = %name,
+        sha256 = %&hash[..12.min(hash.len())],
+        "导入新皮肤"
+    );
+    Ok(SkinImportResult {
+        item: SkinItem {
+            name,
+            path: target.display().to_string(),
+            is_current: false,
+            size,
+            data_url,
+            builtin: false,
+            uuid: None,
+            source: Some("thirdparty".to_string()),
+            exists: true,
+        },
+        reused: false,
     })
 }
 
@@ -1051,6 +1130,7 @@ pub async fn fetch_mojang_skin(
             Some(info.uuid)
         },
         source: Some("mojang".to_string()),
+        exists: true,
     })
 }
 
@@ -1496,12 +1576,24 @@ mod tests {
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{}/skin.png", addr.port());
         let first = import_from_url(&client, &paths, &url, Some("我的皮肤")).await.unwrap();
-        assert_eq!(first.name, "我的皮肤.png");
-        assert!(!first.is_current, "导入不自动应用");
-        assert!(first.data_url.unwrap_or_default().starts_with("data:image/png"));
+        assert_eq!(first.item.name, "我的皮肤.png");
+        assert!(!first.item.is_current, "导入不自动应用");
+        assert!(!first.reused, "第一次是新导入");
+        assert!(first
+            .item
+            .data_url
+            .as_ref()
+            .map(|value| value.starts_with("data:image/png"))
+            .unwrap_or(false));
+        // 同一张图（同 sha256）再导入一次：复用既有文件，不新增、不改名
         let second = import_from_url(&client, &paths, &url, Some("我的皮肤")).await.unwrap();
-        assert_eq!(second.name, "我的皮肤 (1).png", "重名要追加序号");
-        assert_eq!(list_skins(&paths).len(), 4, "内置 Steve/Alex + 两个导入皮肤");
+        assert!(second.reused, "重复导入要复用");
+        assert_eq!(second.item.name, "我的皮肤.png", "名字保持不变");
+        assert_eq!(
+            list_skins(&paths).len(),
+            3,
+            "内置 Steve/Alex + 一个导入皮肤（没有 (1)）"
+        );
 
         assert!(import_from_url(&client, &paths, "ftp://x/y.png", None).await.is_err());
         let _ = std::fs::remove_dir_all(&paths.root);
@@ -1534,5 +1626,72 @@ mod tests {
             .to_string();
         assert!(err.contains("player not found"));
         assert!(parse_mojang_profile(r#"{"properties":[]}"#).is_err());
+    }
+
+    #[test]
+    fn current_skin_is_persisted_after_apply() {
+        let paths = temp_paths("current-apply");
+        let source = paths.root.join("incoming.png");
+        std::fs::write(&source, png_bytes(64, 64)).unwrap();
+        apply_skin(&paths, &source.display().to_string()).unwrap();
+        let current = current_skin(&paths).unwrap();
+        assert_eq!(current.name, "incoming.png");
+        assert!(current.exists);
+        assert!(current.is_current);
+        assert!(!current.builtin);
+        assert_eq!(current.source.as_deref(), Some("local"));
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn current_skin_is_persisted_after_upload() {
+        let paths = temp_paths("current-upload");
+        let base64 = util::base64_encode(&png_bytes(64, 64));
+        let uploaded = upload_skin(&paths, "我的皮肤", &base64).unwrap();
+        let current = current_skin(&paths).unwrap();
+        assert_eq!(current.name, uploaded.name);
+        assert!(current.exists);
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn current_skin_is_persisted_after_import() {
+        let paths = temp_paths("current-import");
+        std::fs::create_dir_all(&paths.skins).unwrap();
+        let file = paths.skins.join("from-url.png");
+        std::fs::write(&file, png_bytes(64, 32)).unwrap();
+        apply_skin(&paths, &file.display().to_string()).unwrap();
+        let current = current_skin(&paths).unwrap();
+        assert_eq!(current.name, "from-url.png");
+        assert!(current.exists);
+        assert_eq!(
+            validate_skin_png(&std::fs::read(&file).unwrap()).unwrap(),
+            (64, 32)
+        );
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn missing_current_file_reports_exists_false() {
+        let paths = temp_paths("current-missing");
+        let file = paths.skins.join("gone.png");
+        std::fs::write(&file, png_bytes(64, 64)).unwrap();
+        apply_skin(&paths, &file.display().to_string()).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let current = current_skin(&paths).expect("不能偷偷回落 Steve");
+        assert_eq!(current.name, "gone.png", "名字要保留");
+        assert!(!current.exists, "exists 必须是 false");
+        assert!(current.data_url.is_none());
+        let _ = std::fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn builtin_fallback_has_exists_true() {
+        let paths = temp_paths("current-builtin");
+        let current = current_skin(&paths).unwrap();
+        assert_eq!(current.name, "Steve");
+        assert!(current.builtin);
+        assert!(current.exists);
+        let _ = std::fs::remove_dir_all(&paths.root);
     }
 }

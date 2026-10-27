@@ -717,9 +717,22 @@ export function ContentPage({ instances, versions, notify, onInstalled, onOpenIn
                     type="button"
                     className="pill-button"
                     data-action="content-install"
-                    onClick={() => setInstall({ title: data.title, projectId: item.id, kind: item.kind })}
+                    onClick={() => {
+                      // 整合包没有「装到已有实例」这条路：直接进详情走「创建并安装」
+                      if (item.kind === "modpack") {
+                        setDetailItem(item);
+                        return;
+                      }
+                      setInstall({ title: data.title, projectId: item.id, kind: item.kind });
+                    }}
                   >
-                    {t(item.kind === "plugin" ? "content.installToServer" : "content.installShort")}
+                    {t(
+                      item.kind === "plugin"
+                        ? "content.installToServer"
+                        : item.kind === "modpack"
+                          ? "content.createAndInstall"
+                          : "content.installShort",
+                    )}
                   </button>
                 </div>
               </article>
