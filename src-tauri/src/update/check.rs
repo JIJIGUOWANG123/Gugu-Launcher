@@ -175,13 +175,23 @@ pub fn evaluate(current: &str, release: &ApiRelease, build_time: Option<i64>) ->
     }
 }
 
-/// API 候选地址顺序：先直连 api.github.com，再依次试加速节点（按测速结果升序）。
+/// API 候选地址顺序：先直连 api.github.com，再测速通过的节点（按延迟升序），
+/// 最后是**其余所有节点**——测速通过只代表首页能通，Releases 可能还是 403，
+/// 全列上才不会因为「只挑到一个坏节点」而整次检查失败。
 pub fn api_candidates(results: &[ProbeResult]) -> Vec<String> {
     let mut urls = vec![RELEASES_API.to_string()];
+    let mut seen: Vec<&'static str> = Vec::new();
     for id in github::order_ok_by_latency(results) {
         if let Some(node) = github::find_node(id) {
             urls.push(format!("{}{}", node.base, RELEASES_API));
+            seen.push(node.id);
         }
+    }
+    for node in github::GITHUB_NODES.iter() {
+        if seen.contains(&node.id) {
+            continue;
+        }
+        urls.push(format!("{}{}", node.base, RELEASES_API));
     }
     urls
 }
@@ -193,7 +203,166 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 拉 Releases：直连失败就换加速节点，每次 8s 超时；全部失败返回 None（安静失败）。
+/// 一次候选尝试的结果（把网络细节抽出来，便于纯函数判定）。
+#[derive(Debug, Clone)]
+pub enum Attempt {
+    /// 拿到并解析出 Release
+    Json(ApiRelease),
+    /// 仓库确实没有 Release（404）
+    NotFound,
+    /// HTTP 非 2xx（非 404）
+    Status(u16),
+    /// 网络异常（超时/连接失败）
+    Error(String),
+    /// 2xx 但 JSON 解析失败
+    Parse(String),
+}
+
+/// 拉取结论：区分「仓库没发布」与「网络失败」。
+#[derive(Debug, Clone)]
+pub enum FetchOutcome {
+    Found(ApiRelease),
+    /// 仓库还没有 Release（404）：不是错误
+    NoRelease,
+    /// 所有候选节点都失败
+    Failed { reason: String },
+}
+
+/// 纯函数：把一串候选尝试折成一个结论。
+pub fn decide_fetch(attempts: Vec<Attempt>) -> FetchOutcome {
+    let mut last_error = String::new();
+    let mut saw_not_found = false;
+    for attempt in attempts {
+        match attempt {
+            Attempt::Json(release) => return FetchOutcome::Found(release),
+            Attempt::NotFound => saw_not_found = true,
+            Attempt::Status(status) => {
+                last_error = format!("HTTP {status}");
+            }
+            Attempt::Error(err) => last_error = err,
+            Attempt::Parse(err) => last_error = format!("响应解析失败：{err}"),
+        }
+    }
+    // 只要有一个候选明确回 404（仓库没发布），就不算网络失败
+    if saw_not_found && last_error.is_empty() {
+        FetchOutcome::NoRelease
+    } else if saw_not_found {
+        // 既有 404 也有别的错误：按「没发布」处理更贴近事实
+        FetchOutcome::NoRelease
+    } else if last_error.is_empty() {
+        FetchOutcome::Failed {
+            reason: "没有任何可用候选节点".to_string(),
+        }
+    } else {
+        FetchOutcome::Failed {
+            reason: last_error,
+        }
+    }
+}
+
+/// 拉 Releases 并给出区分过的结论（日志逐节点打点）。
+pub async fn fetch_release_detailed(
+    client: &reqwest::Client,
+    probes: &Mutex<ProbeCache>,
+) -> FetchOutcome {
+    let cached = probes
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get().map(|entries| entries.to_vec()));
+    let results = match cached {
+        Some(hit) => hit,
+        None => {
+            let fresh = github::probe_all(client).await;
+            if let Ok(mut cache) = probes.lock() {
+                cache.set(fresh.clone());
+            }
+            fresh
+        }
+    };
+    let candidates = api_candidates(&results);
+    tracing::info!(candidates = candidates.len(), "开始拉取 GitHub Releases");
+    let mut attempts: Vec<Attempt> = Vec::new();
+    for url in candidates {
+        let started = std::time::Instant::now();
+        let outcome = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                let status = response.status().as_u16();
+                match response.json::<ApiRelease>().await {
+                    Ok(release) => {
+                        tracing::info!(
+                            %url,
+                            status,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            tag = ?release.tag_name,
+                            "Releases 拉取成功"
+                        );
+                        Attempt::Json(release)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            %url,
+                            status,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            %err,
+                            "Releases JSON 解析失败"
+                        );
+                        Attempt::Parse(err.to_string())
+                    }
+                }
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let attempt = if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    tracing::info!(
+                        %url,
+                        status,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "仓库还没有 Release（404）"
+                    );
+                    Attempt::NotFound
+                } else {
+                    tracing::warn!(
+                        %url,
+                        status,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Releases 返回非 2xx"
+                    );
+                    Attempt::Status(status)
+                };
+                attempt
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %url,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    %err,
+                    "Releases 请求异常"
+                );
+                Attempt::Error(err.to_string())
+            }
+        };
+        if matches!(outcome, Attempt::Json(_)) {
+            attempts.push(outcome);
+            return decide_fetch(attempts);
+        }
+        attempts.push(outcome);
+    }
+    let verdict = decide_fetch(attempts);
+    match &verdict {
+        FetchOutcome::Found(release) => tracing::info!(tag = ?release.tag_name, "Releases 结论：已取到"),
+        FetchOutcome::NoRelease => tracing::info!("Releases 结论：仓库还没有发布版本"),
+        FetchOutcome::Failed { reason } => tracing::warn!(%reason, "Releases 结论：所有候选都失败"),
+    }
+    verdict
+}
+
+/// 拉 Releases：直连失败就换加速节点，每次 8s 超时；全部失败返回 None（只有「没发布」或「取到了」才可能返回 Some/None 组合，见 fetch_release_detailed）。
 pub async fn fetch_release(client: &reqwest::Client, probes: &Mutex<ProbeCache>) -> Option<ApiRelease> {
     // 注意：MutexGuard 不能跨 await 持有（否则整个 future 不是 Send），
     // 所以先取缓存并把锁释放，再 await 探测，最后重新加锁写回。
@@ -274,12 +443,43 @@ pub async fn run_with_asset(
         );
     }
 
+    tracing::info!(current, mode, "更新检查开始（current=<版本> mode=<模式>）");
     set(UpdateStatus::new(current, Phase::Checking, "正在检查更新…"));
-    let Some(release) = fetch_release(client, probes).await else {
-        // 没有 Release 或网络失败：都按「已是最新」安静处理，不显示错误
-        let mut next = UpdateStatus::new(current, Phase::UpToDate, format!("已是最新（{current}）"));
-        next.checked_at = Some(now_secs());
-        return (set(next), None);
+    let release = match fetch_release_detailed(client, probes).await {
+        FetchOutcome::Found(release) => release,
+        FetchOutcome::NoRelease => {
+            // 仓库确实没发布：这才是「已是最新」，但文案要说清原因
+            let mut next = UpdateStatus::new(
+                current,
+                Phase::UpToDate,
+                "仓库还没有发布版本".to_string(),
+            );
+            next.checked_at = Some(now_secs());
+            tracing::info!(
+                current,
+                phase = "upToDate",
+                message = %next.message,
+                "更新检查结论"
+            );
+            return (set(next), None);
+        }
+        FetchOutcome::Failed { reason } => {
+            // 网络/限流/节点全挂：必须报失败，绝不能伪装成「已是最新」
+            let mut next = UpdateStatus::new(
+                current,
+                Phase::Failed,
+                format!("检查更新失败：{reason}（可重试）"),
+            );
+            next.can_install = false;
+            next.checked_at = Some(now_secs());
+            tracing::warn!(
+                current,
+                reason = %reason,
+                message = %next.message,
+                "更新检查结论"
+            );
+            return (set(next), None);
+        }
     };
 
     match evaluate(current, &release, build_time) {
@@ -288,6 +488,13 @@ pub async fn run_with_asset(
                 UpdateStatus::new(current, Phase::UpToDate, format!("已是最新（{current}）"));
             next.remote_version = remote;
             next.checked_at = Some(now_secs());
+            tracing::info!(
+                current,
+                phase = "upToDate",
+                remote = ?next.remote_version,
+                message = %next.message,
+                "更新检查结论"
+            );
             (set(next), None)
         }
         Outcome::NoAsset { remote } => {
@@ -312,6 +519,14 @@ pub async fn run_with_asset(
             next.can_install = true;
             next.checked_at = Some(now_secs());
             next.message = format!("{}（{}）", next.message, asset.name);
+            tracing::info!(
+                current,
+                phase = "available",
+                remote = ?next.remote_version,
+                asset = %asset.name,
+                message = %next.message,
+                "更新检查结论"
+            );
             (set(next), Some(asset))
         }
     }
@@ -336,6 +551,88 @@ mod tests {
             published_at: Some("2026-10-27T05:30:34Z".to_string()),
             assets,
         }
+    }
+
+#[test]
+    fn api_candidates_cover_every_node() {
+        let urls = api_candidates(&[]);
+        assert_eq!(urls[0], RELEASES_API, "直连永远排第一");
+        assert_eq!(urls.len(), 1 + github::GITHUB_NODES.len(), "直连 + 全部节点");
+        assert!(urls.iter().skip(1).all(|url| url.ends_with(RELEASES_API)));
+        let probes = vec![
+            ProbeResult {
+                node: "tangbai",
+                ok: true,
+                elapsed_ms: 120,
+            },
+            ProbeResult {
+                node: "ghf",
+                ok: true,
+                elapsed_ms: 40,
+            },
+        ];
+        let urls = api_candidates(&probes);
+        assert!(urls[1].contains("ghf"), "最快排第一：{}", urls[1]);
+        assert!(urls[2].contains("tangbai"));
+        assert_eq!(urls.len(), 1 + github::GITHUB_NODES.len(), "其余节点仍要作为兜底");
+        let unique: std::collections::HashSet<&String> = urls.iter().collect();
+        assert_eq!(unique.len(), urls.len(), "不能有重复候选");
+    }
+
+    #[test]
+    fn fetch_404_means_no_release_not_latest() {
+        let verdict = decide_fetch(vec![Attempt::NotFound]);
+        assert!(matches!(verdict, FetchOutcome::NoRelease), "{verdict:?}");
+    }
+
+    #[test]
+    fn fetch_all_candidates_failing_is_an_error() {
+        let verdict = decide_fetch(vec![
+            Attempt::Error("error sending request for url".to_string()),
+            Attempt::Status(502),
+        ]);
+        match verdict {
+            FetchOutcome::Failed { reason } => {
+                assert!(reason.contains("502"), "{reason}");
+            }
+            other => panic!("必须报失败，实际 {other:?}"),
+        }
+        // 一个候选都没有
+        assert!(matches!(decide_fetch(Vec::new()), FetchOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn fetch_first_json_wins() {
+        let rel = release("1.0.1", vec![asset("GuguLauncher-Setup.exe")]);
+        let verdict = decide_fetch(vec![
+            Attempt::Error("timeout".to_string()),
+            Attempt::Json(rel),
+        ]);
+        assert!(matches!(verdict, FetchOutcome::Found(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn status_messages_distinguish_the_four_cases() {
+        // 用与 run_with_asset 相同的文案规则做纯函数级校验
+        let no_release = UpdateStatus::new("1.0.0", Phase::UpToDate, "仓库还没有发布版本");
+        assert_eq!(no_release.message, "仓库还没有发布版本");
+        let failed = UpdateStatus::new(
+            "1.0.0",
+            Phase::Failed,
+            format!("检查更新失败：{}（可重试）", "HTTP 502"),
+        );
+        assert!(failed.message.contains("可重试"));
+        assert_eq!(failed.current_version, "1.0.0");
+        let up = UpdateStatus::new("1.0.0", Phase::UpToDate, format!("已是最新（{}）", "1.0.0"));
+        assert_eq!(up.message, "已是最新（1.0.0）");
+        // Available 判定仍走 evaluate
+        let rel = release("1.0.1", vec![asset("GuguLauncher-Setup.exe")]);
+        match evaluate("1.0.0", &rel, None) {
+            Outcome::Available { remote, .. } => assert_eq!(remote, "1.0.1"),
+            other => panic!("{other:?}"),
+        }
+        let same = release("1.0.1", vec![asset("GuguLauncher-Setup.exe")]);
+        assert!(matches!(evaluate("1.0.1", &same, None), Outcome::UpToDate { .. }));
     }
 
     #[test]
@@ -404,6 +701,9 @@ mod tests {
         let urls = api_candidates(&results);
         assert_eq!(urls[0], RELEASES_API, "先直连");
         assert_eq!(urls[1], format!("https://git.tangbai.cc/{RELEASES_API}"), "再按耗时升序");
-        assert!(!urls.iter().any(|url| url.contains("30006000.xyz")), "测速失败的节点不参与");
+        // 测速失败的节点也保留在候选末尾：测速只测首页，Releases 可能反而能用
+        let xyz = urls.iter().position(|url| url.contains("30006000.xyz"));
+        assert!(xyz.is_some(), "测速失败的节点仍要作为兜底候选");
+        assert!(xyz.unwrap() > urls.iter().position(|url| url.contains("ghf")).unwrap());
     }
 }

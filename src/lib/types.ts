@@ -4,7 +4,25 @@
 export type Lang = "zh-CN";
 export type ThemeMode = "light" | "dark";
 export type UpdateMode = "auto" | "manual" | "off";
-export type DownloadSourceId = "official" | "bmclapi" | "custom" | "sjtu" | "auto";
+/**
+ * 下载源 id：后端 download_sources() 是动态表（现为 13 条），这里列出已知值但允许任意字符串，
+ * 免得后端加镜像就要改前端类型。
+ */
+export type DownloadSourceId =
+  | "auto"
+  | "official"
+  | "bmclapi"
+  | "minguncle"
+  | "nju"
+  | "lzu"
+  | "qlu"
+  | "hit"
+  | "ha"
+  | "ustc"
+  | "nyist"
+  | "sjtu"
+  | "custom"
+  | (string & {});
 /** 资源/模组来源：Modrinth / CurseForge / MCIM 镜像（auto、official 为历史值，UI 不再提供）。 */
 export type ResourceSourceId = "auto" | "official" | "modrinth" | "curseforge" | "mcim";
 /** 资源描述翻译来源：内置接口（默认，有频率限制）或自定义 OpenAI 兼容接口。 */
@@ -27,6 +45,8 @@ export interface Settings {
   /** 自定义镜像根地址，仅 downloadSource === "custom" 时生效 */
   customMirror: string;
   resourceSource: ResourceSourceId;
+  /** 资源下载源（镜像）：auto = 按实测延迟自动切换 / official 原站 / mcim 镜像 */
+  contentSource?: ContentSourceId;
   /** 自动翻译开关：关掉后资源卡片显示原文（titleOriginal / summaryOriginal） */
   translateEnabled: boolean;
   /** 资源描述翻译来源 */
@@ -158,14 +178,6 @@ export interface NewsItem {
   summaryOriginal?: string;
 }
 
-/** 检查更新结果（update_check 的返回）。 */
-export interface UpdateCheckResult {
-  hasUpdate: boolean;
-  latest: string | null;
-  current: string;
-  error: string | null;
-}
-
 export type UpdatePhase =
   | "idle"
   | "checking"
@@ -183,6 +195,12 @@ export interface UpdateStatus {
   message: string;
   checkedAt: number | null;
   canInstall: boolean;
+}
+
+/** app_changelog 的返回：最新一个版本的更新日志（markdown 简单渲染，不引第三方库）。 */
+export interface AppChangelog {
+  version: string;
+  markdown: string;
 }
 
 /** 系统里能显示中文的字体：family 名 + 中文显示名 + 别名链 + 来源。 */
@@ -248,13 +266,32 @@ export interface VersionManifest {
   latest?: { release?: string; snapshot?: string };
 }
 
+/** 实例图标来源：内置图标 / 自定义（上传或 icon.png）/ 没有（显示名称首字）。 */
+export type InstanceIconKind = "builtin" | "custom" | "none";
+
+/** 实例图标描述：底板渐变 + 前景图标两层。 */
+export interface InstanceIconSpec {
+  kind: InstanceIconKind;
+  /** 内置图标 id（BUILTIN_INSTANCE_ICONS 里的 id） */
+  id?: string;
+  /** 自定义图标的绝对路径（后端 iconPath） */
+  path?: string;
+  /** 预览用 data URL：刚上传还没落盘时用 */
+  dataUrl?: string;
+  /** 底板渐变，例如 linear-gradient(135deg, #a, #b) */
+  gradient?: string;
+}
+
 export interface Instance {
   id: number;
   name: string;
   mcVersion: string;
   loader: string;
   loaderVersion: string;
+  /** 后端 icon.png 路径（老字段，保留兼容） */
   icon: string;
+  /** 图标描述（新契约）；没有就按 icon 路径渲染 */
+  iconSpec?: InstanceIconSpec;
   pinnedHome: boolean;
   playTimeSecs: number;
   createdAt: string;
@@ -317,26 +354,47 @@ export interface TranslationTestResult {
   message: string;
 }
 
-/** 测速目标：内置源只给 id，自定义源还要带上用户填的根地址。 */
-export interface SourceProbeTarget {
-  id: DownloadSourceId;
-  /** 自定义镜像的根地址（其它源留空） */
-  base?: string;
-}
-
-/** 测速结果（sources_probe 的返回）：ok=false 时 latencyMs 为 null。 */
+/** sources_probe() 的元素：一次全局测速，每个源一条（命令不收参数）。 */
 export interface SourceProbe {
-  id: DownloadSourceId;
+  sourceId: DownloadSourceId;
   ok: boolean;
   latencyMs: number | null;
-  message: string;
+  /** ok=false 时的后端原因（状态码 / 超时 / 404），tooltip 里给全文 */
+  error?: string | null;
 }
 
-export interface DownloadSource {
-  id: DownloadSourceId;
+/** 资源下载源（设置 → 内容服务）：auto 自动 / official 原站 / mcim 镜像。 */
+export type ContentSourceId = "auto" | "official" | "mcim";
+
+/** resourceSources() 的元素。 */
+export interface ContentSource {
+  id: ContentSourceId;
   label: string;
   description: string;
-  base: string;
+  base?: string;
+  selectable?: boolean;
+}
+
+/** resourceProbe() 的元素（和 sources_probe 同形状）。 */
+export interface ContentSourceProbe {
+  sourceId: ContentSourceId;
+  ok: boolean;
+  latencyMs: number | null;
+  error?: string | null;
+}
+
+/** download_sources() 的元素：后端给的完整镜像表。 */
+export interface DownloadSource {
+  id: DownloadSourceId;
+  /** 显示名（后端可能给 label 或 name，前端已折平到 label） */
+  label: string;
+  /** 后端另一个字段名，兼容用 */
+  name?: string | null;
+  description: string;
+  base?: string;
+  baseUrl?: string | null;
+  /** false = 已下线 / 不可选（例如 sjtu），界面置灰 */
+  selectable?: boolean;
 }
 
 /** 下载任务阶段：文案走 i18n 的 downloads.phase.*。 */
@@ -632,6 +690,8 @@ export interface InstanceSettings {
   javaPath: string;
   /** 实例目录下的 icon.png 绝对路径，空字符串＝没有自定义图标 */
   iconPath: string;
+  /** 图标描述（新契约：内置 / 自定义 / 不设置 + 底板渐变） */
+  iconSpec?: InstanceIconSpec;
 }
 
 /** 实例日志文件（.mc/logs/*.log）。 */

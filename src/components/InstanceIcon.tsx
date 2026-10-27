@@ -1,34 +1,49 @@
+import { builtinIconById } from "../assets/instance-icons";
 import { iconFileUrl } from "../lib/tauri-api";
+import type { InstanceIconSpec } from "../lib/types";
 
 interface Props {
-  /** 实例目录下的 icon.png 绝对路径；空字符串＝还没设置 */
-  icon: string;
+  /** 图标描述（内置 / 自定义 / none） */
+  spec?: InstanceIconSpec | null;
+  /** 后端 icon.png 路径（老字段，和 spec 二选一） */
+  icon?: string;
+  /** 不选图标时显示名称首字 */
+  name?: string;
   className?: string;
   alt?: string;
 }
 
+/** 没选渐变时的默认底板（浅色系，不抢内容） */
+export const DEFAULT_ICON_GRADIENT = "linear-gradient(135deg, #cfe3ff, #a9c8f5)";
+
 /**
- * 实例图标：有 icon.png 就用文件，没有就用内联 SVG 草方块占位。
- * TODO(M2-B): 素材目录里没有草方块 png，先用 SVG 顶着；补素材后换成 <img>。
+ * 实例图标 = 底板（渐变）+ 前景（内置图 / 自定义图 / 名称首字）。
+ * spec 与后端 icon 路径都缺时退回名称首字，不会渲染空方块。
  */
-export function InstanceIcon({ icon, className, alt = "" }: Props) {
-  const url = iconFileUrl(icon);
-  if (url) {
-    return <img className={className} src={url} alt={alt} />;
-  }
+export function InstanceIcon({ spec, icon, name, className, alt = "" }: Props) {
+  const kind = spec?.kind ?? (icon ? "custom" : "none");
+  const builtin = kind === "builtin" ? builtinIconById(spec?.id) : null;
+  const customUrl = kind === "custom" ? spec?.dataUrl || iconFileUrl(spec?.path || icon || "") || "" : "";
+  const src = kind === "builtin" ? (builtin?.url ?? "") : customUrl;
+  const gradient = spec?.gradient || DEFAULT_ICON_GRADIENT;
+  const initial = (name ?? "").trim().slice(0, 1) || "?";
+
   return (
-    <svg className={className} viewBox="0 0 32 32" role="img" aria-label={alt || "实例图标"} shapeRendering="crispEdges">
-      <rect width="32" height="32" fill="#8d6141" />
-      <rect width="32" height="10" fill="#63a83c" />
-      <rect y="10" width="32" height="3" fill="#4d8a2c" />
-      <rect x="4" y="14" width="4" height="4" fill="#7a5236" />
-      <rect x="14" y="18" width="4" height="4" fill="#9c6f4a" />
-      <rect x="24" y="15" width="4" height="4" fill="#7a5236" />
-      <rect x="8" y="24" width="4" height="4" fill="#9c6f4a" />
-      <rect x="20" y="26" width="4" height="4" fill="#6d4a30" />
-      <rect x="2" y="2" width="3" height="3" fill="#7cbe52" />
-      <rect x="18" y="3" width="3" height="3" fill="#7cbe52" />
-      <rect x="27" y="6" width="3" height="3" fill="#4d8a2c" />
-    </svg>
+    <span
+      className={"instance-icon" + (className ? " " + className : "")}
+      data-instance-icon={kind}
+      data-instance-icon-id={spec?.id ?? ""}
+      style={{ background: gradient }}
+      role="img"
+      aria-label={alt || name || "实例图标"}
+    >
+      {src ? (
+        <img className="instance-icon__img" src={src} alt="" />
+      ) : (
+        <span className="instance-icon__initial" data-instance-icon-initial>
+          {initial}
+        </span>
+      )}
+    </span>
   );
 }

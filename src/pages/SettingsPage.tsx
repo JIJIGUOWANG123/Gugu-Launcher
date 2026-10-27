@@ -11,13 +11,16 @@ import { ACCENT_PRESETS, DEFAULT_UI_FONT, fontStack, isFontAvailable, isPresetAc
 import { api } from "../lib/tauri-api";
 import type {
   AppInfo,
+  ContentSource,
+  ContentSourceId,
+  ContentSourceProbe,
+  DownloadSource,
   DownloadSourceId,
   FontChoice,
   DataDirInfo,
   ResourceSourceId,
   Settings,
   SourceProbe,
-  SourceProbeTarget,
   TranslationSource,
   TranslationTestResult,
 } from "../lib/types";
@@ -91,6 +94,11 @@ const SECTIONS: SectionDef[] = [
         keywords: ["一言", "saying", "hitokoto", "接口", "api", "地址"],
       },
       {
+        id: "resourceSource",
+        titleKey: "settings.resourceSource",
+        keywords: ["资源下载源", "镜像", "mcim", "mirror", "测速", "源"],
+      },
+      {
         id: "contentSource",
         titleKey: "settings.contentSource",
         keywords: ["来源", "内容来源", "modrinth", "curseforge", "mcim", "模组", "整合包", "资源包", "content"],
@@ -115,11 +123,14 @@ const SECTIONS: SectionDef[] = [
   },
 ];
 
-/** 三个可选镜像源（自动档单独一行放在上面）。 */
-const MIRRORS: Array<{ id: DownloadSourceId; titleKey: string; descKey: string | null }> = [
-  { id: "official", titleKey: "settings.mirrorOfficial", descKey: "settings.mirrorOfficialDesc" },
-  { id: "bmclapi", titleKey: "settings.mirrorBmclapi", descKey: "settings.mirrorBmclapiDesc" },
-  { id: "custom", titleKey: "settings.mirrorCustom", descKey: null },
+/**
+ * 资源下载源的固定三行（顺序照截图）。后端 resource_sources() 只返回 official / mcim 两条，
+ * 「自动选择」由前端固定渲染，后端表只用来补 label / description。
+ */
+const RESOURCE_SOURCE_ROWS: Array<{ id: ContentSourceId; label: string; description: string }> = [
+  { id: "official", label: "官方原站", description: "直连 Modrinth / CurseForge，国外线路；CurseForge 需要 Key" },
+  { id: "mcim", label: "MCIM 镜像", description: "Modrinth 与 CurseForge 的接口与文件，国内更快" },
+  { id: "auto", label: "自动选择", description: "按实测延迟自动切换，跳过不可用镜像" },
 ];
 
 /**
@@ -164,7 +175,15 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   const [section, setSection] = useState<SectionKey>("general");
   const [search, setSearch] = useState("");
 
-  const [probes, setProbes] = useState<Partial<Record<DownloadSourceId, SourceProbe | "probing">>>({});
+  // 资源下载源（设置 → 内容服务）：官方原站 / MCIM 镜像 / 自动
+  const [resourceSources, setResourceSources] = useState<ContentSource[] | null>(null);
+  const [resourceProbes, setResourceProbes] = useState<Record<string, ContentSourceProbe>>({});
+  const [resourceProbing, setResourceProbing] = useState(false);
+
+  // 镜像表由后端下载源命令给（现为 13 条），probes 按 sourceId 映射
+  const [sources, setSources] = useState<DownloadSource[] | null>(null);
+  const [probes, setProbes] = useState<Record<string, SourceProbe>>({});
+  const [probingAll, setProbingAll] = useState(false);
 
   // 内容服务：翻译接口与 CurseForge Key 都用草稿，点「保存」才落盘
   // 自动翻译开关：老设置没有这个字段时按「开启」处理
@@ -356,63 +375,195 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   const shownGroups = new Set(visibleGroups(activeDef).map((group) => group.id));
   const showGroup = (id: string) => shownGroups.has(id);
 
-  // ---- 镜像源 ----
-  const probeSource = async (target: SourceProbeTarget) => {
-    if (target.id === "custom" && (target.base ?? "").trim().length === 0) {
-      setProbes((prev) => ({ ...prev, custom: { id: "custom", ok: false, latencyMs: null, message: t("settings.mirrorNeedUrl") } }));
-      return;
-    }
-    setProbes((prev) => ({ ...prev, [target.id]: "probing" }));
+  // 拉一次后端镜像表；保存过的 downloadSource 不在表里就回落 auto（后端还会再校验一次）
+  useEffect(() => {
+    let alive = true;
+    void api
+      .downloadSources()
+      .then((list) => {
+        if (!alive) return;
+        setSources(list);
+        const ids = new Set(list.map((item) => item.id));
+        if (settings.downloadSource !== "auto" && !ids.has(settings.downloadSource)) {
+          onChange({ downloadSource: "auto" });
+        }
+      })
+      .catch((error) => {
+        if (!alive) return;
+        setSources([]);
+        onNotify(String(error));
+      });
+    return () => {
+      alive = false;
+    };
+    // 只在挂载时拉一次表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 资源下载源表 + 校验保存过的值
+  useEffect(() => {
+    let alive = true;
+    void api
+      .resourceSources()
+      .then((list) => {
+        if (!alive) return;
+        setResourceSources(list);
+        const ids = new Set(list.map((item) => item.id));
+        const current = settings.contentSource;
+        if (current && !ids.has(current)) onChange({ contentSource: "auto" });
+      })
+      .catch((error) => {
+        if (alive) {
+          setResourceSources([]);
+          onNotify(String(error));
+        }
+      });
+    return () => {
+      alive = false;
+    };
+    // 只在挂载时拉一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** 资源下载源测速：每次点都 force，收到结果整表替换（不复用上次的值）。 */
+  const probeResourceSources = async () => {
+    if (resourceProbing) return;
+    setResourceProbing(true);
     try {
-      const result = await api.sourcesProbe(target);
-      setProbes((prev) => ({ ...prev, [target.id]: result }));
+      const list = await api.resourceProbe({ force: true });
+      const next: Record<string, ContentSourceProbe> = {};
+      for (const item of list) next[item.sourceId] = item;
+      setResourceProbes(next);
     } catch (error) {
-      setProbes((prev) => ({
-        ...prev,
-        [target.id]: { id: target.id, ok: false, latencyMs: null, message: String(error) },
-      }));
+      onNotify(t("settings.probeFailed", { message: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      setResourceProbing(false);
     }
   };
 
-  const fastest = useMemo(() => {
-    let best: { id: DownloadSourceId; latencyMs: number } | null = null;
-    for (const id of ["official", "bmclapi", "custom"] as DownloadSourceId[]) {
-      const state = probes[id];
-      if (!state || state === "probing" || !state.ok) continue;
-      const latency = state.latencyMs ?? 0;
-      if (!best || latency < best.latencyMs) best = { id, latencyMs: latency };
+  const resourceHit = useMemo(() => {
+    let best: { label: string; ms: number } | null = null;
+    for (const source of resourceSources ?? []) {
+      if (source.id === "auto") continue;
+      const state = resourceProbes[source.id];
+      if (!state || !state.ok || state.latencyMs === null) continue;
+      if (!best || state.latencyMs < best.ms) best = { label: source.label, ms: state.latencyMs };
     }
     return best;
-  }, [probes]);
+  }, [resourceProbes, resourceSources]);
 
-  const mirrorLabel = (id: DownloadSourceId) => {
-    const found = MIRRORS.find((item) => item.id === id);
-    return found ? t(found.titleKey) : t("settings.mirrorAuto");
-  };
-
-  const probePill = (id: DownloadSourceId) => {
-    const state = probes[id];
-    if (!state) {
-      return <span className="probe-pill" data-probe-pill={id}>{t("settings.probeUntested")}</span>;
+  const resourcePill = (sourceId: ContentSourceId) => {
+    if (resourceProbing) {
+      return (
+        <span className="probe-pill is-busy" data-resource-probe-pill={sourceId}>
+          {t("settings.probing")}
+        </span>
+      );
     }
-    if (state === "probing") {
-      return <span className="probe-pill is-busy" data-probe-pill={id}>{t("settings.probing")}</span>;
+    const state = resourceProbes[sourceId];
+    if (!state) {
+      return (
+        <span className="probe-pill" data-resource-probe-pill={sourceId}>
+          {t("settings.probeUntested")}
+        </span>
+      );
     }
     if (state.ok) {
       return (
-        <span className="probe-pill is-ok" data-probe-pill={id}>
-          {t("settings.probeMs", { ms: state.latencyMs ?? 0 })}
+        <span className="probe-pill is-ok" data-resource-probe-pill={sourceId}>
+          {t("settings.probeMsPlain", { ms: state.latencyMs ?? 0 })}
         </span>
       );
     }
     return (
-      <span className="probe-pill is-off" data-probe-pill={id} title={state.message}>
+      <span className="probe-pill is-off" data-resource-probe-pill={sourceId} title={state.error ?? ""}>
         {t("settings.probeUnavailable")}
       </span>
     );
   };
 
-  const selectSource = (id: DownloadSourceId) => onChange({ downloadSource: id });
+  // ---- 镜像源（表由后端 download_sources() 给，前端只负责分组 / 状态 / 选中）----
+  /** 全局测速一次：sources_probe({ force: true }) 绕过后端 10 分钟缓存，按 sourceId 映射到行 */
+  const probeAll = async () => {
+    if (probingAll) return;
+    setProbingAll(true);
+    try {
+      const list = await api.sourcesProbe({ force: true });
+      const next: Record<string, SourceProbe> = {};
+      for (const item of list) next[item.sourceId] = item;
+      setProbes(next);
+    } catch (error) {
+      onNotify(t("settings.probeFailed", { message: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      setProbingAll(false);
+    }
+  };
+
+  // 自动档结论：所有可测源里延迟最低的那个
+  const fastest = useMemo(() => {
+    let best: { id: DownloadSourceId; label: string; latencyMs: number } | null = null;
+    for (const source of sources ?? []) {
+      if (source.id === "auto" || source.id === "custom" || source.selectable === false) continue;
+      const state = probes[source.id];
+      if (!state || !state.ok || state.latencyMs === null) continue;
+      if (!best || state.latencyMs < best.latencyMs) {
+        best = { id: source.id, label: source.label, latencyMs: state.latencyMs };
+      }
+    }
+    return best;
+  }, [probes, sources]);
+
+  const probePill = (sourceId: DownloadSourceId) => {
+    if (probingAll) {
+      return (
+        <span className="probe-pill is-busy" data-probe-pill={sourceId}>
+          {t("settings.probing")}
+        </span>
+      );
+    }
+    const state = probes[sourceId];
+    if (!state) {
+      return (
+        <span className="probe-pill" data-probe-pill={sourceId}>
+          {t("settings.probeUntested")}
+        </span>
+      );
+    }
+    if (state.ok) {
+      return (
+        <span className="probe-pill is-ok" data-probe-pill={sourceId}>
+          {t("settings.probeMs", { ms: state.latencyMs ?? 0 })}
+        </span>
+      );
+    }
+    return (
+      <span className="probe-pill is-off" data-probe-pill={sourceId} title={state.error ?? ""}>
+        {t("settings.probeUnavailable")}
+      </span>
+    );
+  };
+
+  const selectSource = (source: DownloadSource) => {
+    if (source.selectable === false) {
+      onNotify(t("settings.mirrorDisabled", { name: source.label }));
+      return;
+    }
+    onChange({ downloadSource: source.id });
+  };
+
+  /** 分组标题：official / bmclapi / 国内镜像 / 自定义，未知 id 归到国内镜像组 */
+  const groupOf = (id: DownloadSourceId): string => {
+    if (id === "official") return "official";
+    if (id === "bmclapi") return "bmclapi";
+    if (id === "custom") return "custom";
+    return "cn";
+  };
+  const GROUP_TITLE: Record<string, string> = {
+    official: "settings.mirrorGroupOfficial",
+    bmclapi: "settings.mirrorGroupBmclapi",
+    cn: "settings.mirrorGroupCn",
+    custom: "settings.mirrorGroupCustom",
+  };
 
   // ---- 内容服务：翻译接口 / 内容来源 ----
   const canTest = translation.baseUrl.trim().length > 0 && translation.model.trim().length > 0;
@@ -675,76 +826,117 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   );
 
   const mirrorGroup = (
-    <section className="card settings-card">
-      <div className="settings-card__title">{t("settings.mirror")}</div>
+    <section className="card settings-card" data-mirror-group>
+      <div className="mirror-group__head">
+        <span className="settings-card__title">{t("settings.mirror")}</span>
+        <button
+          type="button"
+          className="pill-button"
+          data-action="sources-probe"
+          data-probe-all
+          disabled={probingAll || sources === null}
+          onClick={(event) => {
+            event.stopPropagation();
+            void probeAll();
+          }}
+        >
+          {probingAll ? t("settings.probing") : t("settings.probe")}
+        </button>
+      </div>
 
       <button
         type="button"
         className={"mirror-auto" + (settings.downloadSource === "auto" ? " is-active" : "")}
         data-source="auto"
         aria-pressed={settings.downloadSource === "auto"}
-        onClick={() => selectSource("auto")}
+        onClick={() => onChange({ downloadSource: "auto" })}
       >
         <span className="mirror-auto__mark" aria-hidden="true" />
         <span className="mirror-auto__text">
           <span className="mirror-auto__title">{t("settings.mirrorAuto")}</span>
-          <span className="row__hint">
-            {fastest ? t("settings.mirrorAutoHit", { name: mirrorLabel(fastest.id) }) : t("settings.mirrorAutoPending")}
+          <span className="row__hint" data-auto-pick>
+            {fastest
+              ? t("settings.mirrorAutoWill", { name: fastest.label, ms: fastest.latencyMs })
+              : t("settings.mirrorAutoPending")}
           </span>
         </span>
+        {probePill("auto")}
       </button>
 
-      <div className="mirror-list" role="radiogroup" aria-label={t("settings.mirror")}>
-        {MIRRORS.map((mirror) => (
-          <div
-            key={mirror.id}
-            role="radio"
-            tabIndex={0}
-            aria-checked={settings.downloadSource === mirror.id}
-            data-source={mirror.id}
-            className={"mirror-card" + (settings.downloadSource === mirror.id ? " is-active" : "")}
-            onClick={() => selectSource(mirror.id)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                selectSource(mirror.id);
-              }
-            }}
-          >
-            <span className="mirror-card__mark" aria-hidden="true" />
-            <div className="mirror-card__body">
-              <div className="mirror-card__title">{t(mirror.titleKey)}</div>
-              {mirror.descKey ? (
-                <div className="mirror-card__desc">{t(mirror.descKey)}</div>
-              ) : (
-                <input
-                  type="text"
-                  className="mirror-card__input"
-                  data-mirror-input="custom"
-                  value={settings.customMirror}
-                  placeholder={t("settings.mirrorCustomPlaceholder")}
-                  aria-label={t("settings.mirrorCustom")}
-                  onClick={(event) => event.stopPropagation()}
-                  onFocus={() => selectSource("custom")}
-                  onChange={(event) => onChange({ customMirror: event.target.value, downloadSource: "custom" })}
-                />
-              )}
-            </div>
-            <button
-              type="button"
-              className="mirror-card__probe"
-              data-probe={mirror.id}
-              onClick={(event) => {
-                event.stopPropagation();
-                void probeSource({ id: mirror.id, base: mirror.id === "custom" ? settings.customMirror : undefined });
-              }}
-            >
-              {t("settings.probe")}
-            </button>
-            {probePill(mirror.id)}
-          </div>
-        ))}
-      </div>
+      {sources === null ? (
+        <div className="row__hint" data-mirror-loading>
+          {t("common.loading")}
+        </div>
+      ) : sources.length === 0 ? (
+        <div className="empty-hint" data-mirror-empty>
+          {t("settings.mirrorEmpty")}
+        </div>
+      ) : (
+        <div className="mirror-list" role="radiogroup" aria-label={t("settings.mirror")}>
+          {sources
+            .filter((source) => source.id !== "auto")
+            .map((source, index, list) => {
+              const group = groupOf(source.id);
+              const prev = index > 0 ? groupOf(list[index - 1].id) : "";
+              const disabled = source.selectable === false;
+              const isCustom = source.id === "custom";
+              return (
+                <div key={source.id} className="mirror-block" data-mirror-group-block={group}>
+                  {group !== prev ? (
+                    <div className="mirror-group__title" data-mirror-group-title={group}>
+                      {t(GROUP_TITLE[group] ?? "settings.mirrorGroupCn")}
+                    </div>
+                  ) : null}
+                  <div
+                    role="radio"
+                    tabIndex={disabled ? -1 : 0}
+                    aria-checked={settings.downloadSource === source.id}
+                    aria-disabled={disabled}
+                    data-source={source.id}
+                    data-source-selectable={disabled ? "0" : "1"}
+                    className={
+                      "mirror-card" +
+                      (settings.downloadSource === source.id ? " is-active" : "") +
+                      (disabled ? " is-disabled" : "")
+                    }
+                    onClick={() => selectSource(source)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        selectSource(source);
+                      }
+                    }}
+                  >
+                    <span className="mirror-card__mark" aria-hidden="true" />
+                    <div className="mirror-card__body">
+                      <div className="mirror-card__title" data-source-label={source.id}>
+                        {source.label}
+                      </div>
+                      {isCustom ? (
+                        <input
+                          type="text"
+                          className="mirror-card__input"
+                          data-mirror-input="custom"
+                          value={settings.customMirror}
+                          placeholder={t("settings.mirrorCustomPlaceholder")}
+                          aria-label={source.label}
+                          onClick={(event) => event.stopPropagation()}
+                          onFocus={() => onChange({ downloadSource: "custom" })}
+                          onChange={(event) => onChange({ customMirror: event.target.value, downloadSource: "custom" })}
+                        />
+                      ) : (
+                        <div className="mirror-card__desc" data-source-desc={source.id}>
+                          {source.description}
+                        </div>
+                      )}
+                    </div>
+                    {probePill(source.id)}
+                  </div>
+                </div>
+              );
+            })}
+        </div>
+      )}
 
       <div className="row__hint">{t("settings.mirrorNote")}</div>
     </section>
@@ -1192,6 +1384,80 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
   );
 
   /** CurseForge API Key：常驻卡片，和「内容来源」选中什么无关。 */
+  const resourceSourceGroup = (
+    <section className="card settings-card" data-resource-source>
+      <div className="mirror-group__head">
+        <span className="settings-card__title">{t("settings.resourceSource")}</span>
+        <button
+          type="button"
+          className="pill-outline"
+          data-action="resource-probe"
+          data-resource-probe
+          disabled={resourceProbing || resourceSources === null}
+          onClick={() => void probeResourceSources()}
+        >
+          <span aria-hidden="true">⚡</span>&nbsp;{resourceProbing ? t("settings.probing") : t("settings.probe")}
+        </button>
+      </div>
+
+      <div className="mirror-list" role="radiogroup" aria-label={t("settings.resourceSource")}>
+        {RESOURCE_SOURCE_ROWS.map((row) => {
+          // 后端表只用来补字段（可能改文案）；「自动选择」行后端没有，这里固定渲染
+          const remote = (resourceSources ?? []).find((item) => item.id === row.id);
+          const source = {
+            id: row.id,
+            label: remote?.label || row.label,
+            description: remote?.description || row.description,
+          };
+          {
+            const active = (settings.contentSource ?? "auto") === source.id;
+            const isAuto = source.id === "auto";
+            return (
+              <div
+                key={source.id}
+                role="radio"
+                tabIndex={0}
+                aria-checked={active}
+                data-resource-source-row={source.id}
+                className={"mirror-card" + (active ? " is-active" : "")}
+                onClick={() => onChange({ contentSource: source.id })}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onChange({ contentSource: source.id });
+                  }
+                }}
+              >
+                <span className="mirror-card__mark" aria-hidden="true" />
+                <div className="mirror-card__body">
+                  <div className="mirror-card__title" data-resource-source-label={source.id}>
+                    {source.label}
+                  </div>
+                  <div className="mirror-card__desc">{source.description}</div>
+                </div>
+                {isAuto ? (
+                  <span className="row__hint" data-resource-hit>
+                    {resourceProbing
+                      ? t("settings.probing")
+                      : resourceHit
+                        ? t("settings.resourceHit", { name: resourceHit.label, ms: resourceHit.ms })
+                        : t("settings.resourceHitPending")}
+                  </span>
+                ) : (
+                  resourcePill(source.id)
+                )}
+              </div>
+            );
+          }
+        })}
+      </div>
+
+      <div className="row__hint" data-resource-source-note>
+        {t("settings.resourceSourceNote")}
+      </div>
+    </section>
+  );
+
   const curseforgeKeyGroup = (
     <section className="card settings-card" data-cf-key-card>
       <div className="cf-key__head">
@@ -1324,6 +1590,7 @@ export function SettingsPage({ settings, appInfo, dataRoot, fonts, fontMissing, 
                 {showGroup("translation") ? translationGroup : null}
                 {showGroup("sayingApi") ? sayingApiGroup : null}
                 {showGroup("contentSource") ? contentSourceGroup : null}
+                {showGroup("resourceSource") ? resourceSourceGroup : null}
                 {showGroup("curseforgeKey") ? curseforgeKeyGroup : null}
                 {showGroup("msLogin") ? msLoginGroup : null}
               </>

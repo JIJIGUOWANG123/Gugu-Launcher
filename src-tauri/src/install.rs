@@ -424,6 +424,10 @@ async fn download_batch(
 
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    let mut last_logged_done = 0u64;
+    let mut last_logged_bytes = 0u64;
+    tracing::info!(stage, files = total, "阶段开始：下载文件");
     while let Some(joined) = set.join_next().await {
         let result = joined.map_err(|err| AppError::Other(format!("下载任务异常退出：{err}")))?;
         match result {
@@ -434,20 +438,90 @@ async fn download_batch(
                     downloaded += 1;
                 }
                 let current = done.load(Ordering::Relaxed);
+                let received = bytes.load(Ordering::Relaxed);
                 let elapsed = started.elapsed().as_secs_f64().max(0.001);
-                let speed = (bytes.load(Ordering::Relaxed) as f64 / elapsed) as u64;
+                let speed = (received as f64 / elapsed) as u64;
                 task.set_speed(speed);
                 task.progress(Phase::Downloading, stage, current, total);
+                if should_log_progress(current, received, last_logged_done, last_logged_bytes) {
+                    last_logged_done = current;
+                    last_logged_bytes = received;
+                    tracing::info!(
+                        stage,
+                        done = current,
+                        total,
+                        received_bytes = received,
+                        "下载进度"
+                    );
+                }
             }
             Err((label, err)) => {
-                return Err(match err {
-                    AppError::Cancelled => AppError::Cancelled,
-                    other => AppError::Other(format!("{label} 下载失败：{other}")),
-                });
+                // 单个文件失败不静默：先记 WARN 汇总，全部结束后一起报
+                failures.push(format!("{label}：{err}"));
+                tracing::warn!(stage, file = %label, %err, "文件下载失败（继续其它文件）");
+                let current = done.load(Ordering::Relaxed);
+                task.progress(Phase::Downloading, stage, current, total);
+                if failures.len() >= MAX_FILE_FAILURES {
+                    let summary = summarize_failures(&failures);
+                    return Err(AppError::Other(format!(
+                        "{stage} 有 {} 个文件下载失败：{summary}",
+                        failures.len()
+                    )));
+                }
             }
         }
     }
+    if !failures.is_empty() {
+        let summary = summarize_failures(&failures);
+        return Err(AppError::Other(format!(
+            "{stage} 有 {} 个文件下载失败：{summary}",
+            failures.len()
+        )));
+    }
+    tracing::info!(
+        stage,
+        downloaded,
+        skipped,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "阶段结束：下载文件"
+    );
     Ok((downloaded, skipped))
+}
+
+/// 进度日志节流：每 20 个文件或每 5 MB 打一条 INFO。
+pub const LOG_EVERY_FILES: u64 = 20;
+pub const LOG_EVERY_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 单批里允许的最大失败文件数（超过就直接报错，避免无限拖）。
+pub const MAX_FILE_FAILURES: usize = 8;
+
+/// 纯函数：这次进度要不要打日志。
+pub fn should_log_progress(done: u64, bytes: u64, last_done: u64, last_bytes: u64) -> bool {
+    done.saturating_sub(last_done) >= LOG_EVERY_FILES
+        || bytes.saturating_sub(last_bytes) >= LOG_EVERY_BYTES
+}
+
+/// 失败汇总：只取前 3 条，附带总数。
+pub fn summarize_failures(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let head = failures
+        .iter()
+        .take(3)
+        .map(|item| item.as_str())
+        .collect::<Vec<_>>()
+        .join("；");
+    if failures.len() > 3 {
+        format!("{head}（还有其他 {} 条失败）", failures.len() - 3)
+    } else {
+        head
+    }
+}
+
+/// 纯函数：total 未知时进度必须标 indeterminate（前端按字节显示）。
+pub fn progress_indeterminate(total: u64) -> bool {
+    total == 0
 }
 
 /// 下载器里查清单用：读缓存优先，缓存里没有该版本才联网重拉。
@@ -649,6 +723,35 @@ mod tests {
     use super::*;
     use crate::events::NoopEvents;
     use crate::tasks::TaskStore;
+
+    #[test]
+    fn progress_log_throttle_fires_every_20_files_or_5mb() {
+        assert!(!should_log_progress(5, 1024, 0, 0), "5 个文件、1KB 都不够");
+        assert!(should_log_progress(20, 1024, 0, 0), "满 20 个文件要打");
+        assert!(!should_log_progress(19, 1024, 0, 0));
+        assert!(should_log_progress(3, 5 * 1024 * 1024, 0, 0), "满 5MB 也要打");
+        assert!(!should_log_progress(21, 1024, 20, 1024), "刚打过不再打");
+    }
+
+    #[test]
+    fn failure_summary_keeps_first_three() {
+        assert!(summarize_failures(&[]).is_empty());
+        let failures: Vec<String> = (1..=6).map(|index| format!("文件{index} 失败")).collect();
+        let summary = summarize_failures(&failures);
+        assert!(summary.contains("文件1"));
+        assert!(summary.contains("文件3"));
+        assert!(!summary.contains("文件4"), "只取前 3 条：{summary}");
+        assert!(summary.contains("还有其他 3 条失败"), "{summary}");
+        let two = summarize_failures(&["a 失败".to_string(), "b 失败".to_string()]);
+        assert!(!two.contains("还有其他"));
+    }
+
+    #[test]
+    fn unknown_total_marks_indeterminate() {
+        assert!(progress_indeterminate(0));
+        assert!(!progress_indeterminate(1));
+        assert!(!progress_indeterminate(1024));
+    }
 
     fn temp_root(tag: &str) -> Paths {
         let root = std::env::temp_dir().join(format!("gugu-install-{tag}-{}", std::process::id()));

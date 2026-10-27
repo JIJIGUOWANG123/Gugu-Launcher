@@ -56,6 +56,8 @@ pub struct InstallProgress {
     pub received_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
     pub target_dir: String,
+    /// total 未知（补齐依赖/资源这类路径）时为 true：前端显示「已下载 xx MB / 未知总量」而不是 0%
+    pub indeterminate: bool,
 }
 
 /// install://error 的载荷。
@@ -227,6 +229,7 @@ mod tests {
             received_bytes: Some(5),
             total_bytes: Some(10),
             target_dir: "D:\\minecraft\\.mc".into(),
+            indeterminate: false,
         };
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["taskId"], "t1");

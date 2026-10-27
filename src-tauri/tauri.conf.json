@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "咕咕启动器",
   "mainBinaryName": "GuguLauncher",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "identifier": "com.gugu.launcher",
   "build": {
     "beforeDevCommand": "pnpm run dev",

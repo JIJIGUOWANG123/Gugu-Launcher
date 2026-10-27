@@ -9,7 +9,7 @@ import { useT } from "../lib/i18n";
 import { BUILTIN_SKINS, OFFICIAL_SKINS } from "../lib/officialSkins";
 import { fileToDataUrl, hasDiskPath, imageUrlToBase64, isSkinSize, readImageSize, stripDataUrlPrefix } from "../lib/image-file";
 import { api } from "../lib/tauri-api";
-import type { CapesListResult, Settings, SkinItem, SkinModel } from "../lib/types";
+import type { CapesListResult, MsProfile, Settings, SkinItem, SkinModel, ThirdpartySkin } from "../lib/types";
 
 interface Props {
   notify: (message: string) => void;
@@ -34,6 +34,21 @@ const ACTIONS: Array<{ key: SkinAction; labelKey: string }> = [
   { key: "run", labelKey: "skin.action.run" },
   { key: "none", labelKey: "skin.action.none" },
 ];
+
+/**
+ * skin_current 的返回折成字符串：后端可能给字符串、{path}/{name}、甚至 null（真机白屏就是这类形状漂移）。
+ */
+function normalizeCurrentSkin(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw && typeof raw === "object") {
+    const record = raw as Record<string, unknown>;
+    for (const key of ["path", "name", "file"]) {
+      const value = record[key];
+      if (typeof value === "string") return value;
+    }
+  }
+  return "";
+}
 
 /** 后端缓存时间只用来提示，格式化失败就原样显示。 */
 function formatCacheTime(iso: string): string {
@@ -96,6 +111,10 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
   // 第三方账号的只读预览（和本地选择分开存，互不覆盖）
   const [thirdpartyPreview, setThirdpartyPreview] = useState<SkinItem | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  // 崩溃注入开关：只在 localStorage 显式打开时生效（自检脚本用）
+  const [crashInjected] = useState(
+    () => typeof window !== "undefined" && window.localStorage.getItem("gugu.mock.crash") === "skin",
+  );
 
   // 内置 Steve / Alex（列表前两项，不落盘、不可删）
   const builtin = BUILTIN;
@@ -119,7 +138,9 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
         setAccountSkinLoading(true);
       }
       try {
-        const profile = await api.msProfile(force ? { force: true } : {});
+        const rawProfile: unknown = await api.msProfile(force ? { force: true } : {});
+        // 形状漂移兜底：不是对象就当成没拿到
+        const profile = (rawProfile && typeof rawProfile === "object" ? rawProfile : {}) as MsProfile;
         if (profile.throttled) {
           notify(t("skin.throttled"));
           return;
@@ -164,10 +185,16 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
         } else if (active?.type === "thirdparty") {
           // 只读预览：拿皮肤站上正在用的那张
           try {
-            const skin = await api.thirdpartySkin({ accountId: active.id });
+            const rawSkin: unknown = await api.thirdpartySkin({ accountId: active.id });
+            const skin = (rawSkin && typeof rawSkin === "object" ? rawSkin : {}) as ThirdpartySkin;
             const url = skin.previewDataUrl || skin.skinUrl || null;
-            if (url) {
-              setThirdpartyPreview({ name: active.name + "（皮肤站）", path: "thirdparty://" + skin.uuid, dataUrl: url, size: 0 });
+            if (typeof url === "string" && url) {
+              setThirdpartyPreview({
+                name: active.name + "（皮肤站）",
+                path: "thirdparty://" + (skin.uuid ?? "unknown"),
+                dataUrl: url,
+                size: 0,
+              });
               setModel(skin.variant === "slim" ? "slim" : "default");
             }
           } catch {
@@ -203,9 +230,20 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
       api.skinCurrent(),
       api.capesList(),
     ]);
-    const list = skinResult.status === "fulfilled" ? skinResult.value : [];
-    const current = currentResult.status === "fulfilled" ? currentResult.value : "";
-    const capeList = capeResult.status === "fulfilled" ? capeResult.value : null;
+    // 后端形状漂移（非数组 / 对象 / null）一律兜住：宁可少显示，也不能把整棵页面打崩
+    const rawList: unknown = skinResult.status === "fulfilled" ? skinResult.value : [];
+    const list: SkinItem[] = Array.isArray(rawList)
+      ? (rawList as SkinItem[]).filter((item) => item && typeof item === "object")
+      : Array.isArray((rawList as { items?: unknown })?.items)
+        ? ((rawList as { items: SkinItem[] }).items).filter((item) => item && typeof item === "object")
+        : [];
+    const currentRaw: unknown = currentResult.status === "fulfilled" ? currentResult.value : "";
+    const current = normalizeCurrentSkin(currentRaw);
+    const rawCapes: unknown = capeResult.status === "fulfilled" ? capeResult.value : null;
+    const capeList: CapesListResult | null =
+      rawCapes && typeof rawCapes === "object"
+        ? { ...(rawCapes as CapesListResult), items: Array.isArray((rawCapes as CapesListResult).items) ? (rawCapes as CapesListResult).items : [] }
+        : null;
     setSkins(list);
     setCapes(capeList);
     setCurrentPath(current);
@@ -216,7 +254,7 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
       if (prev.builtin) return prev;
       return list.find((item) => item.path === prev.path) ?? prev;
     });
-    const activeCape = capeList?.items.find((cape) => cape.id === capeList.active) ?? null;
+    const activeCape = (capeList?.items ?? []).find((cape) => cape.id === capeList?.active) ?? null;
     setPreviewCape(activeCape ? { name: activeCape.name, dataUrl: activeCape.url } : null);
     const failed = [skinResult, capeResult].find((item) => item.status === "rejected");
     if (failed && failed.status === "rejected") notify(String(failed.reason));
@@ -228,8 +266,8 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
 
   /** 当前皮肤：skin_current 可能给绝对路径、文件名或内置名，三种都要还原（真机曾因名字对不上而回落 Steve）。 */
   const currentSkin = useMemo(() => {
-    const raw = (currentPath ?? "").trim();
-    const list = skins ?? [];
+    const raw = normalizeCurrentSkin(currentPath).trim();
+    const list = Array.isArray(skins) ? skins : [];
     if (!raw) return null;
     if (/^steve$/i.test(raw)) return BUILTIN.classic;
     if (/^alex$/i.test(raw)) return BUILTIN.slim;
@@ -240,7 +278,7 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
     return list.find((item) => bare(item.name) === target || bare(item.path) === target) ?? null;
   }, [skins, currentPath]);
   // 后端说在用某张皮肤，但本地找不到这个文件：保留上一次的选择并提示，不静默回 Steve
-  const currentMissing = currentPath.trim().length > 0 && skins !== null && currentSkin === null;
+  const currentMissing = normalizeCurrentSkin(currentPath).trim().length > 0 && skins !== null && currentSkin === null;
   // 列表 = 内置 Steve / Alex（前端常量，唯一来源）+ 后端返回的本地皮肤。
   // 后端若也返回了内置项（builtin 标记或 builtin:// 路径），这里过滤掉，避免同一个 Steve 出现两次。
   // 「本地皮肤」只放用户自己导入/保存的（.mc\skins 里的文件，含按玩家名获取后保存的）。
@@ -529,6 +567,9 @@ export function SkinsPage({ notify, onOpenAccounts }: Props) {
       setCapeSaving(false);
     }
   };
+
+  // 自检用：localStorage 里 gugu.mock.crash=skin 时主动抛一次渲染异常，验证页面级 ErrorBoundary
+  if (crashInjected) throw new Error("模拟渲染异常：皮肤页（gugu.mock.crash=skin）");
 
   return (
     <div className="skin-page">

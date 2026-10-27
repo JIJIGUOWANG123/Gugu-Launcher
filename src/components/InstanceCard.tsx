@@ -26,7 +26,13 @@ export function InstanceCard({ instance, onLaunch, onOpenFolder, onDetail, onCon
       }}
     >
       <div className="instance-card__head">
-        <InstanceIcon className="instance-card__icon" icon={instance.icon} alt={instance.name} />
+        <InstanceIcon
+          className="instance-card__icon"
+          spec={instance.iconSpec}
+          icon={instance.icon}
+          name={instance.name}
+          alt={instance.name}
+        />
         <div className="instance-card__meta">
           <div className="instance-card__title" title={instance.name}>
             {instance.name}

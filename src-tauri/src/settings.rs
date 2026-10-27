@@ -14,7 +14,30 @@ pub const SUPPORTED_LANGUAGES: [&str; 1] = ["zh-CN"];
 pub const THEMES: [&str; 2] = ["light", "dark"];
 pub const UPDATE_MODES: [&str; 3] = ["auto", "manual", "off"];
 /// custom 需要 customMirrorUrl；sjtu 只为兼容老配置保留（UI 暂时不展示）。
-pub const DOWNLOAD_SOURCES: [&str; 5] = ["official", "bmclapi", "sjtu", "custom", "auto"];
+/// 合法下载源：官方 / BMCLAPI / 8 个 BMCLAPI 协议镜像 / SJTU（旧值兼容）/ 自定义 / 自动。
+/// 资源（模组/整合包）下载源三选一。
+pub const CONTENT_SOURCES: [&str; 3] = ["auto", "official", "mcim"];
+
+/// 资源下载源的默认值（auto：按测速结果，没测过默认走 MCIM）。
+pub fn default_content_source() -> String {
+    "auto".to_string()
+}
+
+pub const DOWNLOAD_SOURCES: [&str; 13] = [
+    "official",
+    "bmclapi",
+    "minguncle",
+    "nju",
+    "lzu",
+    "qlu",
+    "hit",
+    "ha",
+    "ustc",
+    "nyist",
+    "sjtu",
+    "custom",
+    "auto",
+];
 /// 同时下载文件数范围。
 pub const CONCURRENCY_MIN: u16 = 1;
 pub const CONCURRENCY_MAX: u16 = 32;
@@ -56,6 +79,9 @@ pub struct Settings {
     pub theme_color: String,
     /// 内容文件默认走 MCIM 镜像下载（镜像失败会自动回退原始地址）
     pub content_download_via_mcim: bool,
+    /// 资源（模组/整合包）下载源：auto | official | mcim（默认 auto）
+    #[serde(default = "default_content_source")]
+    pub content_source: String,
     /// 内容搜索是否翻译标题/简介
     pub translate_enabled: bool,
     /// 启动前把游戏内语言强制成简体中文（默认开）
@@ -122,6 +148,7 @@ impl Default for Settings {
             accent: DEFAULT_ACCENT.to_string(),
             theme_color: String::new(),
             content_download_via_mcim: true,
+            content_source: default_content_source(),
             translate_enabled: true,
             force_chinese: true,
             // 首次安装默认「手动」：不自动下载更新（用户可在设置里改）
@@ -209,6 +236,18 @@ impl Settings {
     /// 读取时的兜底：把非法/过期取值回落到默认值，不报错。
     pub fn normalize(mut self) -> Self {
         let defaults = Settings::default();
+        // 旧配置迁移：contentDownloadViaMcim(true→mcim / false→official)，新值合法时不动
+        if !CONTENT_SOURCES.contains(&self.content_source.as_str()) {
+            self.content_source = if self.content_download_via_mcim {
+                "mcim".to_string()
+            } else {
+                "official".to_string()
+            };
+            tracing::info!(
+                content_source = %self.content_source,
+                "配置里的 contentDownloadViaMcim 已迁移到 contentSource"
+            );
+        }
         // 旧配置迁移：closeToTray: true → minimize，false → exit
         if let Some(close_to_tray) = self.close_to_tray.take() {
             self.close_action = if close_to_tray { "minimize" } else { "exit" }.to_string();
@@ -349,6 +388,12 @@ impl Settings {
         }
         if !UPDATE_MODES.contains(&self.update_mode.as_str()) {
             return Err(AppError::Invalid(format!("updateMode 非法：{:?}", self.update_mode)));
+        }
+        if !CONTENT_SOURCES.contains(&self.content_source.as_str()) {
+            return Err(AppError::Invalid(format!(
+                "contentSource 必须是 {:?} 之一，收到 {:?}",
+                CONTENT_SOURCES, self.content_source
+            )));
         }
         if !DOWNLOAD_SOURCES.contains(&self.download_source.as_str()) {
             return Err(AppError::Invalid(format!("downloadSource 非法：{:?}", self.download_source)));

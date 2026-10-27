@@ -7,6 +7,8 @@
 pub mod accounts;
 pub mod appearance;
 pub mod capes;
+pub mod changelog;
+pub mod contentsource;
 pub mod commands;
 pub mod content;
 pub mod datadir;
@@ -41,6 +43,7 @@ pub mod skins;
 pub mod sources;
 pub mod state;
 pub mod storage;
+pub mod sysinfo;
 pub mod tasks;
 pub mod terracotta;
 pub mod translate;
@@ -314,6 +317,14 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
+            commands::instance_ensure_dependencies,
+            commands::resource_sources,
+            commands::resource_probe,
+            commands::system_info,
+            commands::instance_set_icon,
+            commands::instance_icon_upload,
+            commands::instance_icon_remove,
+            commands::app_changelog,
             commands::paths_init,
             commands::settings_get,
             commands::settings_set,

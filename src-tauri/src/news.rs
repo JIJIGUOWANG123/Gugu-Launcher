@@ -12,6 +12,24 @@ use crate::translate::BuiltinTranslator;
 use crate::util;
 
 pub const NEWS_URL: &str = "https://launchercontent.mojang.com/v2/news.json";
+/// 主端点：v2 news.json。
+pub const NEWS_URL_V2: &str = "https://launchercontent.mojang.com/v2/news.json";
+/// 老端点：某些时期只有 /news.json。
+pub const NEWS_URL_LEGACY: &str = "https://launchercontent.mojang.com/news.json";
+/// 站点网格兜底。
+pub const NEWS_URL_GRID: &str = FALLBACK_URL;
+/// 单个端点的超时（三端点回退，别让一个端点拖死整页）。
+pub const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 三个端点的尝试顺序。
+pub fn news_endpoints() -> [(&'static str, &'static str); 3] {
+    [
+        ("v2", NEWS_URL_V2),
+        ("legacy", NEWS_URL_LEGACY),
+        ("grid", NEWS_URL_GRID),
+    ]
+}
+
 pub const NEWS_IMAGE_BASE: &str = "https://launchercontent.mojang.com";
 pub const FALLBACK_URL: &str = "https://www.minecraft.net/content/minecraftnet/language-masters/en-us/jcr:content/root/container/image_grid_a_copy_64.articles.page-1.json";
 pub const FALLBACK_IMAGE_BASE: &str = "https://www.minecraft.net";
@@ -321,55 +339,6 @@ impl NewsCache {
     }
 }
 
-/// 拉一份文本：显式 UA + accept，失败时把 URL / 状态码 / 耗时写进 WARN。
-async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String> {
-    let started = Instant::now();
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .header(reqwest::header::USER_AGENT, NEWS_USER_AGENT)
-        .header(reqwest::header::ACCEPT, "application/json, text/plain, */*")
-        .send()
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                url,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                error = %err,
-                "新闻请求失败（网络层）"
-            );
-            AppError::Net(format!("拉取新闻失败：{err}"))
-        })?;
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        tracing::warn!(
-            url,
-            status,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "新闻接口返回非 2xx"
-        );
-        return Err(AppError::Net(format!("新闻接口返回 HTTP {status}")));
-    }
-    let text = response.text().await.map_err(|err| {
-        tracing::warn!(
-            url,
-            status,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %err,
-            "读取新闻响应失败"
-        );
-        AppError::Net(format!("读取新闻响应失败：{err}"))
-    })?;
-    tracing::debug!(
-        url,
-        status,
-        bytes = text.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "新闻请求成功"
-    );
-    Ok(text)
-}
-
 /// 拿新闻：内存 30 分钟 → 网络（v2，再兜底站点网格）→ 旧磁盘缓存（stale）。
 pub async fn list(
     client: &reqwest::Client,
@@ -405,22 +374,98 @@ pub async fn list(
     }
 
     let mut items: Vec<NewsItem> = Vec::new();
-    match fetch_text(client, NEWS_URL).await {
-        Ok(text) => match parse_v2(&text, limit) {
-            Ok(parsed) if !parsed.is_empty() => items = parsed,
-            Ok(_) => tracing::warn!("news.json 解析为空"),
-            Err(err) => tracing::warn!(%err, "news.json 解析失败"),
-        },
-        Err(err) => tracing::warn!(%err, "拉取官方新闻失败，改用兜底源"),
-    }
-    if items.is_empty() {
-        match fetch_text(client, FALLBACK_URL).await {
-            Ok(text) => match parse_fallback(&text, limit) {
-                Ok(parsed) => items = parsed,
-                Err(err) => tracing::warn!(%err, "兜底新闻源解析失败"),
-            },
-            Err(err) => tracing::warn!(%err, "兜底新闻源也失败"),
+    let mut source = "";
+    let started = std::time::Instant::now();
+    for (kind, url) in news_endpoints() {
+        let step = std::time::Instant::now();
+        let outcome = tokio::time::timeout(ENDPOINT_TIMEOUT, client.get(url).send()).await;
+        match outcome {
+            Ok(Ok(response)) => {
+                let status = response.status().as_u16();
+                if !(200..300).contains(&status) {
+                    tracing::warn!(
+                        endpoint = kind,
+                        url,
+                        status,
+                        elapsed_ms = step.elapsed().as_millis() as u64,
+                        "新闻端点返回非 2xx，换下一个"
+                    );
+                    continue;
+                }
+                let text = match response.text().await {
+                    Ok(text) => text,
+                    Err(err) => {
+                        tracing::warn!(
+                            endpoint = kind,
+                            url,
+                            status,
+                            elapsed_ms = step.elapsed().as_millis() as u64,
+                            %err,
+                            "新闻端点读取响应失败，换下一个"
+                        );
+                        continue;
+                    }
+                };
+                let parsed = if kind == "grid" {
+                    parse_fallback(&text, limit)
+                } else {
+                    parse_v2(&text, limit)
+                };
+                match parsed {
+                    Ok(list) if !list.is_empty() => {
+                        tracing::info!(
+                            endpoint = kind,
+                            url,
+                            status,
+                            bytes = text.len(),
+                            count = list.len(),
+                            elapsed_ms = step.elapsed().as_millis() as u64,
+                            "新闻端点成功"
+                        );
+                        items = list;
+                        source = kind;
+                        break;
+                    }
+                    Ok(_) => tracing::warn!(
+                        endpoint = kind,
+                        url,
+                        status,
+                        elapsed_ms = step.elapsed().as_millis() as u64,
+                        "新闻端点解析为空，换下一个"
+                    ),
+                    Err(err) => tracing::warn!(
+                        endpoint = kind,
+                        url,
+                        status,
+                        elapsed_ms = step.elapsed().as_millis() as u64,
+                        %err,
+                        "新闻端点解析失败，换下一个"
+                    ),
+                }
+            }
+            Ok(Err(err)) => tracing::warn!(
+                endpoint = kind,
+                url,
+                elapsed_ms = step.elapsed().as_millis() as u64,
+                %err,
+                "新闻端点请求失败，换下一个"
+            ),
+            Err(_) => tracing::warn!(
+                endpoint = kind,
+                url,
+                elapsed_ms = step.elapsed().as_millis() as u64,
+                timeout_secs = ENDPOINT_TIMEOUT.as_secs(),
+                "新闻端点超时，换下一个"
+            ),
         }
+    }
+    if !items.is_empty() {
+        tracing::info!(
+            source,
+            count = items.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "新闻最终结论：成功"
+        );
     }
     if items.is_empty() {
         cache.mark_failed();
@@ -452,8 +497,11 @@ pub async fn list(
         "新闻拉取成功"
     );
 
-    // 翻译前 N 条（失败保留原文）
+    // 翻译前 N 条（失败保留原文；开关关掉就完全不翻译）
     if let Some((settings, translator)) = translator {
+        if !settings.translate_enabled {
+            tracing::info!("新闻 translate_enabled=false，跳过翻译");
+        } else {
         let mut texts: Vec<String> = Vec::new();
         for item in items.iter().take(TRANSLATE_LIMIT) {
             texts.push(item.title.clone());
@@ -482,6 +530,7 @@ pub async fn list(
                 changed = true;
             }
             item.translated = changed;
+        }
         }
     }
 
@@ -694,6 +743,30 @@ mod tests {
     }
 
 #[test]
+    fn three_endpoints_are_tried_in_order() {
+        let endpoints = news_endpoints();
+        assert_eq!(endpoints[0].0, "v2");
+        assert_eq!(endpoints[1].0, "legacy");
+        assert_eq!(endpoints[2].0, "grid");
+        assert!(endpoints[0].1.ends_with("/v2/news.json"));
+        assert!(endpoints[1].1.ends_with("/news.json"));
+        assert!(!endpoints[1].1.contains("/v2/"));
+        assert!(endpoints[2].1.contains("image_grid"));
+        assert_eq!(ENDPOINT_TIMEOUT.as_secs(), 5);
+        assert_eq!(NEGATIVE_TTL.as_secs(), 30, "失败负缓存只 30 秒");
+        assert_eq!(MEMORY_TTL.as_secs(), 30 * 60, "成功缓存 30 分钟");
+    }
+
+    #[test]
+    fn parsed_items_start_untranslated() {
+        let json = r#"{"version":1,"entries":[{"title":"Hello","category":"News","date":"2026-10-26T00:00:00Z","text":"Body","readMoreLink":"https://www.minecraft.net/article/x","newsPageImage":{"url":"/img/a.jpg"}}]}"#;
+        let items = parse_v2(json, 1).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].translated, "解析出来必须是未翻译状态");
+        assert_eq!(items[0].title, "Hello", "翻译失败/关闭时保留原文");
+    }
+
+    #[test]
     fn negative_cache_is_short_and_clearable() {
         let cache = NewsCache::new();
         cache.mark_failed();

@@ -146,9 +146,27 @@ impl Fetcher {
         }
 
         let mut failures: Vec<String> = Vec::new();
-        for origin in &self.origins {
+        // 候选链：剔除不支持该文件的源（部分镜像只代理 libraries/assets），并限次
+        let candidates: Vec<&Origin> = self
+            .origins
+            .iter()
+            .filter(|origin| crate::sources::origin_supports(origin, url))
+            .take(crate::sources::MAX_DOWNLOAD_ATTEMPTS)
+            .collect();
+        let mut previous: Option<&str> = None;
+        for origin in candidates {
             self.check_cancelled()?;
             let mapped = map_origin(origin, url);
+            if let Some(from) = previous {
+                tracing::warn!(
+                    file = %url,
+                    from,
+                    to = origin.id(),
+                    reason = %failures.last().cloned().unwrap_or_default(),
+                    "下载失败，切换镜像"
+                );
+            }
+            previous = Some(origin.id());
 
             // 大文件先试分片并发，失败再回落到单流
             if let Some(size) = size {
@@ -156,6 +174,7 @@ impl Fetcher {
                     match self.download_chunked(&mapped, dest, size).await {
                         Ok(bytes) => {
                             self.verify(dest, sha1, origin.id(), &mut failures)?;
+                            tracing::info!(file = %url, source = origin.id(), bytes, "下载成功（最终源）");
                             return Ok(FetchOutcome {
                                 bytes,
                                 skipped: false,
@@ -183,6 +202,7 @@ impl Fetcher {
                 match self.download_once(&mapped, dest).await {
                     Ok(bytes) => {
                         self.verify(dest, sha1, origin.id(), &mut failures)?;
+                        tracing::info!(file = %url, source = origin.id(), bytes, "下载成功（最终源）");
                         return Ok(FetchOutcome {
                             bytes,
                             skipped: false,

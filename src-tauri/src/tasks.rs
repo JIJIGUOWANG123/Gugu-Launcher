@@ -227,6 +227,8 @@ impl TaskStore {
                 received_bytes: task.received_bytes,
                 total_bytes: task.total_bytes,
                 target_dir: task.target_dir.clone(),
+                // total 未知时不能报 0%：标记 indeterminate，前端按字节数展示
+                indeterminate: total == 0 && phase != Phase::Finished,
             }
         };
 

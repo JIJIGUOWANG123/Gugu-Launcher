@@ -35,6 +35,184 @@ pub const IDENTIFIER: &str = "com.gugu.launcher";
 pub const PRODUCT_NAME: &str = "咕咕启动器";
 pub const PRODUCT_NAME_EN: &str = "Gugu Launcher";
 
+/// 设置实例图标 spec（内置 / 渐变 / none）；内置 id 不在白名单回落 none。
+#[tauri::command]
+pub fn instance_set_icon(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    spec: crate::instance::InstanceIconSpec,
+) -> Result<crate::instance::Instance> {
+    let conn = crate::db::open(&state.paths.db_file)?;
+    let saved = crate::instance::set_icon_spec(&conn, id, &spec)?;
+    tracing::info!(
+        id,
+        spec = %saved.icon_spec_raw,
+        "实例图标已保存"
+    );
+    Ok(saved)
+}
+
+/// 上传自定义图标：只收 PNG、≤256KB，缩放到 256×256 写入 <实例目录>\icon.png。
+#[tauri::command]
+pub fn instance_icon_upload(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    file_name: String,
+    data_base64: String,
+) -> Result<IconUploadResult> {
+    let conn = crate::db::open(&state.paths.db_file)?;
+    let target = crate::instance::get(&conn, id)?;
+    let game_dir = crate::instance::game_dir(&state.paths, &target.name);
+    let png = crate::instance::decode_icon_upload(&file_name, &data_base64)?;
+    let path = crate::instance::write_instance_icon(&game_dir, &png)?;
+    let spec = crate::instance::InstanceIconSpec::Custom {
+        path: Some(path.to_string_lossy().to_string()),
+    };
+    let saved = crate::instance::set_icon_spec(&conn, id, &spec)?;
+    tracing::info!(
+        id,
+        path = %path.display(),
+        bytes = png.len(),
+        "实例自定义图标已上传"
+    );
+    Ok(IconUploadResult {
+        path: path.to_string_lossy().to_string(),
+        icon_spec: saved.icon_spec,
+    })
+}
+
+/// 删除自定义图标（内置图标不允许删，返回可读错误）。
+#[tauri::command]
+pub fn instance_icon_remove(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+) -> Result<crate::instance::Instance> {
+    let conn = crate::db::open(&state.paths.db_file)?;
+    let target = crate::instance::get(&conn, id)?;
+    if matches!(target.icon_spec, crate::instance::InstanceIconSpec::Builtin { .. }) {
+        return Err(AppError::Invalid(
+            "内置图标不能删除，请改选其它图标".to_string(),
+        ));
+    }
+    let game_dir = crate::instance::game_dir(&state.paths, &target.name);
+    let path = crate::instance::icon_file_path(&game_dir);
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        tracing::info!(id, path = %path.display(), "实例自定义图标已删除");
+    }
+    let saved = crate::instance::set_icon_spec(&conn, id, &crate::instance::InstanceIconSpec::None)?;
+    Ok(saved)
+}
+
+/// instance_icon_upload 的返回。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IconUploadResult {
+    pub path: String,
+    pub icon_spec: crate::instance::InstanceIconSpec,
+}
+
+/// instance_ensure_dependencies({id})：单独跑一次依赖补齐，进度走 install://progress。
+#[tauri::command]
+pub async fn instance_ensure_dependencies(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<GithubDownloadStarted> {
+    let paths = state.paths.clone();
+    let client = state.client.clone();
+    let settings = state.settings();
+    let target = {
+        let conn = state.db()?;
+        instance::get(&conn, id)?
+    };
+    let origins = sources::resolve_with_probe(&client, &settings).await;
+    let task = state.tasks.create(
+        "install",
+        &format!("补齐依赖 {}", target.mc_version),
+        &instance::instance_dir(&paths, &target.name).display().to_string(),
+    );
+    let task_id = task.id().to_string();
+    task.progress(crate::events::Phase::Downloading, "检查依赖完整性", 0, 0);
+    tracing::info!(version = %target.mc_version, task = %task_id, "开始补齐依赖（indeterminate 阶段）");
+    let events: std::sync::Arc<dyn crate::events::Events> =
+        std::sync::Arc::new(NullEvents::default());
+    let installer = crate::install::Installer::new(
+        client,
+        paths,
+        origins,
+        events,
+        settings.effective_concurrency(),
+        settings.effective_connections(),
+    );
+    let version = target.mc_version.clone();
+    let handle = task;
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        match installer.ensure_ready(&version, &handle).await {
+            Ok(report) => {
+                handle.progress_forced(
+                    crate::events::Phase::Finished,
+                    "依赖已齐全",
+                    report.libraries as u64,
+                    report.libraries as u64,
+                );
+                handle.finish();
+                tracing::info!(
+                    version,
+                    libraries = report.libraries,
+                    assets = report.assets_total,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "补齐依赖完成"
+                );
+            }
+            Err(err) => {
+                handle.fail(&err.to_string());
+                tracing::warn!(version, %err, "补齐依赖失败");
+            }
+        }
+    });
+    Ok(GithubDownloadStarted { task_id })
+}
+
+/// 占位事件实现：补齐依赖只要进度，不需要游戏日志。
+#[derive(Default)]
+struct NullEvents;
+
+impl crate::events::Events for NullEvents {
+    fn install_progress(&self, _payload: &crate::events::InstallProgress) {}
+    fn install_error(&self, _payload: &crate::events::InstallError) {}
+    fn game_log(&self, _instance_id: i64, _line: &str) {}
+    fn game_exit(&self, _instance_id: i64, _code: Option<i32>) {}
+}
+
+/// resource_sources()：资源下载源列表（官方原站 / MCIM 镜像）。
+#[tauri::command]
+pub fn resource_sources() -> Vec<crate::contentsource::ResourceSource> {
+    crate::contentsource::resource_sources()
+}
+
+/// resource_probe({force})：两个源并发测速（force 绕过 10 分钟缓存）。
+#[tauri::command]
+pub async fn resource_probe(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<Vec<crate::contentsource::ResourceProbe>> {
+    let force = force.unwrap_or(false);
+    Ok(crate::contentsource::probe_all(&state.client, force).await)
+}
+
+/// system_info()：本机物理内存 / 可用内存 / CPU 核数 / 系统（实例内存滑块上限）。
+#[tauri::command]
+pub fn system_info() -> crate::sysinfo::SystemInfo {
+    crate::sysinfo::info()
+}
+
+/// app_changelog()：内嵌 CHANGELOG.md 的最新版本段落。
+#[tauri::command]
+pub fn app_changelog() -> crate::changelog::Changelog {
+    crate::changelog::latest()
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppInfo {
@@ -550,10 +728,28 @@ pub fn download_sources(state: State<'_, AppState>) -> Vec<SourceInfo> {
 
 /// 对 official / bmclapi / custom 各测一次速（并发、8 秒超时、取中位数）。
 #[tauri::command]
-pub async fn sources_probe(state: State<'_, AppState>) -> Result<Vec<SourceProbe>> {
+pub async fn sources_probe(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<Vec<SourceProbe>> {
     let settings = state.settings();
+    let force = force.unwrap_or(false);
     let candidates = sources::auto_candidates(&settings.custom_mirror_url);
-    Ok(sources::probe_all(&state.client, &candidates).await)
+    if force {
+        tracing::info!(candidates = candidates.len(), "手动测速：强制刷新全部下载源");
+    }
+    let probes = sources::probe_all_with(&state.client, &candidates, force).await;
+    if force {
+        for probe in &probes {
+            tracing::info!(
+                source = %probe.source_id,
+                ok = probe.ok,
+                latency_ms = probe.latency_ms,
+                "强制重新测速结果"
+            );
+        }
+    }
+    Ok(probes)
 }
 
 /// loader_versions({loader, mcVersion})：加载器可用版本（Fabric/Forge/NeoForge）。
@@ -1553,7 +1749,9 @@ pub async fn mods_apply_updates(
     let kind_id = crate::mods::ModKind::from_id(&kind)?;
     let content_dir = crate::mods::kind_dir(&state.paths, &target.name, kind_id);
     let instance_dir = instance::instance_dir(&state.paths, &target.name);
-    let via_mcim = state.settings().content_download_via_mcim;
+    let settings = state.settings();
+    let (source, _reason) = crate::contentsource::route_with_cache(&settings, "modrinth", true);
+    let via_mcim = source == "mcim";
     crate::updates::apply_updates(&state.client, &instance_dir, &content_dir, &items, via_mcim).await
 }
 
@@ -1807,7 +2005,9 @@ pub async fn server_content_apply_updates(
 ) -> Result<server_content::ContentApplyResult> {
     let (dir, _meta) = server::find(&state.paths, server_id.value()?)?;
     let kind = server_content::ServerContentKind::from_id(&kind)?;
-    let via_mcim = state.settings().content_download_via_mcim;
+    let settings = state.settings();
+    let (source, _reason) = crate::contentsource::route_with_cache(&settings, "modrinth", true);
+    let via_mcim = source == "mcim";
     server_content::apply_updates(&state.client, &dir, kind, &items, via_mcim).await
 }
 
@@ -2203,6 +2403,7 @@ async fn translate_content_items(state: &AppState, items: &mut [content::Content
     let settings = state.settings();
     // 关掉翻译开关就完全不打翻译接口：标题保持原文、translated 恒为 false
     if !settings.translate_enabled {
+        tracing::info!("内容搜索 translate_enabled=false，跳过翻译");
         content::disable_translation(items);
         return;
     }
@@ -2304,6 +2505,12 @@ pub async fn content_search(
         limit: page_size,
     }, has_key)?;
     let text = content::http_text(&state.client, &url, api_key).await?;
+    let (source, reason) = crate::contentsource::route_with_cache(
+        &state.settings(),
+        provider.id(),
+        !state.settings().curseforge_api_key.trim().is_empty(),
+    );
+    tracing::info!(source = %source, reason, provider = provider.id(), "内容搜索使用的资源通道");
     let mut result = content::parse_search(provider, &text, &kind, page, page_size)?;
     translate_content_items(&state, &mut result.items).await;
     Ok(result)
@@ -2387,7 +2594,12 @@ pub async fn mod_install(
         instance::get(&conn, instance_id)?
     };
     let title = format!("安装模组 {}", project_id);
-    let via_mcim = settings.content_download_via_mcim;
+    let (content_source, _reason) = crate::contentsource::route_with_cache(
+        &settings,
+        provider.id(),
+        !settings.curseforge_api_key.trim().is_empty(),
+    );
+    let via_mcim = content_source == "mcim";
     let task = state.tasks.create_with_prefix(
         "content",
         &title,
@@ -2473,7 +2685,14 @@ pub async fn modpack_install(
         connections: settings.effective_connections(),
         concurrency: settings.effective_concurrency(),
         curseforge_api_key: settings.curseforge_api_key.clone(),
-        via_mcim: settings.content_download_via_mcim,
+        via_mcim: {
+            let (source, _reason) = crate::contentsource::route_with_cache(
+                &settings,
+                "modrinth",
+                !settings.curseforge_api_key.trim().is_empty(),
+            );
+            source == "mcim"
+        },
     };
     let request = modpack::PackRequest {
         provider,

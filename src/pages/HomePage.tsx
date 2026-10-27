@@ -188,7 +188,13 @@ export function HomePage({ versions, instance, onLaunch, onOpenInstances, notify
                 data-home-recent-item={item.id}
                 onClick={() => (index === 0 ? onLaunch() : onOpenInstances())}
               >
-                <InstanceIcon className="home-recent__icon" icon={item.icon} alt={item.name} />
+                <InstanceIcon
+                  className="home-recent__icon"
+                  spec={item.iconSpec}
+                  icon={item.icon}
+                  name={item.name}
+                  alt={item.name}
+                />
                 <span className="home-recent__meta">
                   <span className="home-recent__name">{item.name}</span>
                   <span className="row__hint">

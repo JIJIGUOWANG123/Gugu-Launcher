@@ -504,9 +504,11 @@ export function ContentPage({ instances, versions, notify, onInstalled, onOpenIn
           </label>
           <button
             type="button"
-            className={"pill-outline" + (translateOn ? " is-active" : "")}
+            className={"pill-outline content-translate-toggle" + (translateOn ? " is-active" : " is-off")}
             data-action="content-translate-toggle"
             data-translate-on={translateOn ? "1" : "0"}
+            aria-pressed={translateOn}
+            title={translateOn ? t("content.translateOn") : t("content.translateOff")}
             onClick={() => void toggleTranslate()}
           >
             {translateOn ? t("content.translateOn") : t("content.translateOff")}

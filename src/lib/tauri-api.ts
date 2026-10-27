@@ -4,9 +4,11 @@
  */
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { builtinSkins } from "../assets/skins";
+import { CHANGELOG } from "./changelog";
 import { normalizeManifest } from "./versions";
 import type {
   Account,
+  AppChangelog,
   AppInfo,
   AuthlibStatus,
   BackgroundItem,
@@ -20,6 +22,8 @@ import type {
   ContentItem,
   ContentKindTab,
   ContentProvider,
+  ContentSource,
+  ContentSourceProbe,
   ContentSearchQuery,
   ContentSearchResult,
   ContentType,
@@ -71,11 +75,9 @@ import type {
   SkinLookupResult,
   SourceProbe,
   TranslationTestResult,
-  SourceProbeTarget,
   TeraState,
   TeraStatus,
   TranslateResult,
-  UpdateCheckResult,
   UpdateStatus,
   VersionChannel,
   VersionItem,
@@ -160,6 +162,7 @@ const MOCK_SETTINGS: Settings = {
   perFileConnections: 4,
   customMirror: "",
   resourceSource: "modrinth",
+  contentSource: "auto",
   translateEnabled: true,
   translationSource: "builtin",
   translationBaseUrl: "",
@@ -258,6 +261,7 @@ let mockInstances: Instance[] = [
     loader: "Fabric",
     loaderVersion: "0.26.1",
     icon: "",
+    iconSpec: { kind: "builtin", id: "grass-block", gradient: "linear-gradient(135deg, #c7f0c0, #4f9d5a)" },
     pinnedHome: true,
     playTimeSecs: 500,
     createdAt: "2025-01-01T00:00:00Z",
@@ -283,6 +287,7 @@ let mockInstances: Instance[] = [
     loader: "Fabric",
     loaderVersion: "0.15.11",
     icon: "",
+    iconSpec: { kind: "none", gradient: "linear-gradient(135deg, #ffd89b, #ff8a5c)" },
     pinnedHome: false,
     playTimeSecs: 1200,
     createdAt: "2025-02-03T00:00:00Z",
@@ -290,48 +295,180 @@ let mockInstances: Instance[] = [
   },
 ];
 
-const MOCK_UPDATE_STATUS: UpdateStatus = {
-  phase: "uptodate",
-  currentVersion: VERSION,
-  remoteVersion: null,
-  message: "已是最新（1.0.0）",
-  checkedAt: null,
-  canInstall: false,
-};
+/**
+ * 更新状态（update_status / update_check 的返回）：phase 由后端给，message 直接显示。
+ * 浏览器预览用 localStorage 的 gugu.mock.update = available | failed 切另外两种 phase。
+ */
+/** 把内置 changelog 折成后端形状的 markdown（后端 app_changelog 接进来后直接替换这段 mock）。 */
+function mockAppChangelog(): AppChangelog {
+  if (window.localStorage.getItem("gugu.mock.changelog") === "fail") {
+    throw new Error("更新日志接口不可用（HTTP 502）");
+  }
+  const latest = CHANGELOG[0];
+  const markdown = latest
+    ? latest.sections
+        .map((section) => "## " + section.title + "\n" + section.items.map((item) => "- " + item).join("\n"))
+        .join("\n\n")
+    : "";
+  return { version: latest?.version ?? VERSION, markdown };
+}
 
+function mockUpdateStatus(): UpdateStatus {
+  const override = window.localStorage.getItem(MOCK_UPDATE_OVERRIDE_KEY);
+  const checkedAt = Date.now();
+  if (override === "available") {
+    return {
+      phase: "available",
+      currentVersion: VERSION,
+      remoteVersion: "1.0.1",
+      message: "发现新版本 1.0.1",
+      checkedAt,
+      canInstall: true,
+    };
+  }
+  if (override === "failed" || override === "error") {
+    return {
+      phase: "failed",
+      currentVersion: VERSION,
+      remoteVersion: null,
+      message: "检查更新失败：网络不可达（已重试 2 次），可重试",
+      checkedAt,
+      canInstall: false,
+    };
+  }
+  return {
+    phase: "uptodate",
+    currentVersion: VERSION,
+    remoteVersion: null,
+    message: "已是最新（" + VERSION + "）",
+    checkedAt,
+    canInstall: false,
+  };
+}
+
+/**
+ * download_sources() 的假实现：和真机一致的 13 条（8 个国内镜像 + 官方 / BMCLAPI / 自定义 / sjtu 已下线）。
+ * 后端字段可能是 label 或 name、base 或 baseUrl，前端在 downloadSources() 里折平。
+ */
 const MOCK_SOURCES: DownloadSource[] = [
-  { id: "official", label: "官方源", description: "直接使用各官方地址", base: "https://launchermeta.mojang.com" },
-  { id: "bmclapi", label: "BMCLAPI", description: "https://bmclapi2.bangbang93.com", base: "https://bmclapi2.bangbang93.com" },
-  { id: "custom", label: "自定义镜像", description: "需兼容 BMCLAPI 接口", base: "" },
-  { id: "auto", label: "自动", description: "按测速选最快", base: "" },
+  { id: "official", label: "官方源", description: "直接使用 Mojang / Forge 官方地址（国外）", baseUrl: "https://launchermeta.mojang.com", selectable: true },
+  { id: "bmclapi", label: "BMCLAPI 官方", description: "https://bmclapi2.bangbang93.com", baseUrl: "https://bmclapi2.bangbang93.com", selectable: true },
+  { id: "minguncle", label: "明叔镜像", description: "https://download.mcimirror.top", baseUrl: "https://download.mcimirror.top", selectable: true },
+  { id: "nju", label: "南京大学镜像", description: "https://mirror.nju.edu.cn/minecraft", baseUrl: "https://mirror.nju.edu.cn/minecraft", selectable: true },
+  { id: "lzu", label: "兰州大学镜像", description: "https://mirror.lzu.edu.cn/minecraft", baseUrl: "https://mirror.lzu.edu.cn/minecraft", selectable: true },
+  { id: "qlu", label: "齐鲁工业大学镜像", description: "https://mirrors.qlu.edu.cn/minecraft", baseUrl: "https://mirrors.qlu.edu.cn/minecraft", selectable: true },
+  { id: "hit", label: "哈尔滨工业大学镜像", description: "https://mirrors.hit.edu.cn/minecraft", baseUrl: "https://mirrors.hit.edu.cn/minecraft", selectable: true },
+  { id: "ha", label: "河南理工大学镜像", description: "https://mirrors.hpu.edu.cn/minecraft", baseUrl: "https://mirrors.hpu.edu.cn/minecraft", selectable: true },
+  { id: "ustc", label: "中科大镜像", description: "https://mirrors.ustc.edu.cn/minecraft", baseUrl: "https://mirrors.ustc.edu.cn/minecraft", selectable: true },
+  { id: "nyist", label: "南阳理工学院镜像", description: "https://mirror.nyist.edu.cn/minecraft", baseUrl: "https://mirror.nyist.edu.cn/minecraft", selectable: true },
+  { id: "sjtu", label: "上海交大镜像（已下线）", description: "该镜像已停止服务，仅保留记录", baseUrl: "https://mirrors.sjtug.sjtu.edu.cn/minecraft", selectable: false },
+  { id: "custom", label: "自定义镜像", description: "需兼容 BMCLAPI 接口，填写自己的根地址", baseUrl: "", selectable: true },
+  { id: "auto", label: "自动", description: "按测速选最快", baseUrl: "", selectable: true },
 ];
 
-/** 浏览器里的假测速：官方最慢、BMCLAPI 最快；example.com / 空地址判为不可用。 */
-function mockSourceProbe(target: SourceProbeTarget): Promise<SourceProbe> {
-  const base = (target.base ?? "").trim();
+/**
+ * 资源下载源（设置 → 内容服务）。
+ * 注意：真机后端只返回 official / mcim 两条（"自动选择"由前端固定渲染），这里刻意照真机只给两条。
+ */
+const MOCK_CONTENT_SOURCES: ContentSource[] = [
+  {
+    id: "official",
+    label: "官方原站",
+    description: "直连 Modrinth / CurseForge，国外线路；CurseForge 需要 Key",
+    base: "https://api.modrinth.com",
+    selectable: true,
+  },
+  {
+    id: "mcim",
+    label: "MCIM 镜像",
+    description: "Modrinth 与 CurseForge 的接口与文件，国内更快",
+    base: "https://mod.mcimirror.top",
+    selectable: true,
+  },
+];
+
+/** 资源下载源的 mock 延迟（参考真机：官方 ~172ms、MCIM ~76ms）。 */
+const MOCK_CONTENT_LATENCY: Record<string, number> = { official: 172, mcim: 76 };
+let mockContentProbeAttempt = 0;
+
+/** resourceProbe() 的假实现：force 时每次重新测，延迟带增量（验证「数字每次都变」）。 */
+function mockResourceProbe(request: { force?: boolean } = {}): Promise<ContentSourceProbe[]> {
   return new Promise((resolve) => {
     window.setTimeout(() => {
-      if (target.id === "custom" && base.length === 0) {
-        resolve({ id: target.id, ok: false, latencyMs: null, message: "请先填写自定义镜像地址" });
-        return;
-      }
-      // 自检用：打开这个开关后每个源都返回不可用，文案带真后端那种原因（状态码 / 超时）
-      if (window.localStorage.getItem("gugu.mock.probe") === "fail") {
-        resolve({
-          id: target.id,
-          ok: false,
-          latencyMs: null,
-          message: target.id === "official" ? "HTTP 502（Bad Gateway）" : "连接超时（3000ms）",
-        });
-        return;
-      }
-      if (base.includes("example.com") || base.includes("invalid")) {
-        resolve({ id: target.id, ok: false, latencyMs: null, message: "HTTP 404（Not Found）：镜像地址不存在" });
-        return;
-      }
-      const baseMs = target.id === "bmclapi" ? 34 : target.id === "custom" ? 76 : 148;
-      resolve({ id: target.id, ok: true, latencyMs: baseMs + Math.floor(Math.random() * 30), message: "" });
-    }, 320);
+      mockContentProbeAttempt += 1;
+      const jitter = request.force ? (mockContentProbeAttempt - 1) * 7 : 0;
+      const failAll = window.localStorage.getItem("gugu.mock.probe") === "fail";
+      resolve(
+        MOCK_CONTENT_SOURCES.filter((source) => source.id !== "auto").map((source): ContentSourceProbe => {
+          if (failAll) {
+            return {
+              sourceId: source.id,
+              ok: false,
+              latencyMs: null,
+              error: source.id === "official" ? "连接超时（5000ms）" : "HTTP 503（Service Unavailable）",
+            };
+          }
+          return {
+            sourceId: source.id,
+            ok: true,
+            latencyMs: (MOCK_CONTENT_LATENCY[source.id] ?? 120) + jitter,
+            error: null,
+          };
+        }),
+      );
+    }, 380);
+  });
+}
+
+/** 各镜像的 mock 延迟（和真机实测同量级，lzu 最快）。 */
+const MOCK_SOURCE_LATENCY: Record<string, number> = {
+  lzu: 62,
+  qlu: 113,
+  nyist: 145,
+  ha: 151,
+  hit: 179,
+  minguncle: 201,
+  bmclapi: 489,
+  ustc: 998,
+  official: 112,
+  ha_alt: 0,
+};
+
+/** 已测速次数：force 时每次给延迟加点增量，方便验证「再点一次数字会变」。 */
+let mockProbeAttempt = 0;
+
+/**
+ * sources_probe() 的假实现：一次返回所有源的结果；force=true 绕过缓存（这里体现为延迟重新测一次）。
+ * nju 固定 404（ok=false + error），sjtu 已下线，custom 没填地址就不测。
+ */
+function mockSourceProbeList(request: { force?: boolean } = {}): Promise<SourceProbe[]> {
+  return new Promise((resolve) => {
+    window.setTimeout(() => {
+      mockProbeAttempt += 1;
+      const jitter = request.force ? (mockProbeAttempt - 1) * 11 : 0;
+      const failAll = window.localStorage.getItem("gugu.mock.probe") === "fail";
+      const list = MOCK_SOURCES.filter((source) => source.id !== "auto").map((source): SourceProbe => {
+        if (failAll) {
+          return {
+            sourceId: source.id,
+            ok: false,
+            latencyMs: null,
+            error: source.id === "official" ? "HTTP 502（Bad Gateway）" : "连接超时（3000ms）",
+          };
+        }
+        if (source.id === "sjtu") {
+          return { sourceId: source.id, ok: false, latencyMs: null, error: "该镜像已下线（HTTP 404）" };
+        }
+        if (source.id === "custom") {
+          return { sourceId: source.id, ok: false, latencyMs: null, error: "请先填写自定义镜像地址" };
+        }
+        if (source.id === "nju") {
+          return { sourceId: source.id, ok: false, latencyMs: null, error: "HTTP 404（Not Found）：镜像路径已变更" };
+        }
+        return { sourceId: source.id, ok: true, latencyMs: (MOCK_SOURCE_LATENCY[source.id] ?? 220) + jitter, error: null };
+      });
+      resolve(list);
+    }, 420);
   });
 }
 
@@ -592,7 +729,8 @@ function mockInstanceSettings(id: number): InstanceSettings {
     windowWidth: 1920,
     windowHeight: 1080,
     javaPath: "",
-    iconPath: "",
+    iconPath: instance?.icon ?? "",
+    iconSpec: instance?.iconSpec,
   };
   MOCK_INSTANCE_SETTINGS.set(id, fresh);
   return fresh;
@@ -1082,6 +1220,8 @@ function mockApplyAccount(id: string): void {
 
 /** 第三方（Yggdrasil 皮肤站）登录的假实现：地址 / 密码 / 角色 / 可达性各走一条错误分支。 */
 const MOCK_AUTHLIB_KEY = "gugu.mock.authlib";
+/** 皮肤相关命令的形状漂移开关（自检用：gugu.mock.skinShape=drift）。 */
+const MOCK_SKIN_SHAPE_KEY = "gugu.mock.skinShape";
 
 function mockThirdpartyLogin(request: { server: string; username: string; password: string }): Account {
   const server = request.server.trim();
@@ -2006,15 +2146,28 @@ export const api = {
   },
 
   downloadSources(): Promise<DownloadSource[]> {
-    return call("download_sources", undefined, () => MOCK_SOURCES);
+    return call("download_sources", undefined, () => MOCK_SOURCES).then((list) =>
+      (Array.isArray(list) ? list : [])
+        // 后端字段名可能是 label 或 name、base 或 baseUrl：这里统一折成 label / base
+        .map((raw) => ({
+          ...raw,
+          label: raw.label || raw.name || raw.id,
+          description: raw.description ?? "",
+          base: raw.base ?? raw.baseUrl ?? "",
+          selectable: raw.selectable !== false,
+        }))
+        .filter((item) => Boolean(item.id)),
+    );
   },
 
   /**
-   * 给一个下载源测速。TODO(M2-A): 后端 sources_probe —— 真发一次小请求测往返延迟，
-   * 自定义源用 target.base 当根地址；不可达时 ok=false、latencyMs=null。
+   * 全局测速：**不收参数**，返回每个源一条结果（ok=false 时 error 里是状态码 / 超时原因）。
+   * TODO(M16): 后端 sources_probe —— 一次并发探所有源，自定义源用设置里的地址。
    */
-  sourcesProbe(target: SourceProbeTarget): Promise<SourceProbe> {
-    return call("sources_probe", { target }, () => mockSourceProbe(target));
+  sourcesProbe(request: { force?: boolean } = {}): Promise<SourceProbe[]> {
+    return call("sources_probe", { ...request }, () => mockSourceProbeList(request)).then((list) =>
+      Array.isArray(list) ? list : [],
+    );
   },
 
   /**
@@ -2098,31 +2251,60 @@ export const api = {
     return cached("fonts_list", () => call("fonts_list", undefined, () => MOCK_FONTS));
   },
 
+  /**
+   * 最新一个版本的更新日志（关于页用）。TODO(M16): 后端 app_changelog —— 形状 { version, markdown }，
+   * 内容必须和仓库 README / release note 一致。
+   */
+  appChangelog(): Promise<AppChangelog> {
+    return call("app_changelog", undefined, () => mockAppChangelog());
+  },
+
+  /** 资源下载源表（设置 → 内容服务）。TODO(M16): 后端 resourceSources。 */
+  resourceSources(): Promise<ContentSource[]> {
+    return call("resource_sources", undefined, () => MOCK_CONTENT_SOURCES).then((list) =>
+      (Array.isArray(list) ? list : []).map((raw) => ({
+        ...raw,
+        label: raw.label || raw.id,
+        description: raw.description ?? "",
+        selectable: raw.selectable !== false,
+      })),
+    );
+  },
+
+  /** 资源下载源测速；force=true 绕过后端缓存，每次点都重新测。TODO(M16): 后端 resourceProbe。 */
+  resourceProbe(request: { force?: boolean } = {}): Promise<ContentSourceProbe[]> {
+    return call("resource_probe", { ...request }, () => mockResourceProbe(request)).then((list) =>
+      Array.isArray(list) ? list : [],
+    );
+  },
+
   /** 只读更新状态（不发请求），关于页轮询用。 */
   updateStatus(): Promise<UpdateStatus> {
-    return call("update_status", undefined, () => MOCK_UPDATE_STATUS);
+    return call("update_status", undefined, () => mockUpdateStatus());
   },
 
   /**
-   * 立即检查一次更新（M4 形状：hasUpdate / latest / current / error）。
-   * 浏览器预览里用 localStorage 的 gugu.mock.update = available|error 模拟另外两种结果。
+   * 立即检查一次更新，返回 UpdateStatus（phase / currentVersion / remoteVersion / message / checkedAt / canInstall）。
+   * 文案由后端按 phase 给，前端不再自己拼。
+   * TODO(M15): 后端 update_check —— 失败要报 phase=failed，不能伪装成已是最新。
    */
-  updateCheck(): Promise<UpdateCheckResult> {
-    return call("update_check", undefined, () => {
-      const override = window.localStorage.getItem(MOCK_UPDATE_OVERRIDE_KEY);
-      if (override === "available") {
-        return { hasUpdate: true, latest: "1.0.1", current: VERSION, error: null };
-      }
-      if (override === "error") {
-        return { hasUpdate: false, latest: null, current: VERSION, error: "网络不可达（已重试 2 次）" };
-      }
-      return { hasUpdate: false, latest: null, current: VERSION, error: null };
-    });
+  updateCheck(): Promise<UpdateStatus> {
+    // 自检用：记下真实发起的检查次数（window.__guguUpdateCheck），确认「进页面自动查一次 / 点按钮再查」
+    if (typeof window !== "undefined") {
+      const host = window as unknown as Record<string, unknown>;
+      host.__guguUpdateCheck = (typeof host.__guguUpdateCheck === "number" ? host.__guguUpdateCheck : 0) + 1;
+    }
+    return call("update_check", undefined, () => mockUpdateStatus());
   },
 
-  /** manual 模式点「立即更新」；M1 只返回状态，实际安装在 M2 接入。 */
+  /** manual 模式点「立即更新」；真实安装由后端接管，这里只回一个状态。 */
   updateInstall(): Promise<UpdateStatus> {
-    return call("update_install", undefined, () => ({ ...MOCK_UPDATE_STATUS, message: "安装流程将在 M2 接入" }));
+    return call("update_install", undefined, () => ({
+      ...mockUpdateStatus(),
+      phase: "downloading",
+      message: "正在下载更新 12%",
+      canInstall: false,
+    }));
   },
 
   /** 启动实例：M1 后端返回「未实现」，这里把错误原样抛给调用方显示。 */
@@ -2185,7 +2367,12 @@ export const api = {
   instanceSettingsSet(id: number, settings: InstanceSettings): Promise<InstanceSettings> {
     return call("instance_settings_set", { id, settings }, () => {
       MOCK_INSTANCE_SETTINGS.set(id, { ...settings });
-      mockInstances = mockInstances.map((item) => (item.id === id ? { ...item, name: settings.name } : item));
+      // 图标：spec 与后端 icon 路径（自定义图才有路径；内置/未设置清空 icon，卡片靠 spec 渲染）
+      const spec = settings.iconSpec;
+      const icon = spec?.kind === "custom" ? spec.path || spec.dataUrl || "" : "";
+      mockInstances = mockInstances.map((item) =>
+        item.id === id ? { ...item, name: settings.name, icon, iconSpec: spec } : item,
+      );
       return { ...settings };
     });
   },
@@ -2607,9 +2794,18 @@ export const api = {
     return call("skin_fetch_mojang", { ...request }, () => mockFetchMojang(request.username));
   },
 
-  /** 本地 .mc\\skins\\ 下的皮肤列表（带 data URL 缩略图）。TODO(M3-2): 后端 skins_list。 */
+  /**
+   * 本地 .mc\\skins\\ 下的皮肤列表（带 data URL 缩略图）。TODO(M3-2): 后端 skins_list。
+   * 自检用：gugu.mock.skinShape = drift 时故意回 {items:[…]}，模拟后端形状漂移（页面必须不崩）。
+   */
   skinsList(): Promise<SkinItem[]> {
-    return call("skins_list", undefined, () => mockSkins.map((skin) => ({ ...skin })));
+    return call("skins_list", undefined, () => {
+      const list = mockSkins.map((skin) => ({ ...skin }));
+      if (window.localStorage.getItem(MOCK_SKIN_SHAPE_KEY) === "drift") {
+        return { items: list } as unknown as SkinItem[];
+      }
+      return list;
+    });
   },
 
   /** 删除本地皮肤（只删 .mc\\skins 里的文件，不动账号外观）。TODO(M14): 后端 skins_delete。 */
@@ -2685,9 +2881,17 @@ export const api = {
     });
   },
 
-  /** 当前正在使用的皮肤路径。TODO(M3-2): 后端 skin_current。 */
+  /**
+   * 当前正在使用的皮肤路径。TODO(M3-2): 后端 skin_current。
+   * 自检用：gugu.mock.skinShape = drift 时故意回 {path}，模拟后端形状漂移（页面必须不崩）。
+   */
   skinCurrent(): Promise<string> {
-    return call("skin_current", undefined, () => mockCurrentSkin);
+    return call("skin_current", undefined, () => {
+      if (window.localStorage.getItem(MOCK_SKIN_SHAPE_KEY) === "drift") {
+        return { path: mockCurrentSkin } as unknown as string;
+      }
+      return mockCurrentSkin;
+    });
   },
 
   /** 账号上的披风列表；supported=false 时 reason 说明为什么不支持，items 恒为空。 */
@@ -3002,7 +3206,14 @@ export const api = {
 
   /** 批量翻译（译文优先展示）。limited=true 表示内置接口命中频率上限。TODO(M3-2): 后端 translate_texts。 */
   translateTexts(texts: string[]): Promise<TranslateResult> {
-    return call("translate_texts", { texts }, () => mockTranslate(texts));
+    return call("translate_texts", { texts }, () => {
+      // 自检用：记下真实发起的翻译请求次数（window.__guguTranslateCalls），关掉翻译时必须为 0 增量
+      if (typeof window !== "undefined") {
+        const host = window as unknown as Record<string, unknown>;
+        host.__guguTranslateCalls = (typeof host.__guguTranslateCalls === "number" ? host.__guguTranslateCalls : 0) + 1;
+      }
+      return mockTranslate(texts);
+    });
   },
 
   // ------------------------------------------------------ 背景外观（M4）

@@ -11,7 +11,7 @@ use crate::error::Result;
 
 /// 当前 schema 版本。v2 给实例表加上设置列（备注/内存/窗口/Java），
 /// v3 加上整合包列（pack_name / pack_state）。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 打开（必要时创建）数据库并跑迁移。
 pub fn open(path: &Path) -> Result<Connection> {
@@ -35,6 +35,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             1 => apply_v1(&tx)?,
             2 => apply_v2(&tx)?,
             3 => apply_v3(&tx)?,
+            4 => apply_v4(&tx)?,
             other => {
                 return Err(crate::error::AppError::Other(format!(
                     "缺少 schema v{other} 的迁移实现"
@@ -137,6 +138,22 @@ fn apply_v3(conn: &Connection) -> Result<()> {
         conn.execute_batch(&format!(
             "ALTER TABLE instances ADD COLUMN {column} {definition};"
         ))?;
+    }
+    Ok(())
+}
+
+/// v4：实例图标 spec（JSON 字符串，空串表示没设过）。
+fn apply_v4(conn: &Connection) -> Result<()> {
+    let mut existing: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(instances)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for row in rows {
+            existing.push(row?);
+        }
+    }
+    if !existing.iter().any(|name| name == "icon_spec") {
+        conn.execute_batch("ALTER TABLE instances ADD COLUMN icon_spec TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(())
 }

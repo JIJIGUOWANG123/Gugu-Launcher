@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { icons } from "../assets/icons";
+import { IconPickerModal } from "../components/IconPickerModal";
 import { InstanceIcon } from "../components/InstanceIcon";
 import { Modal } from "../components/Modal";
 import { formatBytes, formatStamp } from "../lib/format";
@@ -165,14 +166,8 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
     }
   };
 
-  const pickIcon = async () => {
-    try {
-      const path = await api.instancePickIcon(instance.id);
-      if (path) patch({ iconPath: path });
-    } catch (error) {
-      notify(String(error));
-    }
-  };
+  // 「选择图标」：弹窗里选渐变 / 内置图标 / 上传本地图（不再走系统文件框）
+  const [iconOpen, setIconOpen] = useState(false);
 
   const startExport = async () => {
     setExporting(true);
@@ -206,7 +201,13 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
             <path d="M15 5l-7 7 7 7" />
           </svg>
         </button>
-        <InstanceIcon className="detail-head__icon" icon={settings?.iconPath || instance.icon} alt={instance.name} />
+        <InstanceIcon
+          className="detail-head__icon"
+          spec={settings?.iconSpec ?? instance.iconSpec}
+          icon={settings?.iconPath || instance.icon}
+          name={settings?.name ?? instance.name}
+          alt={instance.name}
+        />
         <div className="detail-head__meta">
           <div className="detail-head__name">{settings?.name ?? instance.name}</div>
           <div className="instance-card__version">
@@ -346,13 +347,31 @@ export function InstanceDetailPage({ instance, onBack, onLaunch, onSaved, notify
             <section className="card">
               <div className="detail-card__title">{t("detail.icon")}</div>
               <div className="row">
-                <InstanceIcon className="detail-icon__preview" icon={settings.iconPath} alt={t("detail.icon")} />
+                <InstanceIcon
+                  className="detail-icon__preview"
+                  spec={settings.iconSpec}
+                  icon={settings.iconPath}
+                  name={settings.name}
+                  alt={t("detail.icon")}
+                />
                 <div>
-                  <button onClick={() => void pickIcon()}>{t("detail.iconPick")}</button>
+                  <button type="button" data-action="instance-icon-pick" onClick={() => setIconOpen(true)}>
+                    {t("detail.iconPick")}
+                  </button>
                   <div className="row__hint">{t("detail.iconHint")}</div>
                 </div>
               </div>
             </section>
+
+            {iconOpen ? (
+              <IconPickerModal
+                spec={settings.iconSpec}
+                name={settings.name}
+                notify={notify}
+                onClose={() => setIconOpen(false)}
+                onChange={(spec) => patch({ iconSpec: spec, iconPath: spec.kind === "custom" && spec.path ? spec.path : "" })}
+              />
+            ) : null}
 
             <div className="detail-actions">
               <button className="pill-button" disabled={saving} onClick={() => void save()}>

@@ -18,6 +18,88 @@ pub const DEFAULT_WINDOW_HEIGHT: u32 = 480;
 pub const WINDOW_MIN: u32 = 320;
 pub const WINDOW_MAX: u32 = 7680;
 
+/// 实例图标 spec（前端弹窗里选出来的东西）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum InstanceIconSpec {
+    /// 内置图标：gradient + 内置 id
+    #[serde(rename = "builtin")]
+    Builtin {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gradient: Option<String>,
+    },
+    /// 自定义上传：落盘到 <实例目录>\icon.png
+    #[serde(rename = "custom")]
+    Custom {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// 没设过
+    #[serde(rename = "none")]
+    None,
+}
+
+impl Default for InstanceIconSpec {
+    fn default() -> Self {
+        InstanceIconSpec::None
+    }
+}
+
+impl InstanceIconSpec {
+    /// 内置图标白名单（与前端 21 张内置图对应；不在表里的一律回落 none）。
+    pub const BUILTIN_IDS: [&'static str; 21] = [
+        "ari-classic", "ari-slim", "alex-classic", "alex-slim", "efe-classic",
+        "efe-slim", "kai-classic", "kai-slim", "makena-classic", "makena-slim",
+        "noor-classic", "noor-slim", "steve-classic", "steve-slim", "sunny-classic",
+        "sunny-slim", "zuri-classic", "zuri-slim", "diamond-block", "grass-block",
+        "creeper-face",
+    ];
+
+    /// 校验并规范化：内置 id 不在白名单 → none。
+    pub fn normalize(self) -> Self {
+        match self {
+            InstanceIconSpec::Builtin { id, gradient } => {
+                match id {
+                    Some(id) if Self::BUILTIN_IDS.contains(&id.as_str()) => {
+                        InstanceIconSpec::Builtin { id: Some(id), gradient }
+                    }
+                    _ => InstanceIconSpec::None,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// 从数据库的 JSON 文本解析；坏了就当没设过。
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return InstanceIconSpec::None;
+        }
+        serde_json::from_str::<InstanceIconSpec>(trimmed)
+            .map(|spec| spec.normalize())
+            .unwrap_or(InstanceIconSpec::None)
+    }
+
+    /// 存回数据库的 JSON 文本。
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// 旧数据回落：没有 spec 但有旧的 icon 路径 → custom。
+    pub fn from_legacy_icon(icon: &str) -> Self {
+        if icon.trim().is_empty() {
+            InstanceIconSpec::None
+        } else {
+            InstanceIconSpec::Custom {
+                path: Some(icon.trim().to_string()),
+            }
+        }
+    }
+}
+
 /// 实例（序列化给前端，camelCase）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +128,11 @@ pub struct Instance {
     /// 整合包状态：installed / incomplete（普通实例为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_state: Option<String>,
+    /// 图标 spec（内置 / 自定义 / 无），前端用它渲染卡片
+    pub icon_spec: InstanceIconSpec,
+    /// 数据库里的原始 JSON（不序列化给前端，写回时用）
+    #[serde(skip)]
+    pub icon_spec_raw: String,
 }
 
 /// 新建实例的入参。
@@ -198,6 +285,12 @@ pub fn apply_patch(current: &Instance, patch: &InstanceSettingsPatch) -> Result<
 fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
     let icon: String = row.get("icon")?;
     let last_played_at: Option<String> = row.get("last_played_at")?;
+    let icon_spec_raw: String = row.get::<_, Option<String>>("icon_spec")?.unwrap_or_default();
+    let mut icon_spec = InstanceIconSpec::parse(&icon_spec_raw);
+    // 旧数据：没有 spec 但有 icon 路径 → 当作 custom
+    if icon_spec == InstanceIconSpec::None {
+        icon_spec = InstanceIconSpec::from_legacy_icon(&icon);
+    }
     Ok(Instance {
         id: row.get("id")?,
         name: row.get("name")?,
@@ -217,6 +310,8 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
         java_path: row.get("java_path")?,
         icon_path: icon,
         pack_name: row.get("pack_name")?,
+        icon_spec,
+        icon_spec_raw,
         pack_state: {
             let state: String = row.get("pack_state")?;
             if state.trim().is_empty() {
@@ -230,7 +325,8 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instance> {
 
 const SELECT_COLUMNS: &str = "id, name, mc_version, loader, loader_version, icon, pinned_home,
                               play_time_secs, created_at, last_played_at, note, memory_mb,
-                              window_width, window_height, java_path, pack_name, pack_state";
+                              window_width, window_height, java_path, pack_name, pack_state,
+                              icon_spec";
 
 pub fn list(conn: &Connection) -> Result<Vec<Instance>> {
     let mut stmt = conn.prepare(&format!(
@@ -342,6 +438,100 @@ pub fn delete(conn: &Connection, paths: &Paths, id: i64) -> Result<()> {
     }
     conn.execute("DELETE FROM instances WHERE id = ?1", [id])?;
     Ok(())
+}
+
+/// 实例目录里的自定义图标文件名。
+pub const ICON_FILE_NAME: &str = "icon.png";
+/// 上传图标的最大体积（256 KB）。
+pub const ICON_MAX_BYTES: usize = 256 * 1024;
+/// 图标统一缩放到的边长。
+pub const ICON_SIZE: u32 = 256;
+
+/// 写 icon_spec 列，并同步旧的 icon / icon_path 字段（老前端仍读它们）。
+pub fn set_icon_spec(conn: &Connection, id: i64, spec: &InstanceIconSpec) -> Result<Instance> {
+    let spec = spec.clone().normalize();
+    let json = spec.to_json();
+    let legacy_path = match &spec {
+        InstanceIconSpec::Custom { path } => path.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let changed = conn.execute(
+        "UPDATE instances SET icon_spec = ?1, icon = ?2, java_path = java_path WHERE id = ?3",
+        rusqlite::params![json, legacy_path, id],
+    )?;
+    if changed == 0 {
+        return Err(crate::error::AppError::Invalid(format!("实例不存在：id={id}")));
+    }
+    get(conn, id)
+}
+
+/// 校验并解码上传的图标：只收 PNG，且不超过 ICON_MAX_BYTES。
+pub fn decode_icon_upload(file_name: &str, data_base64: &str) -> Result<Vec<u8>> {
+    let name = file_name.trim().to_ascii_lowercase();
+    if !name.ends_with(".png") {
+        return Err(crate::error::AppError::Invalid(
+            "只支持 PNG 图标（请导出为 .png 再上传）".to_string(),
+        ));
+    }
+    let trimmed = data_base64.trim();
+    let payload = trimmed
+        .split_once("base64,")
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let bytes = crate::util::base64_decode(payload).ok_or_else(|| {
+        crate::error::AppError::Invalid("图标 base64 解码失败（数据不完整？）".to_string())
+    })?;
+    if bytes.len() > ICON_MAX_BYTES {
+        return Err(crate::error::AppError::Invalid(format!(
+            "图标太大：{} 字节（上限 {} 字节）",
+            bytes.len(),
+            ICON_MAX_BYTES
+        )));
+    }
+    if !bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err(crate::error::AppError::Invalid(
+            "图标不是有效的 PNG 文件".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// 缩放到指定边长（最近邻，够用且零依赖）。
+pub fn resize_rgba(image: &crate::png::Rgba, width: u32, height: u32) -> crate::png::Rgba {
+    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let src_y = (y as u64 * image.height as u64 / height.max(1) as u64) as u32;
+        for x in 0..width {
+            let src_x = (x as u64 * image.width as u64 / width.max(1) as u64) as u32;
+            let index = ((src_y as usize * image.width as usize) + src_x as usize) * 4;
+            if index + 3 < image.pixels.len() {
+                pixels.extend_from_slice(&image.pixels[index..index + 4]);
+            } else {
+                pixels.extend_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
+    crate::png::Rgba {
+        width,
+        height,
+        pixels,
+    }
+}
+
+/// 把图标缩放到 ICON_SIZE×ICON_SIZE 并写进实例目录的 icon.png。
+pub fn write_instance_icon(game_dir: &std::path::Path, png: &[u8]) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(game_dir)?;
+    let image = crate::png::decode_png(png)?;
+    let scaled = resize_rgba(&image, ICON_SIZE, ICON_SIZE);
+    let encoded = crate::png::encode_png(scaled.width, scaled.height, &scaled.pixels)?;
+    let path = icon_file_path(game_dir);
+    std::fs::write(&path, encoded)?;
+    Ok(path)
+}
+
+/// 实例目录下的 icon.png 绝对路径。
+pub fn icon_file_path(game_dir: &std::path::Path) -> std::path::PathBuf {
+    game_dir.join(ICON_FILE_NAME)
 }
 
 /// 更新实例设置；改名时同步改目录名。
@@ -469,6 +659,120 @@ pub fn dir_exists(paths: &Paths, name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::db;
+
+    fn sample_instance_conn() -> (Connection, i64) {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO instances (name, mc_version, created_at) VALUES ('测试实例', '1.20.1', '2026-10-27T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        (conn, id)
+    }
+
+    #[test]
+    fn icon_spec_roundtrips_through_json() {
+        let spec = InstanceIconSpec::Builtin {
+            id: Some("diamond-block".to_string()),
+            gradient: Some("sunset".to_string()),
+        };
+        assert_eq!(InstanceIconSpec::parse(&spec.to_json()), spec);
+        assert_eq!(InstanceIconSpec::parse(""), InstanceIconSpec::None);
+        assert_eq!(InstanceIconSpec::parse("{oops"), InstanceIconSpec::None);
+    }
+
+    #[test]
+    fn legacy_icon_path_falls_back_to_custom() {
+        let (conn, id) = sample_instance_conn();
+        conn.execute(
+            "UPDATE instances SET icon = 'C:/icons/old.png' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+        let instance = get(&conn, id).unwrap();
+        assert_eq!(
+            instance.icon_spec,
+            InstanceIconSpec::Custom {
+                path: Some("C:/icons/old.png".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_builtin_id_falls_back_to_none() {
+        let (conn, id) = sample_instance_conn();
+        let wanted = InstanceIconSpec::Builtin {
+            id: Some("not-a-real-icon".to_string()),
+            gradient: Some("ocean".to_string()),
+        };
+        let saved = set_icon_spec(&conn, id, &wanted).unwrap();
+        assert_eq!(saved.icon_spec, InstanceIconSpec::None);
+        assert!(saved.icon.is_empty(), "旧 icon 字段要跟着清空");
+    }
+
+    #[test]
+    fn builtin_spec_persists_and_shows_up_in_list() {
+        let (conn, id) = sample_instance_conn();
+        let wanted = InstanceIconSpec::Builtin {
+            id: Some("diamond-block".to_string()),
+            gradient: Some("aurora".to_string()),
+        };
+        set_icon_spec(&conn, id, &wanted).unwrap();
+        let listed = list(&conn).unwrap();
+        let found = listed.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(found.icon_spec, wanted);
+        assert_eq!(found.icon_spec_raw, wanted.to_json());
+    }
+
+    #[test]
+    fn upload_rejects_non_png_and_oversize() {
+        let error = decode_icon_upload("icon.jpg", "AAAA").unwrap_err().to_string();
+        assert!(error.contains("只支持 PNG"), "{error}");
+
+        let mut bytes = vec![0x89, b'P', b'N', b'G'];
+        bytes.resize(ICON_MAX_BYTES + 1, 0);
+        let encoded = crate::util::base64_encode(&bytes);
+        let error = decode_icon_upload("icon.png", &encoded)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("太大"), "{error}");
+
+        let error = decode_icon_upload("icon.png", &crate::util::base64_encode(b"not a png"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不是有效的 PNG"), "{error}");
+    }
+
+    #[test]
+    fn uploaded_icon_is_scaled_to_icon_size() {
+        let dir = std::env::temp_dir().join(format!("gugu-icon-test-{}", crate::util::unique_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pixels = vec![128u8; 8 * 8 * 4];
+        let png = crate::png::encode_png(8, 8, &pixels).unwrap();
+        let path = write_instance_icon(&dir, &png).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_eq!(crate::png::png_size(&written), Some((ICON_SIZE, ICON_SIZE)));
+        assert_eq!(path.file_name().unwrap(), ICON_FILE_NAME);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_resets_spec_to_none() {
+        let (conn, id) = sample_instance_conn();
+        set_icon_spec(
+            &conn,
+            id,
+            &InstanceIconSpec::Custom {
+                path: Some("C:/icons/x.png".to_string()),
+            },
+        )
+        .unwrap();
+        let saved = set_icon_spec(&conn, id, &InstanceIconSpec::None).unwrap();
+        assert_eq!(saved.icon_spec, InstanceIconSpec::None);
+        assert!(saved.icon.is_empty());
+    }
 
     fn setup() -> (Connection, Paths) {
         // 每个测试一个独立数据根：同一进程里并行跑也不会互相看到对方的实例

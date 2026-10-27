@@ -6,7 +6,8 @@ import { useDownloads } from "./lib/downloads-store";
 import { useT } from "./lib/i18n";
 import { api, normalizeAppearance, RUNTIME_MODE, subscribeLauncherEvents } from "./lib/tauri-api";
 import { applyFont, applyTheme, normalizeAccent, readCachedFont, readCachedTheme } from "./lib/theme";
-import type { Account, AppInfo, FontChoice, Instance, Settings, UpdateCheckResult, VersionManifest } from "./lib/types";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import type { Account, AppInfo, FontChoice, Instance, Settings, UpdateStatus, VersionManifest } from "./lib/types";
 import { AboutPage } from "./pages/AboutPage";
 import { FunPage } from "./pages/FunPage";
 import { AccountsPage } from "./pages/AccountsPage";
@@ -206,17 +207,21 @@ export default function App() {
     [refreshInstances],
   );
 
-  /** 手动检查更新：结果交给关于页显示三种文案，异常也折成带 error 的结果。 */
-  const checkUpdate = useCallback(async (): Promise<UpdateCheckResult> => {
+  /** 手动检查更新：异常也折成 phase=failed 的状态，绝不当成「已是最新」。 */
+  const checkUpdate = useCallback(async (): Promise<UpdateStatus> => {
+    const current = appInfo?.version ?? "1.0.0";
     setUpdateBusy(true);
     try {
-      return await api.updateCheck();
+      const status = await api.updateCheck();
+      return { ...status, currentVersion: status.currentVersion || current };
     } catch (error) {
       return {
-        hasUpdate: false,
-        latest: null,
-        current: appInfo?.version ?? "1.0.0",
-        error: String(error),
+        phase: "failed",
+        currentVersion: current,
+        remoteVersion: null,
+        message: "检查更新失败：" + (error instanceof Error ? error.message : String(error)) + "（可重试）",
+        checkedAt: Date.now(),
+        canInstall: false,
       };
     } finally {
       setUpdateBusy(false);
@@ -375,7 +380,10 @@ export default function App() {
               <span className="chip">DEV · {RUNTIME_MODE}</span>
             </p>
           ) : null}
-          {mainPage()}
+          {/* 页面级兜底：单个页面崩了只显示错误卡，顶栏 / 导航 / 关窗口都还在 */}
+          <ErrorBoundary key={page} pageName={t(PAGE_TITLE_KEY[page])} onHome={() => setPage("home")}>
+            {mainPage()}
+          </ErrorBoundary>
         </main>
       </div>
 
